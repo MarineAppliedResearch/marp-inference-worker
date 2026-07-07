@@ -53,7 +53,7 @@ def test_load_model_records_model_spec() -> None:
     # Create a test client around the FastAPI app without starting a server.
     client = TestClient(app)
 
-    # Define a representative Ultralytics model spec without loading real files.
+     # Define a representative Ultralytics model spec without loading real files.
     model_spec = {
         "model_id": "demo_yolo",
         "engine": "ultralytics",
@@ -63,6 +63,9 @@ def test_load_model_records_model_spec() -> None:
             "url": "https://model-server/models/demo_yolo.pt",
             "format": "ultralytics_pt",
             "sha256": None,
+        },
+        "load_settings": {
+            "device": "auto",
         },
         "labels": [
             {

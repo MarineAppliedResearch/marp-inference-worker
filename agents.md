@@ -333,6 +333,7 @@ Show the specific file or patch
 Wait for Isaac to apply/test when appropriate
 Use tests as checkpoints
 ```
+We'll create tests in parallel to our code as we go along.
 
 When suggesting code changes, explain why the change is needed before giving the patch.
 

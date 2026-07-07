@@ -30,13 +30,13 @@ router = APIRouter(prefix="/models", tags=["models"])
 @router.post("/load")
 async def load_model(model_spec: ModelSpec) -> dict[str, object]:
 
-    # Delegate model state changes to the manager instead of storing state here.
-    loaded_model = model_manager.load_model(model_spec)
+    # Ask the manager to record the model and compute cache metadata.
+    load_result = model_manager.load_model(model_spec)
 
     # Return a simple response contract for the coordinator and tests.
     return {
         "status": "loaded",
-        "model": loaded_model,
+        **load_result,
     }
 
 

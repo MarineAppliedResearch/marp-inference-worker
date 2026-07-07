@@ -85,8 +85,17 @@ def test_load_model_records_model_spec() -> None:
     # Confirm the response reports the model as loaded.
     assert load_response.json()["status"] == "loaded"
 
-    # Confirm the response echoes the validated model contract.
-    assert load_response.json()["model"] == model_spec
+    # Confirm the response includes the planned local cache state.
+    cache = load_response.json()["cache"]
+
+    # Confirm the model ID is used as the cache key when no hash is provided.
+    assert cache["cache_key"] == "demo_yolo"
+
+    # Confirm the planned artifact path points to the expected cache filename.
+    assert cache["artifact_path"].endswith("models\\cache\\demo_yolo\\demo_yolo.pt")
+
+    # Confirm this fake test model has not actually been downloaded.
+    assert cache["is_cached"] is False
 
     # Request the loaded-model list after fake loading.
     loaded_response = client.get("/models/loaded")

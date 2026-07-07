@@ -3,10 +3,13 @@ Name: marp-inference-worker
 Version: 0.1.0
 Summary: Agnostic MARP inference worker service.
 Requires-Python: >=3.10
+License-File: LICENSE
 Requires-Dist: fastapi
 Requires-Dist: uvicorn[standard]
 Requires-Dist: pydantic
+Requires-Dist: httpx
 Provides-Extra: dev
 Requires-Dist: pytest; extra == "dev"
 Requires-Dist: httpx; extra == "dev"
 Requires-Dist: ruff; extra == "dev"
+Dynamic: license-file

@@ -16,6 +16,9 @@ from marp_inference_worker.main import app
 # The temporary model manager is cleared between tests to isolate fake state.
 from marp_inference_worker.models import model_manager
 
+# Mock patches cache behavior so endpoint tests do not download real artifacts.
+from unittest.mock import patch
+
 
 # test_loaded_models_starts_empty()
 # Verifies that /models/loaded returns an empty list before models are loaded.
@@ -53,7 +56,7 @@ def test_load_model_records_model_spec() -> None:
     # Create a test client around the FastAPI app without starting a server.
     client = TestClient(app)
 
-     # Define a representative Ultralytics model spec without loading real files.
+    # Define a representative Ultralytics model spec without loading real files.
     model_spec = {
         "model_id": "demo_yolo",
         "engine": "ultralytics",
@@ -76,8 +79,18 @@ def test_load_model_records_model_spec() -> None:
         ],
     }
 
-    # Submit the model spec to the fake load endpoint.
-    load_response = client.post("/models/load", json=model_spec)
+    # Mock cache behavior so this endpoint test does not download a real model.
+    with patch(
+        "marp_inference_worker.models.model_cache.ensure_artifact_cached",
+        return_value={
+            "cache_key": "demo_yolo",
+            "artifact_path": "models\\cache\\demo_yolo\\demo_yolo.pt",
+            "is_cached": True,
+            "cache_action": "downloaded",
+        },
+    ):
+        # Submit the model spec to the load endpoint.
+        load_response = client.post("/models/load", json=model_spec)
 
     # Confirm the load endpoint accepts the valid model spec.
     assert load_response.status_code == 200
@@ -85,25 +98,31 @@ def test_load_model_records_model_spec() -> None:
     # Confirm the response reports the model as loaded.
     assert load_response.json()["status"] == "loaded"
 
-    # Confirm the response includes the planned local cache state.
+    # Confirm the response echoes the validated model contract.
+    assert load_response.json()["model"] == model_spec
+
+    # Confirm the response includes the local cache state.
     cache = load_response.json()["cache"]
 
     # Confirm the model ID is used as the cache key when no hash is provided.
     assert cache["cache_key"] == "demo_yolo"
 
-    # Confirm the planned artifact path points to the expected cache filename.
+    # Confirm the artifact path points to the expected cache filename.
     assert cache["artifact_path"].endswith("models\\cache\\demo_yolo\\demo_yolo.pt")
 
-    # Confirm this fake test model has not actually been downloaded.
-    assert cache["is_cached"] is False
+    # Confirm the mocked cache path reports the artifact as cached.
+    assert cache["is_cached"] is True
 
-    # Request the loaded-model list after fake loading.
+    # Confirm the mocked cache path reports that a download occurred.
+    assert cache["cache_action"] == "downloaded"
+
+    # Request the loaded-model list after loading.
     loaded_response = client.get("/models/loaded")
 
     # Confirm the list endpoint still returns a successful response.
     assert loaded_response.status_code == 200
 
-    # Confirm the loaded model appears in the worker's fake loaded-model state.
+    # Confirm the loaded model appears in the worker's loaded-model state.
     assert loaded_response.json() == {"loaded_models": [model_spec]}
 
 

@@ -13,6 +13,7 @@ from fastapi import FastAPI
 # Route modules are imported here so the application factory can register them.
 from marp_inference_worker.api.health_routes import router as health_router
 from marp_inference_worker.api.status_routes import router as status_router
+from marp_inference_worker.api.model_routes import router as model_router
 
 
 # create_app()
@@ -34,6 +35,9 @@ def create_app() -> FastAPI:
 
     # Register status routes so coordinators can inspect worker availability.
     app.include_router(status_router)
+
+    # Register model routes so coordinators can load and inspect worker models.
+    app.include_router(model_router)
 
     # Return the configured app object to main.py for Uvicorn/ASGI discovery.
     return app

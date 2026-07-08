@@ -19,6 +19,9 @@ from marp_inference_worker.models.model_spec import ModelSpec
 # Frame source utilities prepare local paths and URL images for prediction.
 from marp_inference_worker.inputs.frame_source import prepare_frame_source
 
+# Detection renderer draws normalized boxes and labels onto frame images.
+from marp_inference_worker.rendering.detection_renderer import render_detections_to_image_bytes
+
 
 # UltralyticsEngine
 # Loads and stores Ultralytics-compatible YOLO model handles.
@@ -93,21 +96,17 @@ class UltralyticsEngine(BaseEngine):
 
 
     
-    
-
-
-        # infer_frame()
-    # Runs object detection on one image source using a loaded YOLO model.
-    # Inputs: model ID, image source, confidence threshold, label map, and image flag.
-    # Output: normalized detections and optional base64 annotated image.
-    # Use this for first-pass frame inference before video or tracking jobs.
-    def infer_frame(
+        # _run_frame_prediction()
+    # Runs YOLO prediction and normalizes detections for one visual frame.
+    # Inputs: model ID, image source, confidence threshold, and class-name map.
+    # Output: dictionary containing detections and source image array.
+    # Use this so JSON and image routes share one prediction path.
+    def _run_frame_prediction(
         self,
         model_id: str,
         image_source: str,
         confidence: float,
         class_names_by_id: dict[int, str],
-        return_annotated_image: bool = False,
     ) -> dict[str, object]:
 
         # Get the already-loaded YOLO model handle for this model ID.
@@ -123,6 +122,10 @@ class UltralyticsEngine(BaseEngine):
                 conf=confidence,
                 verbose=False,
             )
+
+            # Fail clearly if Ultralytics returned no result object.
+            if not results:
+                raise ValueError("Ultralytics returned no inference results.")
 
             # Store normalized detections returned to callers.
             detections: list[dict[str, object]] = []
@@ -170,35 +173,65 @@ class UltralyticsEngine(BaseEngine):
                         }
                     )
 
-            # Build the base inference result shared by all frame requests.
-            inference_result: dict[str, object] = {
+            # Return normalized detections and the original image for optional rendering.
+            return {
                 "detections": detections,
+                "source_image": results[0].orig_img,
             }
 
-            # Optionally add a base64-encoded annotated image to the JSON result.
-            if return_annotated_image:
-
-                # Base64 is used so the annotated image can travel inside JSON.
-                import base64
-
-                # Render the first image result with custom labels and boxes.
-                annotated_image_bytes = self._render_annotated_image_jpg(
-                    results=results,
-                    detections=detections,
-                )
-
-                # Add image metadata and payload to the inference result.
-                inference_result["annotated_image_format"] = "jpg"
-                inference_result["annotated_image_base64"] = base64.b64encode(
-                    annotated_image_bytes
-                ).decode("utf-8")
-
-            # Return detections and optional annotated image data.
-            return inference_result
-
         finally:
-            # Clean up temporary URL downloads after prediction and rendering finish.
+            # Clean up temporary URL downloads after prediction finishes.
             prepared_source.cleanup()
+
+
+        # infer_frame()
+    # Runs object detection on one image source using a loaded YOLO model.
+    # Inputs: model ID, image source, confidence threshold, label map, and image flag.
+    # Output: normalized detections and optional base64 annotated image.
+    # Use this for first-pass frame inference before video or tracking jobs.
+    def infer_frame(
+        self,
+        model_id: str,
+        image_source: str,
+        confidence: float,
+        class_names_by_id: dict[int, str],
+        return_annotated_image: bool = False,
+    ) -> dict[str, object]:
+
+        # Run prediction through the shared frame helper.
+        prediction_result = self._run_frame_prediction(
+            model_id=model_id,
+            image_source=image_source,
+            confidence=confidence,
+            class_names_by_id=class_names_by_id,
+        )
+
+        # Build the base inference result shared by all frame requests.
+        inference_result: dict[str, object] = {
+            "detections": prediction_result["detections"],
+        }
+
+        # Optionally add a base64-encoded annotated image to the JSON result.
+        if return_annotated_image:
+
+            # Base64 is used so the annotated image can travel inside JSON.
+            import base64
+
+            # Render the source image with normalized detections.
+            annotated_image_bytes = render_detections_to_image_bytes(
+                source_image=prediction_result["source_image"],
+                detections=prediction_result["detections"],
+                output_format="jpg",
+            )
+
+            # Add image metadata and payload to the inference result.
+            inference_result["annotated_image_format"] = "jpg"
+            inference_result["annotated_image_base64"] = base64.b64encode(
+                annotated_image_bytes
+            ).decode("utf-8")
+
+        # Return detections and optional annotated image data.
+        return inference_result
 
 
     
@@ -215,276 +248,20 @@ class UltralyticsEngine(BaseEngine):
         class_names_by_id: dict[int, str],
     ) -> bytes:
 
-        # Get the already-loaded YOLO model handle for this model ID.
-        yolo_model = self.get_loaded_model(model_id)
+        # Run prediction through the shared frame helper.
+        prediction_result = self._run_frame_prediction(
+            model_id=model_id,
+            image_source=image_source,
+            confidence=confidence,
+            class_names_by_id=class_names_by_id,
+        )
 
-        # Prepare local paths and URL images through the shared frame-source utility.
-        prepared_source = prepare_frame_source(image_source)
-
-        try:
-            # Run Ultralytics prediction on the prepared image source.
-            results = yolo_model.predict(
-                source=prepared_source.prediction_source,
-                conf=confidence,
-                verbose=False,
-            )
-
-            # Store normalized detections used by the shared rendering helper.
-            detections: list[dict[str, object]] = []
-
-            # Ultralytics returns one result object per input image.
-            for result in results:
-
-                # Skip result objects with no detection boxes.
-                if result.boxes is None:
-                    continue
-
-                # Convert every detection into the same normalized shape used by JSON.
-                for box in result.boxes:
-
-                    # Convert class ID and confidence into plain Python values.
-                    class_id = int(box.cls[0].item())
-                    detection_confidence = float(box.conf[0].item())
-
-                    # Convert pixel xyxy tensor coordinates into plain Python floats.
-                    bbox_xyxy = [
-                        float(value)
-                        for value in box.xyxy[0].tolist()
-                    ]
-
-                    # Convert normalized xyxy tensor coordinates into plain Python floats.
-                    bbox_xyxyn = [
-                        float(value)
-                        for value in box.xyxyn[0].tolist()
-                    ]
-
-                    # Prefer labels from the model spec, then fall back to Ultralytics names.
-                    class_name = class_names_by_id.get(
-                        class_id,
-                        yolo_model.names.get(class_id, str(class_id)),
-                    )
-
-                    # Add one normalized detection to the render list.
-                    detections.append(
-                        {
-                            "class_id": class_id,
-                            "class_name": class_name,
-                            "confidence": detection_confidence,
-                            "bbox_xyxy": bbox_xyxy,
-                            "bbox_xyxyn": bbox_xyxyn,
-                        }
-                    )
-
-            # Render the first image result with the shared annotation helper.
-            return self._render_annotated_image_jpg(
-                results=results,
-                detections=detections,
-            )
-
-        finally:
-            # Clean up temporary URL downloads after prediction and rendering finish.
-            prepared_source.cleanup()
+        # Render the source image with normalized detections.
+        return render_detections_to_image_bytes(
+            source_image=prediction_result["source_image"],
+            detections=prediction_result["detections"],
+            output_format="jpg",
+        )
 
 
-        # _render_annotated_image_jpg()
-    # Draws detection boxes and attached translucent labels onto one image.
-    # Inputs: Ultralytics results and normalized detection dictionaries.
-    # Output: encoded JPG image bytes.
-    # Use this so JSON and direct-image routes share identical rendering.
-    def _render_annotated_image_jpg(
-        self,
-        results: object,
-        detections: list[dict[str, object]],
-    ) -> bytes:
-
-        # OpenCV is used for drawing and JPG encoding.
-        import cv2
-
-        # Fail clearly if Ultralytics returned no result object to render.
-        if not results:
-            raise ValueError("Ultralytics returned no inference results to annotate.")
-
-        # Copy the original image so drawing does not mutate the Ultralytics result.
-        annotated_image = results[0].orig_img.copy()
-
-        # Read image dimensions so labels can be clamped inside image bounds.
-        image_height, image_width = annotated_image.shape[:2]
-
-        # Draw each detection box and attached label.
-        for detection in detections:
-
-            # Extract and round pixel box coordinates.
-            x1, y1, x2, y2 = [
-                int(round(value))
-                for value in detection["bbox_xyxy"]
-            ]
-
-            # Clamp the box coordinates to the image bounds.
-            x1 = max(0, min(x1, image_width - 1))
-            y1 = max(0, min(y1, image_height - 1))
-            x2 = max(0, min(x2, image_width - 1))
-            y2 = max(0, min(y2, image_height - 1))
-
-            # Calculate box size for label placement and fitting.
-            box_width = max(1, x2 - x1)
-            box_height = max(1, y2 - y1)
-
-            # Compose a concise label with class name and confidence.
-            label_text = (
-                f"{detection['class_name']} "
-                f"{float(detection['confidence']):.2f}"
-            )
-
-            # Set font bounds so small boxes remain readable and large boxes stay reasonable.
-            max_font_scale = min(0.85, max(0.45, box_height / 120.0))
-            min_font_scale = 0.35
-            font_scale = max_font_scale
-            text_thickness = 1
-
-            # Reserve horizontal padding inside the label bar.
-            horizontal_padding = max(4, min(10, box_width // 12))
-            available_text_width = max(1, box_width - (horizontal_padding * 2))
-
-            # Shrink the font until the label fits the box width or reaches the minimum.
-            while font_scale > min_font_scale:
-
-                # Measure the current label text at the current font scale.
-                text_size, baseline = cv2.getTextSize(
-                    label_text,
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    font_scale,
-                    text_thickness,
-                )
-                text_width, text_height = text_size
-
-                # Stop shrinking once the label fits inside the box width.
-                if text_width <= available_text_width:
-                    break
-
-                # Reduce font size gradually to fit longer labels.
-                font_scale -= 0.05
-
-            # Clamp to the minimum readable font size.
-            font_scale = max(min_font_scale, font_scale)
-
-            # Re-measure after final font scale is selected.
-            text_size, baseline = cv2.getTextSize(
-                label_text,
-                cv2.FONT_HERSHEY_SIMPLEX,
-                font_scale,
-                text_thickness,
-            )
-            text_width, text_height = text_size
-
-            # Truncate the label if it still does not fit at the minimum font size.
-            if text_width > available_text_width:
-
-                # Keep shortening until the label plus ellipsis fits.
-                truncated_label = label_text
-                while len(truncated_label) > 3:
-
-                    # Test the shortened label with an ellipsis.
-                    candidate_label = truncated_label[:-1].rstrip() + "..."
-                    text_size, baseline = cv2.getTextSize(
-                        candidate_label,
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        font_scale,
-                        text_thickness,
-                    )
-                    text_width, text_height = text_size
-
-                    # Use the first shortened label that fits the available width.
-                    if text_width <= available_text_width:
-                        label_text = candidate_label
-                        break
-
-                    # Remove one more character and test again.
-                    truncated_label = truncated_label[:-1]
-
-            # Re-measure the final label after any truncation.
-            text_size, baseline = cv2.getTextSize(
-                label_text,
-                cv2.FONT_HERSHEY_SIMPLEX,
-                font_scale,
-                text_thickness,
-            )
-            text_width, text_height = text_size
-
-            # Vertical padding keeps text from touching the label bar edges.
-            vertical_padding = max(3, int(round(font_scale * 6)))
-
-            # Make the label bar exactly align with the bounding box x coordinates.
-            label_x1 = x1
-            label_x2 = x2
-
-            # Prefer placing the label directly below the bounding box.
-            label_y1 = y2
-            label_y2 = y2 + text_height + baseline + (vertical_padding * 2)
-
-            # If below the box would leave the image, place the label inside the box bottom.
-            if label_y2 >= image_height:
-                label_y2 = y2
-                label_y1 = y2 - text_height - baseline - (vertical_padding * 2)
-
-            # Clamp the label bar inside the image.
-            label_y1 = max(0, min(label_y1, image_height - 1))
-            label_y2 = max(0, min(label_y2, image_height - 1))
-
-            # Draw a visible bounding box around the detection.
-            cv2.rectangle(
-                annotated_image,
-                (x1, y1),
-                (x2, y2),
-                (0, 255, 255),
-                2,
-            )
-
-            # Draw a translucent label background aligned to the box width.
-            overlay = annotated_image.copy()
-            cv2.rectangle(
-                overlay,
-                (label_x1, label_y1),
-                (label_x2, label_y2),
-                (0, 0, 0),
-                -1,
-            )
-            cv2.addWeighted(
-                overlay,
-                0.55,
-                annotated_image,
-                0.45,
-                0,
-                annotated_image,
-            )
-
-            # Center the label text horizontally inside the label bar.
-            text_x = label_x1 + max(0, ((label_x2 - label_x1) - text_width) // 2)
-
-            # Center the label text vertically inside the label bar.
-            label_height = max(1, label_y2 - label_y1)
-            text_y = label_y1 + ((label_height + text_height) // 2) - baseline
-
-            # Clamp the text baseline so it stays visible.
-            text_y = max(text_height, min(text_y, image_height - baseline - 1))
-
-            # Draw the label text in white over the translucent background.
-            cv2.putText(
-                annotated_image,
-                label_text,
-                (text_x, text_y),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                font_scale,
-                (255, 255, 255),
-                text_thickness,
-                cv2.LINE_AA,
-            )
-
-        # Encode the final rendered image as JPG bytes.
-        encoded_success, encoded_image = cv2.imencode(".jpg", annotated_image)
-
-        # Fail clearly if OpenCV cannot encode the rendered image.
-        if not encoded_success:
-            raise ValueError("Could not encode annotated inference image.")
-
-        # Return raw JPG bytes for direct API image responses.
-        return encoded_image.tobytes()
+     

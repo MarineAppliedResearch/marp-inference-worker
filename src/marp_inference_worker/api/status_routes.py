@@ -7,6 +7,7 @@
 # status to coordinators, dashboards, and local developer tools. Heavy
 # hardware checks, model loading, and job execution should not live here.
 
+# FastAPI provides the router used to group worker status endpoints.
 from fastapi import APIRouter
 
 

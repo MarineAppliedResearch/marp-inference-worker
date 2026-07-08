@@ -15,6 +15,9 @@ from marp_inference_worker.models.model_spec import ModelSpec
 # Path is used to create temporary local model artifact files in tests.
 from pathlib import Path
 
+# UUID creates unique model IDs so cache tests do not reuse prior artifacts.
+from uuid import uuid4
+
 
 # test_cache_key_uses_model_id_without_hash()
 # Verifies that model ID is used as the cache key when no hash is available.
@@ -115,21 +118,21 @@ def test_is_remote_url_detects_http_urls() -> None:
 def test_local_artifact_is_copied_into_cache(tmp_path: Path) -> None:
 
     # Create a temporary local artifact file to act like a staged model.
-    source_model_path = tmp_path / "demo_yolo.pt"
+    source_model_path = tmp_path / "demo_mock.pt"
     source_model_path.write_bytes(b"fake model bytes")
 
     # Create a unique model ID so this test does not reuse cache from prior runs.
-    model_id = f"demo_yolo_local_test_{tmp_path.name}"
+    model_id = f"demo_mock_local_test_{uuid4().hex}"
 
     # Create a model spec that points artifact.url at the local file.
     model_spec = ModelSpec(
         model_id=model_id,
-        engine="ultralytics",
-        model_arch="yolo11",
+        engine="mock",
+        model_arch="mock_detector",
         task="detect",
         artifact={
             "url": str(source_model_path),
-            "format": "ultralytics_pt",
+            "format": "mock",
             "sha256": None,
         },
     )

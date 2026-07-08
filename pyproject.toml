@@ -8,8 +8,8 @@ dependencies = [
     "uvicorn[standard]",
     "pydantic",
     "httpx",
+    "ultralytics",
 ]
-
 [project.optional-dependencies]
 dev = [
     "pytest",

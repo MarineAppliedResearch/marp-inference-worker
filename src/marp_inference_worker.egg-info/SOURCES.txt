@@ -13,10 +13,15 @@ src/marp_inference_worker/api/app.py
 src/marp_inference_worker/api/health_routes.py
 src/marp_inference_worker/api/model_routes.py
 src/marp_inference_worker/api/status_routes.py
+src/marp_inference_worker/engines/__init__.py
+src/marp_inference_worker/engines/base_engine.py
+src/marp_inference_worker/engines/engine_registry.py
+src/marp_inference_worker/engines/mock_engine.py
 src/marp_inference_worker/models/__init__.py
 src/marp_inference_worker/models/model_cache.py
 src/marp_inference_worker/models/model_manager.py
 src/marp_inference_worker/models/model_spec.py
+tests/test_engine_registry.py
 tests/test_health.py
 tests/test_model_cache.py
 tests/test_models.py

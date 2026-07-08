@@ -58,13 +58,13 @@ def test_load_model_records_model_spec() -> None:
 
     # Define a representative Ultralytics model spec without loading real files.
     model_spec = {
-        "model_id": "demo_yolo",
-        "engine": "ultralytics",
-        "model_arch": "yolo11",
+        "model_id": "demo_mock",
+        "engine": "mock",
+        "model_arch": "mock_detector",
         "task": "detect",
         "artifact": {
             "url": "https://model-server/models/demo_yolo.pt",
-            "format": "ultralytics_pt",
+            "format": "mock",
             "sha256": None,
         },
         "load_settings": {
@@ -124,6 +124,11 @@ def test_load_model_records_model_spec() -> None:
 
     # Confirm the loaded model appears in the worker's loaded-model state.
     assert loaded_response.json() == {"loaded_models": [model_spec]}
+
+    # Confirm the mock engine reports the model as loaded.
+    assert load_response.json()["engine"]["engine"] == "mock"
+    assert load_response.json()["engine"]["model_id"] == "demo_mock"
+    assert load_response.json()["engine"]["loaded"] is True
 
 
 # test_load_model_rejects_missing_required_fields()

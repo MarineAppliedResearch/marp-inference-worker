@@ -2,52 +2,71 @@
 
 # MARP Inference Worker Agent Guide
 
+## Purpose of This File
+
+This file is the project handoff guide for LLM assistants working with Isaac on the MARP Inference Worker. It should give a new LLM enough context to continue development without needing the full prior chat history.
+
+Isaac is the programmer. The LLM is the programming assistant. Work interactively, make small changes, explain why each change is being made, and avoid large speculative rewrites.
+
 ## Project Overview
 
-This project is the MARP Inference Worker.
+MARP Inference Worker is a Python FastAPI service for running computer vision and other model inference workloads on one worker machine.
 
-The goal is to build an agnostic Python inference worker that can run on different computers and receive inference jobs from a future coordinator service. Each worker should be able to load and cache models from a model server, process individual frames or video ranges, run inference using different model engines, report status, and return standardized detection results to the coordinator.
+The long-term system will have multiple inference workers running on different computers. A future coordinator service will decide which worker gets which job, send model and input information to the worker, receive standardized inference results, and save or interpret those results through the MARP database API.
 
-The worker is not the coordinator. It should not decide which videos to process, how jobs are distributed across machines, or how detections become MARP database observations. The future coordinator will own those decisions and will save results to the existing MARP database API.
+The worker is intentionally not the coordinator.
 
-The worker’s core contract is:
+The worker should eventually:
 
 ```text
-Coordinator sends model, input source, range, and inference settings.
-Worker loads or reuses the requested model.
-Worker runs inference.
-Worker reports job status and returns standardized detections.
-Coordinator saves or interprets the results.
+Report worker health and status
+Load model artifacts supplied by a coordinator or model server
+Cache model artifacts locally
+Dispatch models to the correct inference engine
+Run inference on individual frames
+Run inference on video ranges or streams
+Track local jobs
+Return standardized detections/results to the coordinator
+Support multiple model engines over time
 ```
 
-## Current Development State
+The worker should not own:
 
-The project has been initialized as a Python FastAPI service.
+```text
+Global job scheduling
+MARP database writes
+Observation approval logic
+Survey-specific decision rules
+Human review workflow
+Final conversion of detections into database observations
+```
 
-Current completed setup:
+## Current Project State
+
+The project is initialized and working as a FastAPI service.
+
+Current environment:
 
 ```text
 Project name: marp-inference-worker
-Python version in venv: Python 3.10.11
-Package style: pyproject.toml
+Python version used in venv: Python 3.10.11
+Package configuration: pyproject.toml
 API framework: FastAPI
 Test framework: pytest
 Repository: Git/GitHub
+Development shell: Windows PowerShell
 ```
 
-Current implemented behavior:
+Current implemented endpoints:
 
 ```text
-GET /health
+GET  /health
+GET  /status
+POST /models/load
+GET  /models/loaded
 ```
 
-The `/health` endpoint returns:
-
-```json
-{"status": "ok"}
-```
-
-Swagger/OpenAPI documentation is available through FastAPI at:
+FastAPI documentation is available when the server is running:
 
 ```text
 /docs
@@ -55,111 +74,346 @@ Swagger/OpenAPI documentation is available through FastAPI at:
 /redoc
 ```
 
-Current project structure is intentionally minimal. More modules should be added only as the design requires them.
-
-## Development Philosophy
-
-Isaac is the programmer. The LLM is the assistant.
-
-Do not rush ahead and design large systems without checking the direction interactively. Work one focused step at a time. Before writing code, explain what the change is meant to accomplish and why it belongs in the current step.
-
-Do not assume code that has not been shown in the current context. If exact code matters and you are unsure, ask Isaac to paste the file or relevant function before proposing a patch.
-
-Prefer small commits and small working milestones.
-
-Each new API endpoint should usually come with a test or a modification to an existing test. The tests are part of the API contract that the future coordinator will rely on.
-
-## Intended Architecture
-
-The first project is the inference worker only.
-
-The worker should eventually support:
+Current test state at handoff:
 
 ```text
-Health/status reporting
-Model loading
-Model caching
-Remote model artifacts from a model server
-Single-frame inference
-Video-range inference
-HLS or stream-based video input
-Job status tracking
-Job cancellation
-Standardized detection result output
-HTTP callback or polling result delivery
-Multiple inference engines
+pytest passes with 10 tests
+There is one non-blocking FastAPI/Starlette TestClient warning about httpx/httpx2
 ```
 
-The worker should not directly own:
+The warning is not currently being addressed.
+
+## Current API Behavior
+
+### GET /health
+
+Returns:
+
+```json
+{"status": "ok"}
+```
+
+This is a cheap health check only. Do not add expensive GPU, model, or job checks here.
+
+### GET /status
+
+Currently returns a static worker status:
+
+```json
+{
+  "worker_id": "dev-worker",
+  "status": "idle",
+  "version": "0.1.0",
+  "active_jobs": 0,
+  "loaded_models": []
+}
+```
+
+Later, this should read from a real worker state object, job manager, and model manager.
+
+### POST /models/load
+
+Accepts a model spec. The worker now:
 
 ```text
-MARP database writes
-Observation approval logic
-Survey-specific processing decisions
-Job scheduling across multiple machines
-Coordinator responsibilities
-Human review workflow
+Validates the model spec
+Ensures the artifact is present in the local cache
+Selects the requested engine through the engine registry
+Loads the cached artifact through that engine
+Stores the model spec in the loaded-model registry
+Returns model, cache, and engine metadata
 ```
 
-A future coordinator service will:
+At the current stage, the only registered engine is `mock`.
+
+### GET /models/loaded
+
+Returns loaded model specs currently stored in the in-memory model manager registry.
+
+Current loaded state is not persistent. It resets when the process restarts.
+
+## Current Model Spec
+
+The current model spec is defined in:
 
 ```text
-Choose jobs
-Choose workers
-Resolve model URLs
-Resolve video stream URLs
-Submit jobs to workers
-Receive inference results
-Save detections or observations through the database API
-Track global job status
+src/marp_inference_worker/models/model_spec.py
 ```
 
-## FastAPI Usage Rules
+Conceptually:
 
-Use FastAPI as the HTTP API layer.
+```json
+{
+  "model_id": "demo_mock",
+  "engine": "mock",
+  "model_arch": "mock_detector",
+  "task": "detect",
+  "artifact": {
+    "url": "test_models/demo_mock.pt",
+    "format": "mock",
+    "sha256": null
+  },
+  "load_settings": {
+    "device": "auto"
+  },
+  "labels": [
+    {
+      "class_id": 0,
+      "class_name": "bat star",
+      "external_id": null
+    }
+  ]
+}
+```
 
-Use route files for endpoints and keep route handlers thin. Route handlers should translate HTTP requests into calls to manager/service classes. They should not contain heavy model loading, video decoding, inference, or job-processing logic.
+Important design decisions:
 
-Use FastAPI routers for endpoint groups.
+```text
+artifact.url is intentionally used as a generic artifact locator.
+If it starts with http:// or https://, it is treated as a remote URL.
+Otherwise, it is treated as a local file path.
+```
 
-Expected route organization over time:
+This allows local development with local model files before the model server is fully integrated.
+
+`labels` maps model class IDs to class names. For example, class ID `0` can map to `"bat star"`. The worker should return class names when possible, but the coordinator/database layer decides how those labels map to database species or observations.
+
+`load_settings.device` currently defaults to `"auto"`. Later this may control CPU/GPU device selection such as `"cpu"` or `"cuda:0"`.
+
+## Current Model Cache Behavior
+
+Model cache logic lives in:
+
+```text
+src/marp_inference_worker/models/model_cache.py
+```
+
+Current cache root:
+
+```text
+models/cache/
+```
+
+This path is ignored by git because `.gitignore` ignores `models/`.
+
+Current behavior:
+
+```text
+If artifact.url is http or https:
+  download with httpx into models/cache/<cache_key>/<filename>
+
+If artifact.url is anything else:
+  treat it as a local file path
+  copy it into models/cache/<cache_key>/<filename>
+```
+
+Current cache key behavior:
+
+```text
+If artifact.sha256 is present:
+  cache key = model_id + "_" + sha256
+
+If artifact.sha256 is missing:
+  cache key = model_id
+```
+
+Hash verification is not implemented yet. Existing cached artifacts are reused based on file existence only.
+
+Known TODOs:
+
+```text
+Add sha256 verification before reusing cached artifacts
+Add safer path/filename validation
+Add auth headers/retries/progress for remote downloads
+Possibly move cache root into config later
+```
+
+## Current Engine Layer
+
+The engine layer was added to keep model-manager logic independent from specific ML runtimes.
+
+Current files:
+
+```text
+src/marp_inference_worker/engines/base_engine.py
+src/marp_inference_worker/engines/mock_engine.py
+src/marp_inference_worker/engines/engine_registry.py
+```
+
+Current pattern:
+
+```text
+BaseEngine defines the shared interface.
+MockEngine implements that interface without real inference.
+engine_registry maps public engine names to engine instances.
+model_manager asks engine_registry for the requested engine.
+```
+
+Current registered engine:
+
+```text
+mock
+```
+
+Planned engines:
+
+```text
+ultralytics
+custom_torch
+torchscript
+possibly onnx
+possibly tensorrt
+```
+
+Important distinction:
+
+```text
+Engine = runtime/library adapter that knows how to load and run a model.
+Model = trained artifact plus metadata.
+```
+
+Examples:
+
+```text
+UltralyticsEngine
+  handles Ultralytics-compatible YOLO models such as YOLOv8, YOLO11, YOLO28, and custom Ultralytics .pt files.
+
+CustomTorchEngine
+  will later handle Isaac's own PyTorch models, but this needs packaging rules because raw .pt checkpoints may require architecture code and preprocessing/postprocessing logic.
+
+TorchScriptEngine
+  may later handle exported TorchScript models that are easier to load generically.
+```
+
+## Current Model Manager
+
+Model manager lives in:
+
+```text
+src/marp_inference_worker/models/model_manager.py
+```
+
+Current responsibilities:
+
+```text
+Ensure artifact is cached
+Resolve cached artifact path
+Select the engine
+Ask the engine to load the model
+Record the model spec as loaded in memory
+Return model/cache/engine metadata
+```
+
+The loaded-model registry is currently an in-memory dictionary. It is temporary.
+
+Important TODO:
+
+```text
+Replace fake loaded-model state with real loaded model handles.
+The worker will eventually need loaded handles available for inference calls.
+```
+
+## Current Project Structure
+
+Approximate structure after current work:
+
+```text
+marp-inference-worker/
+  README.md
+  AGENTS.md
+  pyproject.toml
+  .gitignore
+  src/
+    marp_inference_worker/
+      __init__.py
+      main.py
+      api/
+        __init__.py
+        app.py
+        health_routes.py
+        status_routes.py
+        model_routes.py
+      engines/
+        __init__.py
+        base_engine.py
+        mock_engine.py
+        engine_registry.py
+      models/
+        __init__.py
+        model_spec.py
+        model_cache.py
+        model_manager.py
+  tests/
+    test_health.py
+    test_status.py
+    test_models.py
+    test_model_cache.py
+    test_engine_registry.py
+```
+
+## FastAPI Design Rules
+
+Use FastAPI only as the HTTP API layer.
+
+Use route files for endpoint groups:
 
 ```text
 api/
-  app.py
   health_routes.py
   status_routes.py
   model_routes.py
   job_routes.py
 ```
 
-`main.py` should remain thin. It should expose the app object that Uvicorn imports.
+Route handlers should stay thin. They should:
 
-`api/app.py` should construct the FastAPI app and include routers.
+```text
+Validate request bodies through Pydantic schemas
+Call manager/service classes
+Return API responses
+```
+
+Route handlers should not contain:
+
+```text
+model download logic
+engine loading logic
+video decoding
+job execution
+heavy inference code
+database-specific logic
+```
+
+`main.py` should remain thin and expose the module-level `app` object for Uvicorn.
+
+`api/app.py` should create the FastAPI app, set metadata, and include routers.
 
 ## Testing Rules
 
-Every new endpoint or changed endpoint contract should be accompanied by a test.
+Every new endpoint or changed endpoint contract should be accompanied by a test or a modification to an existing test.
 
-At minimum, endpoint tests should verify:
+Tests should verify, as appropriate:
 
 ```text
 The route exists
-The expected status code is returned
-The response shape is correct
+Expected status code
+Expected response shape
 Required fields exist
-Invalid input fails correctly when relevant
+Invalid input fails correctly
+State changes are visible through API
 ```
 
-Internal refactors do not always need new tests, but existing tests must continue to pass.
+For model/cache tests, avoid relying on external network access. Mock remote downloads or use temporary local files.
 
-Run tests with:
+The project currently uses pytest:
 
 ```powershell
 pytest
 ```
 
-## Comment Style Rules
+When Isaac says a change is “done,” assume he has edited it and run pytest unless he says otherwise.
+
+## Code Comment Style Rules
 
 Every source file must begin with a file header comment.
 
@@ -170,16 +424,16 @@ File name
 Date created
 Author
 A few lines explaining what the file does
-The file’s purpose in the system
-What type of code should belong in the file
+The file's purpose in the system
+What type of code belongs in the file
 ```
 
-Every function must have a function header comment. The function header should be concise, usually no more than 4 or 5 lines. It should describe:
+Every function must have a concise function header comment, usually no more than 4 or 5 lines. It should describe:
 
 ```text
 What the function does
-Its inputs
-Its outputs
+Inputs
+Outputs
 How or when to use it
 Why it exists, when useful
 ```
@@ -188,177 +442,99 @@ After every function definition line, include one blank line before the first co
 
 When two functions appear one after another, place exactly two blank lines between them.
 
-Every object, variable, and class should have a short comment above it explaining why that object is being declared. This should usually be one or two lines.
+Every class must have a class header comment. After every class definition line, include one blank line before the first class body comment or code.
+
+Every object, variable, and class should have a short comment above it explaining why it is declared. This is usually one or two lines.
+
+Imports should be commented by import group. Do not necessarily comment every individual import if a group comment is clearer.
+
+Example:
+
+```python
+# FastAPI provides the router used to group model-management endpoints.
+from fastapi import APIRouter
+
+# Model manager owns model loading and loaded-model state.
+from marp_inference_worker.models import model_manager
+```
 
 Inline comments should appear throughout important code paths to explain what the code or algorithm is doing. These comments should usually be one line, sometimes two.
 
-Comments are for future developers and future LLMs to understand the code. Comments should be professional. They should not contain chat metadata, debug notes, or references to the current conversation.
+Comments are for future developers and future LLMs. They should be professional. Do not include chat metadata, debug chatter, or conversational rationale in code comments.
 
-## Current Commented Files
+Patch rationale belongs in the assistant response before code, not in code comments.
 
-The following files have been rewritten or planned using the project comment style:
+## Patch Delivery Rules for LLMs
 
-```text
-src/marp_inference_worker/main.py
-src/marp_inference_worker/api/app.py
-src/marp_inference_worker/api/health_routes.py
-tests/test_health.py
-```
+Before giving a patch, explain briefly what the change does and why it is being made. Do not put that explanatory rationale into code comments.
 
-## Current `main.py` Intent
+Isaac prefers patches to be specific and easy to apply.
 
-`main.py` is the application entry point.
-
-It should:
+For a whole-function replacement:
 
 ```text
-Import create_app
-Create the module-level app object
-Remain thin
-Avoid route logic
-Avoid model logic
-Avoid job logic
+Give the new full function only.
+Do not include the old full function.
 ```
 
-## Current `api/app.py` Intent
-
-`api/app.py` is the FastAPI application factory.
-
-It should:
+For a partial-function replacement:
 
 ```text
-Create the FastAPI application
-Define service metadata shown in Swagger/OpenAPI
-Register routers
-Return the configured app
+Give exact old code to find.
+Give exact replacement code.
+Include enough surrounding context so Isaac knows where it goes.
 ```
 
-It should not contain actual endpoint behavior, model loading, video processing, or job management.
+If adding a new import, state where it belongs and show the surrounding import group.
 
-## Current `health_routes.py` Intent
+If adding a new file, provide the full file content.
 
-`health_routes.py` owns lightweight health-check endpoints.
+If exact current code matters and is not known, ask Isaac to paste the exact file or function before advising where to patch.
 
-It should:
+## Working Style with Isaac
+
+Isaac is the programmer. The LLM is the assistant.
+
+Do not race ahead. Do not design huge systems without checking direction.
+
+Work one small milestone at a time.
+
+A useful step pattern is:
 
 ```text
-Expose cheap health checks
-Avoid expensive runtime checks
-Avoid model loading
-Avoid job execution
-Avoid GPU-heavy checks
+1. Explain the next design decision.
+2. Confirm the chosen direction when needed.
+3. Explain what the patch changes and why.
+4. Provide the exact code patch.
+5. Ask Isaac to run pytest or manually test.
+6. Use test results as the checkpoint.
 ```
 
-## Development Sequence
+Do not assume code that has not been shown in the current context.
 
-Current milestone:
-
-```text
-Minimal FastAPI skeleton
-/health endpoint
-pytest test for /health
-GitHub repository setup
-AGENTS.md project guidance
-```
-
-Next likely milestones:
-
-```text
-1. Add /status endpoint
-2. Add worker identity and runtime state object
-3. Add tests for /status
-4. Add model spec schema
-5. Add fake model loading
-6. Add tests for model loading
-7. Add fake job lifecycle
-8. Add tests for job submission and status
-9. Add model artifact download/cache behavior
-10. Add mock inference engine
-11. Add real Ultralytics engine
-12. Add video/HLS decoding
-```
-
-Do not jump to later milestones unless Isaac explicitly asks.
-
-## Model System Direction
-
-Models will be hosted on a model server.
-
-The coordinator will eventually send the worker a model specification containing a URL and metadata. The worker should download the model if needed, cache it locally, verify it when possible, and reuse it from cache when the same artifact is requested again.
-
-The cache should be based on model identity plus artifact hash or immutable version, not only the model name.
-
-The worker should eventually support multiple engine types, especially:
-
-```text
-Ultralytics models
-Custom Torch models
-Mock engine for testing
-Possibly ONNX or TensorRT later
-```
-
-FastAPI is only the API layer. It should not constrain the inference engines.
-
-## Result Semantics
-
-The worker should return detections, not finalized MARP observations.
-
-A worker result should say:
-
-```text
-This model produced this detection on this frame.
-```
-
-The coordinator or database layer should decide:
-
-```text
-Whether a detection becomes an observation
-Whether detections are merged
-Whether results require review
-Whether a result is saved as a proposed observation
-How detections map to database records
-```
-
-## Preferred Working Style with LLMs
-
-Work interactively.
-
-Do not provide huge project-wide rewrites unless asked.
-
-For each step:
-
-```text
-Explain the purpose of the change
-Show the specific file or patch
-Wait for Isaac to apply/test when appropriate
-Use tests as checkpoints
-```
-We'll create tests in parallel to our code as we go along.
-
-When suggesting code changes, explain why the change is needed before giving the patch.
-
-If exact code context is missing, ask for the exact file or function before advising where to patch.
-
-Use PowerShell commands when giving Windows shell instructions.
+Use PowerShell commands for Windows shell instructions.
 
 Use `vim` for Linux config edits unless Isaac specifies otherwise.
 
-Final JSON outputs should be placed inside code blocks for easier copying.
+Final JSON outputs should be in code blocks for easier copying.
+
+Keep responses concise. Isaac explicitly asked for less overexplaining. Give enough context to reason about the change, but avoid broad surveys unless he asks.
 
 ## Git Notes
 
-The project is tracked in git and pushed to GitHub.
-
 Use small commits.
 
-Suggested commit style:
+Current useful commit milestones already completed or expected around this handoff:
 
 ```text
 Initial FastAPI inference worker skeleton
-Add worker status endpoint
-Add model load schema
-Add fake model manager
-Add video range job lifecycle
+Add static worker status endpoint
+Add fake model loading endpoints
+Add model load settings schema
+Add model cache path planning
+Add model artifact download/cache path
+Support local model artifact caching
+Add engine registry and mock engine
 ```
 
 Do not commit:
@@ -370,23 +546,21 @@ model artifacts
 runtime data
 cache folders
 logs
+models/cache/
+test_models/ real model files unless explicitly intended
 ```
 
 ## Environment Notes
 
 Use a project-specific virtual environment.
 
-Current recommended Python for this project:
+Recommended Python:
 
 ```text
 Python 3.10.x
 ```
 
-Reason: this project will likely use Torch and Ultralytics, and Python 3.10 is a conservative choice for dependency compatibility.
-
-The venv is not a standalone executable bundle. Each worker computer still needs a compatible Python installation.
-
-## Current Commands
+Reason: this project will likely use Torch and Ultralytics, and Python 3.10 is a conservative compatibility choice.
 
 Create and activate the venv on Windows:
 
@@ -395,7 +569,7 @@ py -3.10 -m venv .venv
 .\.venv\Scripts\Activate.ps1
 ```
 
-Install development dependencies:
+Install project dependencies:
 
 ```powershell
 pip install -e ".[dev]"
@@ -417,5 +591,139 @@ Check the API:
 
 ```text
 http://127.0.0.1:8000/health
+http://127.0.0.1:8000/status
 http://127.0.0.1:8000/docs
 ```
+
+## Current Dependencies
+
+Core dependencies currently include:
+
+```text
+fastapi
+uvicorn[standard]
+pydantic
+httpx
+```
+
+Development dependencies include:
+
+```text
+pytest
+httpx
+ruff
+```
+
+The project has not yet added Ultralytics, Torch, OpenCV, PyAV, or other heavy ML/video dependencies.
+
+## Current Next Step
+
+The likely next implementation step is:
+
+```text
+Add a real UltralyticsEngine.
+```
+
+Recommended direction:
+
+```text
+1. Add ultralytics dependency carefully.
+2. Register "ultralytics" in engine_registry.
+3. Implement UltralyticsEngine.load_model().
+4. Test loading a local real Ultralytics .pt artifact copied through artifact.url.
+5. Keep inference endpoint separate until model loading is confirmed.
+```
+
+Do not start with fake `/infer/frame` unless Isaac changes direction. Isaac decided a fake inference endpoint would not be useful before real model loading works.
+
+After Ultralytics loading works, the next likely feature is:
+
+```text
+POST /infer/frame
+```
+
+That endpoint should accept a directly supplied frame or image reference and return normalized model detections.
+
+Later milestones:
+
+```text
+Frame inference with real Ultralytics model
+Result normalization for detection outputs
+Video/HLS range job endpoint
+Local job manager
+Job status and cancellation
+Callback or polling result delivery
+Custom PyTorch engine support
+Hash verification for cached artifacts
+Worker status backed by real model/job state
+```
+
+## Important Model and Result Semantics
+
+The worker should return model detections/results, not finalized MARP observations.
+
+The worker result means:
+
+```text
+This model produced this output for this input.
+```
+
+The coordinator/database layer decides:
+
+```text
+Whether a detection becomes an observation
+Whether detections are merged
+Whether results require human review
+How class labels map to MARP database records
+How inference results are saved
+```
+
+## Historical Context
+
+The project was started because Isaac has existing MARP/ML inference scripts, including a large inference script, but they are not structured for:
+
+```text
+multiple jobs
+multiple workers
+multiple model engines
+clean API usage
+model loading from a model server
+future distributed processing
+```
+
+The architecture direction is to avoid another large monolithic script. The project is being built as a modular API service with small files, tests, comments, and replaceable components.
+
+Older design decisions:
+
+```text
+The coordinator will eventually talk to the MARP database API, model server, Jellyfin/video server, and multiple workers.
+The worker should eventually be able to pull video or HLS streams directly from the video server.
+For high-throughput video work, the worker should process video ranges locally rather than receive one HTTP request per frame.
+Single-frame inference is still needed for testing, GUI tools, and debugging.
+```
+
+Keep this distinction clear:
+
+```text
+Coordinator = decides what should run and stores/interprets results.
+Worker = loads models, processes assigned inputs, reports local state, returns detections/results.
+```
+
+```
+
+If you do not know the code in a file, do not assume, just ask for it before suggesting an edit. 
+when you tell me to add a new file, just give me the powershell command to run from the base of the project.
+
+Current milestone:
+  1. Load a real Ultralytics YOLO model.
+  2. Store the loaded model handle in the UltralyticsEngine.
+  3. Add frame inference through the same engine.
+  4. Return normalized detections from one image/frame.
+
+Not yet:
+  Training jobs
+  Job manager
+  GPU resource endpoint
+  ByteTrack
+  Video range processing
+  Coordinator behavior

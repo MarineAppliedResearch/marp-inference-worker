@@ -8,6 +8,7 @@ Requires-Dist: fastapi
 Requires-Dist: uvicorn[standard]
 Requires-Dist: pydantic
 Requires-Dist: httpx
+Requires-Dist: ultralytics
 Provides-Extra: dev
 Requires-Dist: pytest; extra == "dev"
 Requires-Dist: httpx; extra == "dev"

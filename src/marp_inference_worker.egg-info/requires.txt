@@ -2,6 +2,7 @@ fastapi
 uvicorn[standard]
 pydantic
 httpx
+ultralytics
 
 [dev]
 pytest

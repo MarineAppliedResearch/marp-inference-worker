@@ -29,30 +29,34 @@ def test_infer_frame_returns_detections(monkeypatch) -> None:
 
     # fake_infer_frame()
     # Replaces real model inference during this route test.
-    # Inputs: model ID, image source, and confidence threshold.
-    # Output: one normalized fake detection.
+    # Inputs: model ID, image source, confidence threshold, and image flag.
+    # Output: fake inference result dictionary.
     # Use this so the API route can be tested without loading YOLO.
     def fake_infer_frame(
         model_id: str,
         image_source: str,
         confidence: float,
-    ) -> list[dict[str, object]]:
+        return_annotated_image: bool = False,
+    ) -> dict[str, object]:
 
         # Confirm the route passes the request values into the manager.
         assert model_id == "demo_yolo"
         assert image_source == "C:\\test_frames\\frame_001.jpg"
         assert confidence == 0.25
+        assert return_annotated_image is False
 
-        # Return a representative normalized detection.
-        return [
-            {
-                "class_id": 0,
-                "class_name": "Bat star",
-                "confidence": 0.9,
-                "bbox_xyxy": [10.0, 20.0, 30.0, 40.0],
-                "bbox_xyxyn": [0.1, 0.2, 0.3, 0.4],
-            }
-        ]
+        # Return a representative inference result.
+        return {
+            "detections": [
+                {
+                    "class_id": 0,
+                    "class_name": "Bat star",
+                    "confidence": 0.9,
+                    "bbox_xyxy": [10.0, 20.0, 30.0, 40.0],
+                    "bbox_xyxyn": [0.1, 0.2, 0.3, 0.4],
+                }
+            ]
+        }
 
     # Patch the model manager so this test only checks route behavior.
     monkeypatch.setattr(model_manager, "infer_frame", fake_infer_frame)
@@ -77,9 +81,14 @@ def test_infer_frame_returns_detections(monkeypatch) -> None:
     assert response_body["model_id"] == "demo_yolo"
     assert response_body["image_source"] == "C:\\test_frames\\frame_001.jpg"
     assert response_body["confidence"] == 0.25
+    assert response_body["return_annotated_image"] is False
 
     # Confirm detection count is derived from the returned detections list.
     assert response_body["detection_count"] == 1
+
+    # Confirm no annotated image is returned unless requested.
+    assert "annotated_image_format" not in response_body
+    assert "annotated_image_base64" not in response_body
 
     # Confirm the returned detection includes pixel and normalized boxes.
     assert response_body["detections"] == [
@@ -144,14 +153,15 @@ def test_infer_frame_returns_400_when_model_is_not_loaded(monkeypatch) -> None:
 
     # fake_infer_frame()
     # Simulates manager failure when the requested model is not loaded.
-    # Inputs: model ID, image source, and confidence threshold.
+    # Inputs: model ID, image source, confidence threshold, and image flag.
     # Output: raises ValueError.
     # Use this so the route error handling can be tested directly.
     def fake_infer_frame(
         model_id: str,
         image_source: str,
         confidence: float,
-    ) -> list[dict[str, object]]:
+        return_annotated_image: bool = False,
+    ) -> dict[str, object]:
 
         # Raise the same error type used by model_manager.infer_frame().
         raise ValueError(f"Model is not loaded: {model_id}")

@@ -16,6 +16,9 @@ from marp_inference_worker.engines.base_engine import BaseEngine
 # ModelSpec defines the validated model metadata passed into the engine.
 from marp_inference_worker.models.model_spec import ModelSpec
 
+# Frame source utilities prepare local paths and URL images for prediction.
+from marp_inference_worker.inputs.frame_source import prepare_frame_source
+
 
 # UltralyticsEngine
 # Loads and stores Ultralytics-compatible YOLO model handles.
@@ -89,72 +92,11 @@ class UltralyticsEngine(BaseEngine):
         return self._loaded_models_by_id[model_id]
 
 
-    # _prepare_image_source_for_prediction()
-    # Converts image source input into a YOLO-readable source path.
-    # Inputs: local path or HTTP/HTTPS image URL.
-    # Output: prediction source path and optional temp file path for cleanup.
-    # Use this so URL images are downloaded once instead of treated as streams.
-    def _prepare_image_source_for_prediction(self, image_source: str) -> tuple[str, Path | None]:
-
-        # Local paths can be passed directly to Ultralytics.
-        if not image_source.lower().startswith(("http://", "https://")):
-            return image_source, None
-
-        # Standard library modules parse URL paths and create temp files.
-        import tempfile
-        from urllib.parse import urlparse
-
-        # HTTPX downloads URL image sources before inference.
-        import httpx
-
-        # Download the image URL once so Ultralytics does not treat it as a stream.
-        response = httpx.get(
-            image_source,
-            follow_redirects=True,
-            timeout=30.0,
-        )
-
-        # Raise a clear error if the URL could not be downloaded.
-        response.raise_for_status()
-
-        # Confirm the server returned image content.
-        content_type = response.headers.get("content-type", "").lower()
-        if not content_type.startswith("image/"):
-            raise ValueError(f"URL did not return image content: {content_type}")
-
-        # Pick a file suffix from the content type or URL path.
-        suffix_by_content_type = {
-            "image/jpeg": ".jpg",
-            "image/jpg": ".jpg",
-            "image/png": ".png",
-            "image/webp": ".webp",
-            "image/bmp": ".bmp",
-        }
-        suffix = suffix_by_content_type.get(content_type.split(";")[0], "")
-
-        # Fall back to the URL path suffix if content type was less specific.
-        if suffix == "":
-            url_path = Path(urlparse(image_source).path)
-            suffix = url_path.suffix if url_path.suffix else ".jpg"
-
-        # Write the downloaded image to a temporary file for YOLO prediction.
-        temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
-        temp_path = Path(temp_file.name)
-
-        try:
-            temp_file.write(response.content)
-            temp_file.close()
-        except Exception:
-            temp_file.close()
-            temp_path.unlink(missing_ok=True)
-            raise
-
-        # Return the temp file path and remember it for cleanup after inference.
-        return str(temp_path), temp_path
+    
     
 
 
-     # infer_frame()
+        # infer_frame()
     # Runs object detection on one image source using a loaded YOLO model.
     # Inputs: model ID, image source, confidence threshold, label map, and image flag.
     # Output: normalized detections and optional base64 annotated image.
@@ -171,13 +113,13 @@ class UltralyticsEngine(BaseEngine):
         # Get the already-loaded YOLO model handle for this model ID.
         yolo_model = self.get_loaded_model(model_id)
 
-        # Convert URLs into temporary local files before prediction.
-        prediction_source, temp_image_path = self._prepare_image_source_for_prediction(image_source)
+        # Prepare local paths and URL images through the shared frame-source utility.
+        prepared_source = prepare_frame_source(image_source)
 
         try:
             # Run Ultralytics prediction on the prepared image source.
             results = yolo_model.predict(
-                source=prediction_source,
+                source=prepared_source.prediction_source,
                 conf=confidence,
                 verbose=False,
             )
@@ -233,7 +175,7 @@ class UltralyticsEngine(BaseEngine):
                 "detections": detections,
             }
 
-            # Optionally add a base64-encoded annotated JPG to the JSON result.
+            # Optionally add a base64-encoded annotated image to the JSON result.
             if return_annotated_image:
 
                 # Base64 is used so the annotated image can travel inside JSON.
@@ -255,15 +197,16 @@ class UltralyticsEngine(BaseEngine):
             return inference_result
 
         finally:
-            # Remove temporary URL downloads after prediction and rendering finish.
-            if temp_image_path is not None:
-                temp_image_path.unlink(missing_ok=True)
+            # Clean up temporary URL downloads after prediction and rendering finish.
+            prepared_source.cleanup()
+
+
     
         # infer_frame_image()
-    # Runs inference and returns an annotated JPG image.
+    # Runs inference and returns an annotated image.
     # Inputs: model ID, image source, confidence threshold, and class-name map.
-    # Output: encoded JPG image bytes.
-    # Use this when an API route should return image/jpeg directly.
+    # Output: encoded image bytes.
+    # Use this when an API route should return image bytes directly.
     def infer_frame_image(
         self,
         model_id: str,
@@ -275,13 +218,13 @@ class UltralyticsEngine(BaseEngine):
         # Get the already-loaded YOLO model handle for this model ID.
         yolo_model = self.get_loaded_model(model_id)
 
-        # Convert URLs into temporary local files before prediction.
-        prediction_source, temp_image_path = self._prepare_image_source_for_prediction(image_source)
+        # Prepare local paths and URL images through the shared frame-source utility.
+        prepared_source = prepare_frame_source(image_source)
 
         try:
             # Run Ultralytics prediction on the prepared image source.
             results = yolo_model.predict(
-                source=prediction_source,
+                source=prepared_source.prediction_source,
                 conf=confidence,
                 verbose=False,
             )
@@ -339,9 +282,8 @@ class UltralyticsEngine(BaseEngine):
             )
 
         finally:
-            # Remove temporary URL downloads after prediction and rendering finish.
-            if temp_image_path is not None:
-                temp_image_path.unlink(missing_ok=True)
+            # Clean up temporary URL downloads after prediction and rendering finish.
+            prepared_source.cleanup()
 
 
         # _render_annotated_image_jpg()

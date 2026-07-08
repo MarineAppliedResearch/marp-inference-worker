@@ -87,3 +87,76 @@ class UltralyticsEngine(BaseEngine):
 
         # Return the raw model handle for engine-internal inference use.
         return self._loaded_models_by_id[model_id]
+
+
+        # infer_frame()
+    # Runs object detection on one image source using a loaded YOLO model.
+    # Inputs: model ID, image source, confidence threshold, and class-name map.
+    # Output: normalized detection dictionaries safe for API responses.
+    # Use this for first-pass frame inference before video or tracking jobs.
+    def infer_frame(
+        self,
+        model_id: str,
+        image_source: str,
+        confidence: float,
+        class_names_by_id: dict[int, str],
+    ) -> list[dict[str, object]]:
+
+        # Get the already-loaded YOLO model handle for this model ID.
+        yolo_model = self.get_loaded_model(model_id)
+
+        # Run Ultralytics prediction on the image source.
+        results = yolo_model.predict(
+            source=image_source,
+            conf=confidence,
+            verbose=False,
+        )
+
+        # Store normalized detections returned to callers.
+        detections: list[dict[str, object]] = []
+
+        # Ultralytics returns one result object per input image.
+        for result in results:
+
+            # Skip result objects with no detection boxes.
+            if result.boxes is None:
+                continue
+
+            # Normalize every detected box into the worker response contract.
+            for box in result.boxes:
+
+                # Convert class ID and confidence into plain Python values.
+                class_id = int(box.cls[0].item())
+                detection_confidence = float(box.conf[0].item())
+
+                # Convert pixel xyxy tensor coordinates into plain Python floats.
+                bbox_xyxy = [
+                    float(value)
+                    for value in box.xyxy[0].tolist()
+                ]
+
+                # Convert normalized xyxy tensor coordinates into plain Python floats.
+                bbox_xyxyn = [
+                    float(value)
+                    for value in box.xyxyn[0].tolist()
+                ]
+
+                # Prefer labels from the model spec, then fall back to Ultralytics names.
+                class_name = class_names_by_id.get(
+                    class_id,
+                    yolo_model.names.get(class_id, str(class_id)),
+                )
+
+                # Add one normalized detection to the result list.
+                detections.append(
+                    {
+                        "class_id": class_id,
+                        "class_name": class_name,
+                        "confidence": detection_confidence,
+                        "bbox_xyxy": bbox_xyxy,
+                        "bbox_xyxyn": bbox_xyxyn,
+                    }
+                )
+
+        # Return all normalized detections for this frame.
+        return detections

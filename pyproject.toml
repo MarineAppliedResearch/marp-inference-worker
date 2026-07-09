@@ -23,6 +23,7 @@ dependencies = [
     "filterpy",
     "h5py",
     "cython-bbox",
+    "sortedcontainers",
 ]
 [project.optional-dependencies]
 dev = [

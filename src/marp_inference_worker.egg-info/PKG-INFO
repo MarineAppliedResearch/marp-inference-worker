@@ -23,6 +23,7 @@ Requires-Dist: motmetrics
 Requires-Dist: filterpy
 Requires-Dist: h5py
 Requires-Dist: cython-bbox
+Requires-Dist: sortedcontainers
 Provides-Extra: dev
 Requires-Dist: pytest; extra == "dev"
 Requires-Dist: httpx; extra == "dev"

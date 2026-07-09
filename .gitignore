@@ -25,6 +25,7 @@ Thumbs.db
 
 # Runtime/cache data
 data/
+datasets/
 models/
 runs/
 logs/
@@ -35,3 +36,4 @@ tmp/
 *.onnx
 *.engine
 *.weights
+

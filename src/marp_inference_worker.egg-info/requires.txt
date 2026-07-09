@@ -17,6 +17,7 @@ motmetrics
 filterpy
 h5py
 cython-bbox
+sortedcontainers
 
 [dev]
 pytest

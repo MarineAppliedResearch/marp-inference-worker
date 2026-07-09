@@ -31,6 +31,8 @@ src/marp_inference_worker/rendering/__init__.py
 src/marp_inference_worker/rendering/detection_renderer.py
 src/marp_inference_worker/system/__init__.py
 src/marp_inference_worker/system/resource_monitor.py
+src/old_scripts/database_video_annotations.py
+src/old_scripts/object_tracking_live.py
 tests/test_engine_registry.py
 tests/test_health.py
 tests/test_inference.py

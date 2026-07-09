@@ -11,6 +11,18 @@ dependencies = [
     "ultralytics",
     "psutil",
     "nvidia-ml-py",
+    "loguru",
+    "scipy",
+    "lap",
+    "scikit-image",
+    "thop",
+    "ninja",
+    "tabulate",
+    "tensorboard",
+    "motmetrics",
+    "filterpy",
+    "h5py",
+    "cython-bbox",
 ]
 [project.optional-dependencies]
 dev = [

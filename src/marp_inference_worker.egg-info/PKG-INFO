@@ -11,6 +11,18 @@ Requires-Dist: httpx
 Requires-Dist: ultralytics
 Requires-Dist: psutil
 Requires-Dist: nvidia-ml-py
+Requires-Dist: loguru
+Requires-Dist: scipy
+Requires-Dist: lap
+Requires-Dist: scikit-image
+Requires-Dist: thop
+Requires-Dist: ninja
+Requires-Dist: tabulate
+Requires-Dist: tensorboard
+Requires-Dist: motmetrics
+Requires-Dist: filterpy
+Requires-Dist: h5py
+Requires-Dist: cython-bbox
 Provides-Extra: dev
 Requires-Dist: pytest; extra == "dev"
 Requires-Dist: httpx; extra == "dev"

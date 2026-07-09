@@ -4,6 +4,7 @@ pydantic
 httpx
 ultralytics
 psutil
+nvidia-ml-py
 
 [dev]
 pytest

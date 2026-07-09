@@ -38,6 +38,7 @@ def test_system_resources_route_returns_expected_sections():
     assert "disk" in data
     assert "python" in data
     assert "torch" in data
+    assert "nvidia" in data
     assert "job_pressure" in data
 
     # Verify a few coordinator-useful nested fields.
@@ -46,4 +47,5 @@ def test_system_resources_route_returns_expected_sections():
     assert "percent_used" in data["memory"]
     assert "free_bytes" in data["disk"]
     assert "torch_available" in data["torch"]
+    assert "nvml_available" in data["nvidia"]
     assert "worker_accepting_jobs" in data["job_pressure"]

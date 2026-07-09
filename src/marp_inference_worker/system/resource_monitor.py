@@ -5,13 +5,26 @@
 # System role: Provides system state data for API routes and future coordinator decisions.
 # Code in this file should inspect local resources but should not schedule jobs.
 
-# Standard library imports provide OS, Python, host, and disk path information.
+# os provides operating-system features such as load average checks where supported.
 import os
+
+# platform provides host, operating system, and processor metadata.
 import platform
+
+# shutil provides cross-platform disk usage inspection.
 import shutil
+
+# sys provides Python runtime version and executable metadata.
 import sys
+
+# Path provides cross-platform filesystem path handling.
 from pathlib import Path
+
+# Any supports flexible JSON-serializable resource dictionaries.
 from typing import Any
+
+# Callable supports typed helper functions that safely call optional NVML methods.
+from typing import Callable
 
 # psutil provides cross-platform CPU, memory, and disk usage metrics.
 import psutil
@@ -34,10 +47,227 @@ def get_system_resources() -> dict[str, Any]:
         "disk": _get_disk_resources(current_path),
         "python": _get_python_resources(),
         "torch": _get_torch_resources(),
+        "nvidia": _get_nvidia_resources(),
         "job_pressure": _get_empty_job_pressure(),
     }
 
     return resources
+
+# Collect NVIDIA GPU telemetry through NVML when available.
+# Inputs: none.
+# Outputs: JSON-serializable NVIDIA driver and GPU telemetry.
+# This complements Torch CUDA visibility with live hardware status.
+def _get_nvidia_resources() -> dict[str, Any]:
+
+    # Default response used when NVML is unavailable or no NVIDIA driver is present.
+    nvidia_resources: dict[str, Any] = {
+        "nvml_available": False,
+        "driver_version": None,
+        "device_count": 0,
+        "devices": [],
+        "error": None,
+    }
+
+    try:
+        # pynvml is imported lazily so non-NVIDIA systems can still run the API.
+        import pynvml
+
+    except Exception as exc:
+        # Store import failure as data instead of failing the endpoint.
+        nvidia_resources["error"] = str(exc)
+        return nvidia_resources
+
+    try:
+        # Initialize NVML before querying driver or device telemetry.
+        pynvml.nvmlInit()
+
+    except Exception as exc:
+        # NVML may be installed even when the NVIDIA driver is unavailable.
+        nvidia_resources["error"] = str(exc)
+        return nvidia_resources
+
+    try:
+        # Driver version and device count describe the NVIDIA runtime visible to this worker.
+        driver_version = _decode_nvml_value(pynvml.nvmlSystemGetDriverVersion())
+        device_count = pynvml.nvmlDeviceGetCount()
+
+        # Store top-level NVML capability fields.
+        nvidia_resources["nvml_available"] = True
+        nvidia_resources["driver_version"] = driver_version
+        nvidia_resources["device_count"] = device_count
+
+        # Collect per-device NVIDIA telemetry.
+        devices: list[dict[str, Any]] = []
+
+        for device_index in range(device_count):
+            # NVML handle is used for all device-specific queries.
+            device_handle = pynvml.nvmlDeviceGetHandleByIndex(device_index)
+
+            # Per-device telemetry returned to the API.
+            device_resources = _get_nvidia_device_resources(pynvml, device_handle, device_index)
+
+            devices.append(device_resources)
+
+        # Store the completed device telemetry list.
+        nvidia_resources["devices"] = devices
+
+    except Exception as exc:
+        # Return any partial data collected before the failure.
+        nvidia_resources["error"] = str(exc)
+
+    finally:
+        # Shut down NVML so the request does not leave the library initialized.
+        _safe_nvml_call(pynvml.nvmlShutdown)
+
+    return nvidia_resources
+
+
+# Collect NVIDIA telemetry for one NVML device handle.
+# Inputs: pynvml module, NVML device handle, and device index.
+# Outputs: JSON-serializable per-GPU telemetry dictionary.
+# This isolates optional hardware queries that may vary by platform.
+def _get_nvidia_device_resources(pynvml_module: Any, device_handle: Any, device_index: int) -> dict[str, Any]:
+
+    # Static device identity fields.
+    device_name = _decode_nvml_value(_safe_nvml_call(pynvml_module.nvmlDeviceGetName, device_handle))
+    device_uuid = _decode_nvml_value(_safe_nvml_call(pynvml_module.nvmlDeviceGetUUID, device_handle))
+
+    # PCI information identifies the physical GPU location.
+    pci_info = _safe_nvml_call(pynvml_module.nvmlDeviceGetPciInfo, device_handle)
+    pci_bus_id = _decode_nvml_value(getattr(pci_info, "busId", None))
+
+    # Memory telemetry from NVML should roughly match nvidia-smi.
+    memory_info = _safe_nvml_call(pynvml_module.nvmlDeviceGetMemoryInfo, device_handle)
+
+    # GPU and memory utilization are core scheduling signals.
+    utilization_info = _safe_nvml_call(pynvml_module.nvmlDeviceGetUtilizationRates, device_handle)
+
+    # Temperature, fan, power, and clocks are useful health and load signals.
+    temperature_c = _get_nvml_temperature_c(pynvml_module, device_handle)
+    fan_speed_percent = _safe_nvml_call(pynvml_module.nvmlDeviceGetFanSpeed, device_handle)
+    power_usage_watts = _get_nvml_power_usage_watts(pynvml_module, device_handle)
+    power_limit_watts = _get_nvml_power_limit_watts(pynvml_module, device_handle)
+    graphics_clock_mhz = _get_nvml_clock_mhz(pynvml_module, device_handle, pynvml_module.NVML_CLOCK_GRAPHICS)
+    memory_clock_mhz = _get_nvml_clock_mhz(pynvml_module, device_handle, pynvml_module.NVML_CLOCK_MEM)
+
+    # Per-device NVIDIA resource snapshot.
+    device_resources: dict[str, Any] = {
+        "device_index": device_index,
+        "name": device_name,
+        "uuid": device_uuid,
+        "pci_bus_id": pci_bus_id,
+        "temperature_c": temperature_c,
+        "fan_speed_percent": fan_speed_percent,
+        "power_usage_watts": power_usage_watts,
+        "power_limit_watts": power_limit_watts,
+        "graphics_clock_mhz": graphics_clock_mhz,
+        "memory_clock_mhz": memory_clock_mhz,
+        "gpu_utilization_percent": getattr(utilization_info, "gpu", None),
+        "memory_utilization_percent": getattr(utilization_info, "memory", None),
+        "memory_total_bytes": getattr(memory_info, "total", None),
+        "memory_free_bytes": getattr(memory_info, "free", None),
+        "memory_used_bytes": getattr(memory_info, "used", None),
+        "memory_percent_used": _safe_percent(
+            getattr(memory_info, "used", 0),
+            getattr(memory_info, "total", 0),
+        ),
+    }
+
+    return device_resources
+
+
+# Safely call one NVML function and return None on unsupported fields.
+# Inputs: callable NVML function and optional positional arguments.
+# Outputs: NVML result or None.
+# This keeps one unsupported telemetry field from failing the whole endpoint.
+def _safe_nvml_call(function_to_call: Callable[..., Any], *args: Any) -> Any | None:
+
+    try:
+        # Call the NVML function with the supplied arguments.
+        result = function_to_call(*args)
+
+    except Exception:
+        # Many NVML fields are platform, driver, or device dependent.
+        return None
+
+    return result
+
+
+# Decode NVML byte values into strings when needed.
+# Inputs: value returned by NVML.
+# Outputs: decoded string, original value, or None.
+# This keeps API output JSON-friendly across pynvml versions.
+def _decode_nvml_value(value: Any) -> Any:
+
+    if isinstance(value, bytes):
+        # NVML may return bytes for names, UUIDs, and driver versions.
+        return value.decode("utf-8", errors="replace")
+
+    return value
+
+
+# Read GPU temperature from NVML when supported.
+# Inputs: pynvml module and NVML device handle.
+# Outputs: temperature in Celsius or None.
+# This isolates the NVML temperature constant from the main device collector.
+def _get_nvml_temperature_c(pynvml_module: Any, device_handle: Any) -> int | None:
+
+    # Temperature is reported using the GPU temperature sensor.
+    temperature_c = _safe_nvml_call(
+        pynvml_module.nvmlDeviceGetTemperature,
+        device_handle,
+        pynvml_module.NVML_TEMPERATURE_GPU,
+    )
+
+    return temperature_c
+
+
+# Read GPU power usage from NVML when supported.
+# Inputs: pynvml module and NVML device handle.
+# Outputs: power draw in watts or None.
+# NVML reports power usage in milliwatts.
+def _get_nvml_power_usage_watts(pynvml_module: Any, device_handle: Any) -> float | None:
+
+    # NVML reports power draw in milliwatts.
+    power_usage_milliwatts = _safe_nvml_call(pynvml_module.nvmlDeviceGetPowerUsage, device_handle)
+
+    if power_usage_milliwatts is None:
+        return None
+
+    # Convert milliwatts to watts.
+    power_usage_watts = round(power_usage_milliwatts / 1000.0, 2)
+
+    return power_usage_watts
+
+
+# Read GPU power limit from NVML when supported.
+# Inputs: pynvml module and NVML device handle.
+# Outputs: power limit in watts or None.
+# NVML reports power limit in milliwatts.
+def _get_nvml_power_limit_watts(pynvml_module: Any, device_handle: Any) -> float | None:
+
+    # NVML reports power limit in milliwatts.
+    power_limit_milliwatts = _safe_nvml_call(pynvml_module.nvmlDeviceGetPowerManagementLimit, device_handle)
+
+    if power_limit_milliwatts is None:
+        return None
+
+    # Convert milliwatts to watts.
+    power_limit_watts = round(power_limit_milliwatts / 1000.0, 2)
+
+    return power_limit_watts
+
+
+# Read one GPU clock value from NVML when supported.
+# Inputs: pynvml module, NVML device handle, and NVML clock type.
+# Outputs: clock speed in MHz or None.
+# This supports graphics and memory clock telemetry.
+def _get_nvml_clock_mhz(pynvml_module: Any, device_handle: Any, clock_type: int) -> int | None:
+
+    # NVML returns the current clock speed in MHz.
+    clock_mhz = _safe_nvml_call(pynvml_module.nvmlDeviceGetClockInfo, device_handle, clock_type)
+
+    return clock_mhz
 
 
 # Collect stable host and OS identity fields.

@@ -10,6 +10,7 @@ Requires-Dist: pydantic
 Requires-Dist: httpx
 Requires-Dist: ultralytics
 Requires-Dist: psutil
+Requires-Dist: nvidia-ml-py
 Provides-Extra: dev
 Requires-Dist: pytest; extra == "dev"
 Requires-Dist: httpx; extra == "dev"

@@ -3,6 +3,7 @@ uvicorn[standard]
 pydantic
 httpx
 ultralytics
+psutil
 
 [dev]
 pytest

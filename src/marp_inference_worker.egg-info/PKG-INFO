@@ -9,6 +9,7 @@ Requires-Dist: uvicorn[standard]
 Requires-Dist: pydantic
 Requires-Dist: httpx
 Requires-Dist: ultralytics
+Requires-Dist: psutil
 Provides-Extra: dev
 Requires-Dist: pytest; extra == "dev"
 Requires-Dist: httpx; extra == "dev"

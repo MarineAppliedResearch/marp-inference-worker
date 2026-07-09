@@ -18,6 +18,9 @@ from marp_inference_worker.api.model_routes import router as model_router
 # Inference routes expose model execution endpoints.
 from marp_inference_worker.api.inference_routes import router as inference_router
 
+# System routes expose worker-local resource information.
+from marp_inference_worker.api import system_routes
+
 
 # create_app()
 # Builds and returns the FastAPI application used by the ASGI server.
@@ -44,6 +47,9 @@ def create_app() -> FastAPI:
 
     # Register inference routes so loaded models can run against worker-local inputs.
     app.include_router(inference_router)
+
+    # Register system information routes so the coordinator can understasnd what state the system is in.
+    app.include_router(system_routes.router)
 
     # Return the configured app object to main.py for Uvicorn/ASGI discovery.
     return app

@@ -9,6 +9,7 @@ dependencies = [
     "pydantic",
     "httpx",
     "ultralytics",
+    "psutil",
 ]
 [project.optional-dependencies]
 dev = [

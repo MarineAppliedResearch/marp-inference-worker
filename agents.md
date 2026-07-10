@@ -1157,3 +1157,332 @@ Good next steps, depending on Isaac’s choice:
 
 Do not begin a large job-manager or training implementation without first checking direction with Isaac.
 the dev system we are working with is currently windows, but we want this program to be able to work on linux as well, usually ubuntu
+
+
+## Recent Project History: Jellyfin Streams, Dataset Building, ByteTrack Reference Code, and Training Pipeline
+
+This section records work completed after the earlier FastAPI inference-worker foundation described above.
+
+### Legacy AI Scripts as Reference Material
+
+Older MARP AI scripts have been copied into the repository so they can be run independently during migration and used as reference material while building the new worker architecture.
+
+These scripts are **not** the final architecture. They are temporary reference and compatibility code.
+
+Use them for:
+
+```text
+Manual validation
+Understanding older MARP AI workflows
+Comparing behavior while porting features
+Testing models and datasets before the new worker job system exists
+```
+
+Do not use them as the destination for new production architecture.
+
+Reusable logic from the old scripts should gradually move into structured packages such as:
+
+```text
+src/marp_inference_worker/media/
+src/marp_inference_worker/inputs/
+src/marp_inference_worker/engines/
+src/marp_inference_worker/jobs/
+src/marp_inference_worker/training/
+```
+
+The old scripts can still be run independently from the project root with the virtual environment active.
+
+### ByteTrack Reference and Migration Notes
+
+ByteTrack reference code is present in the repository so the old tracking workflow can still run during migration.
+
+Current status:
+
+```text
+The old ByteTrack workflow can be used for manual testing.
+ByteTrack should not be wired directly into model loading or single-frame inference.
+Future ByteTrack support belongs after video or frame-sequence processing exists.
+Tracking requires sequential frame state and should eventually be part of a video job or tracking module.
+```
+
+When tuning for the MARP review workflow, Isaac prefers higher recall even if this increases false positives:
+
+```text
+False positives are easier for biologists to reject in review mosaics.
+False negatives are more expensive because they require reviewing much more video.
+```
+
+For high-recall tracking tests, verify that YOLO confidence thresholds are actually applied before tuning ByteTrack parameters. If low-confidence raw YOLO detections do not contain the missed animals, ByteTrack tuning will not fix the false negatives.
+
+### Jellyfin Client Port
+
+The old C# application already had a mature Jellyfin API client. The Python worker now has an initial port of the reusable service/client pieces.
+
+New media package:
+
+```text
+src/marp_inference_worker/media/
+  __init__.py
+  jellyfin_client.py
+  video_source_resolver.py
+```
+
+`jellyfin_client.py` is the reusable Python Jellyfin API client. Its first responsibilities are:
+
+```text
+Authenticate to Jellyfin using /Users/AuthenticateByName
+Store base_url, access_token, and user_id
+Use X-Emby-Token for authenticated requests
+Get top-level libraries
+Get child items
+Search video items
+Get PlaybackInfo
+Request constrained transcode PlaybackInfo using a DeviceProfile
+Build direct/original stream URLs
+Convert Jellyfin relative URLs into absolute URLs
+```
+
+Environment variables used for development testing:
+
+```powershell
+$env:JELLYFIN_BASE_URL="http://47.208.203.78:8096"
+$env:JELLYFIN_USERNAME="guest1"
+$env:JELLYFIN_PASSWORD="guest1"
+```
+
+Do not hardcode these credentials into source code. Environment variables are acceptable for local development. Long term, this should become settings/config.
+
+Manual smoke testing confirmed:
+
+```text
+Jellyfin authentication succeeds.
+Jellyfin item search works when using normalized filename stems.
+OpenCV can open direct Jellyfin stream URLs.
+OpenCV can read frame count, FPS, width, and height from at least one Jellyfin stream.
+OpenCV can decode and save a frame from a Jellyfin stream.
+```
+
+### Jellyfin Video Source Resolver
+
+`video_source_resolver.py` sits above the raw Jellyfin client.
+
+Purpose:
+
+```text
+Convert database video_source values into something OpenCV can open.
+Prefer an existing local path when available.
+Fall back to Jellyfin stream resolution when local video is missing.
+Normalize filename differences between MARP database values and Jellyfin item names.
+```
+
+The resolver handles cases such as:
+
+```text
+Database video_source:
+20240727_185645 Fwd.mp4
+
+Jellyfin item name:
+20240727_185645_Fwd
+
+Jellyfin path:
+/mnt/rov-video-new/CAMPA2024/Dive 1/20240727_185645_Fwd.mp4
+```
+
+The resolver searches in stages:
+
+```text
+Exact video_source
+Filename basename
+Filename without extension
+Space-to-underscore variant
+Underscore-to-space variant
+Timestamp prefix when available
+```
+
+It ranks candidates by normalized item name and path basename so that spaces, underscores, hyphens, and extensions do not prevent matching.
+
+Manual resolver testing confirmed:
+
+```text
+Input:
+20240727_185645 Fwd.mp4
+
+Resolved:
+Jellyfin item 20240727_185645_Fwd
+
+Match score:
+100
+
+OpenCV:
+Successfully opened direct Jellyfin stream and decoded a frame.
+```
+
+### Dataset Builder Jellyfin Integration
+
+The legacy dataset builder was updated so it can use the new `VideoSourceResolver` instead of only assuming every database `video_source` exists inside a selected local folder.
+
+Old behavior:
+
+```text
+video_source → selected local folder path → cv2.VideoCapture(local path)
+```
+
+New behavior:
+
+```text
+video_source → VideoSourceResolver
+    1. try selected local folder
+    2. if missing, resolve through Jellyfin
+    3. pass local path or Jellyfin stream URL to cv2.VideoCapture
+```
+
+Validated runtime behavior:
+
+```text
+The dataset builder authenticated to Jellyfin.
+The resolver became available for missing local videos.
+The builder opened at least one Jellyfin direct stream URL.
+The existing frame-processing progress output appeared after OpenCV began reading the stream.
+```
+
+Example output:
+
+```text
+[INFO] Jellyfin resolver is available for missing local videos.
+[INFO] Opening video '20240730_190910 Fwd.mp4' using jellyfin_stream: http://47.208.203.78:8096/Videos/.../stream?static=true&api_key=...
+.
+```
+
+This confirms the dataset builder can reach frame processing through Jellyfin.
+
+### Temporal Split Infinite Loop Bug
+
+While testing Jellyfin-backed dataset building, the script appeared to stall before video opening. Debugging confirmed this was not a Jellyfin stream problem. It was a pre-existing temporal split bug.
+
+Problem pattern:
+
+```python
+while start < total_annotated:
+    train_end = int(start + total_annotated * segment_train_ratio)
+    eval_end = int(train_end + total_annotated * segment_eval_ratio)
+    start = eval_end
+```
+
+With small annotated-frame counts, this can produce:
+
+```text
+total_annotated=7
+segment_train_ratio=0.1
+segment_eval_ratio=0.05
+
+train_end=0
+eval_end=0
+start remains 0 forever
+```
+
+Diagnostic output confirmed:
+
+```text
+[ERROR] Temporal split loop would stall for video '20240801_161909 Fwd.mp4'.
+start=0, train_end=0, eval_end=0, total_annotated=7,
+segment_train_ratio=0.1, segment_eval_ratio=0.05
+```
+
+The fix was to convert ratios into minimum segment sizes:
+
+```text
+train_segment_size = max(1, int(total_annotated * segment_train_ratio))
+eval_segment_size = max(1, int(total_annotated * segment_eval_ratio))
+```
+
+and to guard that `start` always advances.
+
+The summary print was also protected from division by zero by computing `split_frame_count` before calculating percent train.
+
+Validated result after fix:
+
+```text
+20240801_161909 Fwd.mp4: 4 train frames, 3 eval frames
+20240731_150901 Fwd.mp4: 4 train frames, 4 eval frames
+```
+
+The dataset builder then reached observation split assignment, database registration, resolver setup, and Jellyfin video opening.
+
+### Training Pipeline Review
+
+The legacy training pipeline currently uses a three-phase YOLO training process.
+
+Current conceptual behavior:
+
+```text
+Run one training phase.
+Find that phase's weights/best.pt.
+Use that best.pt as starting weights for the next phase.
+Repeat for all phases.
+```
+
+The weight handoff logic is valid.
+
+However, the documented phase order and implementation should be checked. The intended conceptual order is likely:
+
+```text
+crops → frames → mixed
+```
+
+Rationale:
+
+```text
+crops:
+  teach organism appearance and small-object detail
+
+frames:
+  teach real ROV full-frame context
+
+mixed:
+  consolidate crop-scale detail and full-frame context
+```
+
+Current epoch logic shortens some phases. Make sure the database records store the actual phase-adjusted epoch count, not just the original configured epoch count.
+
+Potential issue: the training function appears to evaluate and save metrics in the normal success path, then also evaluate and save metrics again in a `finally` block. Since `finally` always runs, this may create duplicate metric summaries on successful training. Refactor later so final evaluation and DB summary happen exactly once.
+
+### Current Working State After This Session
+
+Current validated facts:
+
+```text
+Old scripts are available as runnable reference material.
+ByteTrack reference code is available for manual tracking tests.
+A Python JellyfinClient exists under marp_inference_worker.media.
+A VideoSourceResolver exists under marp_inference_worker.media.
+Standalone Jellyfin stream and resolver smoke tests work.
+OpenCV can read direct Jellyfin stream URLs from the Python worker environment.
+The dataset builder can resolve missing local videos through Jellyfin.
+The dataset builder can begin reading a Jellyfin stream through OpenCV.
+The temporal split infinite-loop bug for low annotated-frame-count videos was found and fixed.
+```
+
+Current caution:
+
+```text
+The old scripts are still legacy migration code.
+Do not treat old_scripts as final architecture.
+Port reusable pieces into marp_inference_worker modules gradually.
+Avoid turning the training script into another permanent monolith.
+```
+
+### Updated Near-Term Next Steps
+
+Good next steps from this point:
+
+```text
+1. Let the Jellyfin-backed dataset build complete and inspect output folders.
+2. Remove temporary debug prints from the dataset builder after confirming stability.
+3. Commit the Jellyfin client, resolver, smoke tests, dependency updates, and temporal split fix.
+4. Search the tracking script for all confidence/threshold filters before tuning ByteTrack further.
+5. Run raw YOLO-only detection at very low confidence to determine whether false negatives are from the detector or the tracker.
+6. Change training phase order to crops → frames → mixed if Isaac confirms.
+7. Fix training DB total_epochs to store the actual phase-adjusted epoch count.
+8. Later refactor duplicate evaluation/metrics logic so final metrics are saved once.
+9. Later migrate dataset building and training into proper worker job modules instead of old_scripts.
+```

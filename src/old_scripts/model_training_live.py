@@ -17,6 +17,9 @@ from pathlib import Path
 import time
 import numpy as np
 
+from marp_inference_worker.media.jellyfin_client import JellyfinClient
+from marp_inference_worker.media.video_source_resolver import VideoSourceResolver
+
 # Try importing the plotting utilities from the correct place
 try:
     from ultralytics.utils.plotting import Annotator as _  # quick test import
@@ -387,23 +390,43 @@ def open_dataset_builder(parent):
 
             # Index pointer through the annotated frame list
             start = 0
+
+            # Convert ratios into per-video segment sizes.
+            # Each segment must be at least one annotated frame so small videos
+            # cannot create zero-length windows and trap the while loop forever.
+            train_segment_size = max(1, int(total_annotated * segment_train_ratio))
+            eval_segment_size = max(1, int(total_annotated * segment_eval_ratio))
+
             while start < total_annotated:
-                # Determine slice boundaries based on ratios
-                train_end = int(start + total_annotated * segment_train_ratio)
-                eval_end  = int(train_end + total_annotated * segment_eval_ratio)
+                # Determine slice boundaries using fixed segment sizes.
+                train_end = start + train_segment_size
+                eval_end = train_end + eval_segment_size
 
-                # Clamp the indices to avoid overshooting the list
+                # Clamp the indices to avoid overshooting the list.
                 train_end = min(train_end, total_annotated)
-                eval_end  = min(eval_end, total_annotated)
+                eval_end = min(eval_end, total_annotated)
 
-                # Assign frames in the current segment window
+                # Assign frames in the current segment window.
                 for f in annotated_frames[start:train_end]:
                     train_frames.add(f)
+
                 for f in annotated_frames[train_end:eval_end]:
                     eval_frames.add(f)
 
-                # Move to the next temporal block
-                start = eval_end
+                # Move to the next temporal block.
+                # This should always advance because segment sizes are at least one,
+                # but the guard keeps the loop safe if this logic changes later.
+                next_start = eval_end
+
+                if next_start <= start:
+                    print(
+                        f"[WARN] Forced temporal split advance for video '{video_name}'. "
+                        f"start={start}, train_end={train_end}, eval_end={eval_end}, "
+                        f"total_annotated={total_annotated}"
+                    )
+                    next_start = start + 1
+
+                start = next_start
 
             # Optionally add a small random temporal offset so that
             # the train/eval cycle doesn’t align perfectly across videos.
@@ -420,12 +443,21 @@ def open_dataset_builder(parent):
                 "eval":  eval_frames
             }
 
+            split_frame_count = len(train_frames) + len(eval_frames)
+
+            if split_frame_count > 0:
+                train_percent = round(len(train_frames) / split_frame_count * 100, 1)
+            else:
+                train_percent = 0
+
             print(f"[INFO] {video_name}: "
                 f"{len(train_frames)} train frames, {len(eval_frames)} eval frames "
-                f"({round(len(train_frames)/(len(train_frames)+len(eval_frames))*100, 1)}% train)")
+                f"({train_percent}% train)")
 
 
-       # ---------------------------------------------------------
+        print("[DEBUG] Starting observation split assignment loop.")
+
+        # ---------------------------------------------------------
         # Register observations in the dataset based on segmented temporal splits
         # ---------------------------------------------------------
         # GOAL:
@@ -442,8 +474,12 @@ def open_dataset_builder(parent):
         numEvals = 0
         numTrains = 0
 
-        for obs in observations:
+        for obs_index, obs in enumerate(observations):
+            if obs_index % 100 == 0:
+                print(f"[DEBUG] Assigning observation split {obs_index}/{len(observations)}")
+
             video_name = obs["video_source"]
+
             split_info = video_frame_splits.get(video_name)
             if not split_info:
                 continue  # skip if video missing or no split info
@@ -481,8 +517,13 @@ def open_dataset_builder(parent):
         print(f"[INFO] Observations assigned to splits — Train: {numTrains}, Eval: {numEvals}")
         
 
+        print("[DEBUG] About to register dataset_observations in database.")
+
         # Send all in one call to the database
         result = functions.createDatabaseDatasetObservationsBulk(dataset_observations_payload)
+
+        print("[DEBUG] Finished dataset_observations database registration call.")
+
         if result:
             print(f"[DB] Registered {result.get('inserted')} dataset_observations (temporal segmented split).")
         else:
@@ -498,20 +539,65 @@ def open_dataset_builder(parent):
         # ---------------------------------------------------------
         # Build observation_id → split lookup (SOURCE OF TRUTH)
         # ---------------------------------------------------------
+        print("[DEBUG] Building observation split map.")
+
         observation_split_map = {
             row["observation_id"]: row["inclusion_type"]
             for row in dataset_observations_payload
         }
 
-        
+        print("[DEBUG] Reached video processing setup.")
 
-        # Process videos
+        print("[DEBUG] Reached video processing setup.")
+
+                # Process videos
+        print("[DEBUG] Reached video processing setup.")
+        print("[DEBUG] Creating Jellyfin client.")
+
+        jellyfin_client = JellyfinClient()
+        video_resolver = None
+
+        try:
+            print("[DEBUG] Authenticating Jellyfin client.")
+            jellyfin_client.authenticate()
+            print("[DEBUG] Jellyfin authentication finished.")
+
+            video_resolver = VideoSourceResolver(
+                jellyfin_client=jellyfin_client,
+                prefer_local=True
+            )
+
+            print("[INFO] Jellyfin resolver is available for missing local videos.")
+
+        except Exception as ex:
+            print(f"[WARN] Jellyfin resolver unavailable. Local videos only. Reason: {ex}")
+
         for video_name, observations in annotations_by_video.items():
-            video_path = os.path.join(input_video_folder, video_name)
-            cap = cv2.VideoCapture(video_path)
+            resolved_video_source = None
+
+            if video_resolver is not None:
+                resolved_video_source = video_resolver.resolve(
+                    video_name,
+                    local_video_folder=input_video_folder
+                )
+
+            if resolved_video_source is None:
+                video_path = os.path.join(input_video_folder, video_name)
+                resolved_video_path = video_path
+                resolved_source_type = "local_path"
+            else:
+                resolved_video_path = resolved_video_source.resolved_source
+                resolved_source_type = resolved_video_source.source_type
+
+            print(
+                f"[INFO] Opening video '{video_name}' "
+                f"using {resolved_source_type}: {resolved_video_path}"
+            )
+
+            cap = cv2.VideoCapture(resolved_video_path)
 
             if not cap.isOpened():
-                print(f"Error: Cannot open video file '{video_path}'. Skipping.")
+                print(f"Error: Cannot open video source '{resolved_video_path}'. Skipping.")
                 continue
 
             total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))

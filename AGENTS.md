@@ -40,15 +40,13 @@ gets it.
 
 ## State of this repository
 
-**Dormant since 2026-07 and not yet harness-ready.** Two things need settling before an
-agent is pointed at it:
+**Work happens on `develop`.** Other branches exist and are not the question; the
+registry says `develop` and that is the answer.
 
-- **`master`, `main` and `develop` have all diverged**, and the newest work is on
-  `feature-jellyfinAPI`, which is what this branch is built on. That needs resolving or
-  the next person will guess wrong.
-- The checked-in `.venv` points at a Python that does not exist on the current machine and
-  needs recreating against 3.12 — deliberately 3.12 rather than newer, because `torch` and
-  `ultralytics` wheels lag new Python releases.
+Dormant since 2026-07. One thing still needs doing before an agent is pointed at it: the
+checked-in `.venv` points at a Python that does not exist on the current machine and needs
+recreating against 3.12 — deliberately 3.12 rather than newer, because `torch` and
+`ultralytics` wheels lag new Python releases.
 
 Running it needs an NVIDIA GPU. Building it does not.
 
@@ -154,9 +152,22 @@ marp agent start marp-api 71-thumbnail-lifecycle
 
 That gives the branch its own copy, its own database on its own port, its own API port, a
 written `.env`, and its dependencies installed — so it can run and test without touching
-anybody else's. `marp agent list` shows what is set up and where; `marp agent env <branch>`
-prints the settings again; `marp agent remove <branch>` throws the copy away and **keeps
-the branch**, because tidying up and discarding work should never be the same command.
+anybody else's. It installs the nested packages too — an application with its own `package.json` is a
+package in its own right, and an agent that finds no `node_modules` there cannot run its
+tests.
+
+`marp agent list` shows what is set up and where; `marp agent env <branch>` prints the
+settings again; `marp agent stop` and `marp agent remove` shut down the servers and the
+database that workspace started. **`remove` keeps the branch**, because tidying up and
+discarding work should never be the same command.
+
+**Stop what you start.** A server outliving its work is not untidiness — one left running
+in another checkout was adopted by a different workspace's browser tests, which then
+graded that checkout's code for an hour without saying so.
+
+`marp harness check` reports when two workspaces collide: the same port is a failure, an
+exclusive resource named twice in `needs:` is a failure, and two agents on one repository
+is a note for a human to judge.
 
 On a second machine there is nothing to set up: clone the repository, check out the branch,
 and it is already isolated. The command exists for putting several on one machine.

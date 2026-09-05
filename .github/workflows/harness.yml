@@ -1,0 +1,45 @@
+# Harness checks only.
+#
+# There is deliberately no test job here yet. This repository has been dormant since
+# 2026-07, its `master`, `main` and `develop` branches have all diverged, and the
+# checked-in `.venv` points at a Python that does not exist on the current machine. A
+# pytest job would either fail on every push for reasons unrelated to the change, or be
+# written to tolerate failure -- and a suite that tolerates failure looks green while
+# proving nothing.
+#
+# Adding it is the first task after the branches are resolved. See AGENTS.md, "State of
+# this repository".
+
+name: harness
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+
+jobs:
+  harness:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: marp-inference-worker
+
+      - uses: actions/checkout@v4
+        with:
+          repository: MarineAppliedResearch/MARP
+          path: MARP
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Shared instruction block matches the umbrella
+        run: node MARP/scripts/harness/shared-check.mjs marp-inference-worker
+
+      - name: Instruction files carry no credential or stale environment fact
+        run: node MARP/scripts/harness/doc-check.mjs marp-inference-worker
+
+      - name: Task specification gate
+        run: node MARP/scripts/harness/spec-check.mjs marp-inference-worker

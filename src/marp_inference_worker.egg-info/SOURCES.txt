@@ -22,6 +22,8 @@ src/marp_inference_worker/engines/mock_engine.py
 src/marp_inference_worker/engines/ultralytics_engine.py
 src/marp_inference_worker/inputs/__init__.py
 src/marp_inference_worker/inputs/frame_source.py
+src/marp_inference_worker/media/__init__.py
+src/marp_inference_worker/media/jellyfin_client.py
 src/marp_inference_worker/models/__init__.py
 src/marp_inference_worker/models/inference_spec.py
 src/marp_inference_worker/models/model_cache.py

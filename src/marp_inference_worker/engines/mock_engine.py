@@ -34,6 +34,20 @@ from marp_inference_worker.engines.base_engine import (
     JobUnrunnable,
 )
 
+
+# How often, in frames, a durable metric event is emitted.
+# The same cadence as the tracking engine's `_PROGRESS_EVERY_FRAMES`, and for the
+# same reason: a metric event is a database row, and one per frame is 108,000
+# rows for an hour of video at 30fps. This engine emitted one per frame until the
+# first live round trip, where 46,000 frames of mock work put 38,000 rows in
+# `gpu_job_events` -- which made the mock a misleading stand-in for the real
+# engine as well as being wrong on its own terms.
+#
+# Progress and the stop check stay per frame. Neither is durable: the parent
+# keeps only the latest progress, and `should_stop()` is a cached file check, so
+# a cancellation still lands within one frame.
+_METRICS_EVERY_FRAMES = 30
+
 # ModelSpec types the frame-inference capability's load_model, and is imported
 # only for type checking. Importing it at runtime is a cycle: the models package
 # re-exports model_manager, which imports engine_registry, which imports this
@@ -125,11 +139,17 @@ class MockEngine(BaseEngine, FrameInferenceCapable):
                 )
                 frames_processed += 1
 
-                # Report on the same cadence a real engine would.
+                # Progress every frame: it is overwritten in place rather than
+                # accumulated, so it costs one mapping however long the job is.
                 ctx.report_progress(frames_processed, total, "frames")
-                ctx.report_metrics(
-                    step=frame_index, phase="mock", metrics={"frames": frames_processed}
-                )
+
+                # Metrics on the real engine's cadence, because each one is a
+                # durable row. The first frame is included so a short job still
+                # reports something.
+                if frames_processed == 1 or frames_processed % _METRICS_EVERY_FRAMES == 0:
+                    ctx.report_metrics(
+                        step=frame_index, phase="mock", metrics={"frames": frames_processed}
+                    )
 
                 # Cancellation has to be observable here or the runner's
                 # cancellation path is untested.

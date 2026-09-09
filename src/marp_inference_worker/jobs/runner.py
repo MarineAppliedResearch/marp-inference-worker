@@ -75,6 +75,12 @@ _HEARTBEAT_INTERVAL_S = 10.0
 _POLL_FALLBACK_INTERVAL_S = 5.0
 
 
+# How long to ask the coordinator to hold an idle poll open, in seconds.
+# The coordinator caps this at its own ceiling, so asking for more is harmless.
+# Only used when nothing is running -- see _poll_once().
+_LONG_POLL_WAIT_S = 60.0
+
+
 # How long to wait after a coordinator error before trying again.
 # Longer than the fallback, because the usual cause is the coordinator being
 # down or the home connection being out, and hammering it helps nobody.
@@ -85,6 +91,30 @@ _ERROR_BACKOFF_S = 30.0
 # A cooperative stop lands within one should_stop() check, so this is generous;
 # a child still running after it is wedged, not slow.
 _STOP_GRACE_S = 60.0
+
+
+# _failure_reason()
+# Builds the one-line explanation the coordinator records against an attempt.
+# Inputs: the outcome name and the child's terminal payload.
+# Output: a short string, or None for a success.
+# Use this at the terminal report. `failure_reason` is a single text field and
+# it is the only part of a failure the coordinator keeps on the attempt row, so
+# it has to carry the reason rather than a shrug -- the full payload goes to the
+# event stream alongside it.
+def _failure_reason(outcome: str, payload: dict[str, Any]) -> str | None:
+
+    # A success has nothing to explain.
+    if outcome == "succeeded":
+        return None
+
+    # Prefer what the engine actually said.
+    parts = [str(payload[key]) for key in ("reason", "message") if payload.get(key)]
+
+    # A cancellation usually has no message: it stopped because it was asked to.
+    if not parts:
+        parts = [f"the worker reported {outcome}"]
+
+    return " | ".join(parts)[:2000]
 
 
 # JobRunner
@@ -226,15 +256,25 @@ class JobRunner:
         # Report each attempt the record knew about.
         for attempt in record.get("attempts", []):
             try:
+                # Reported as `failed`, with the loss named in the reason.
+                #
+                # `lost` is the worker's own word for it and the coordinator has
+                # no such outcome -- its vocabulary is succeeded, failed and
+                # cancelled -- so sending `lost` was answered 400 and the job
+                # was left leased to a machine that no longer existed until the
+                # lease timed out. `failed` is what puts it back in the queue
+                # while attempts remain, which is what R15 needs; that it reads
+                # as a failure rather than a loss is a presentation question and
+                # is called out in the report.
                 self._client.report_result(
                     attempt_id=str(attempt["attempt_id"]),
                     worker_id=str(attempt["worker_id"]),
                     lease_epoch=int(attempt["lease_epoch"]),
-                    outcome="lost",
-                    payload={
-                        "reason": "worker restarted while this job was running",
-                        "progress": attempt.get("progress"),
-                    },
+                    outcome="failed",
+                    failure_reason=(
+                        "Lost: the worker restarted while this job was running. "
+                        f"Last known progress: {attempt.get('progress')}"
+                    ),
                 )
             except CoordinatorError:
                 # A coordinator that will not take the report must not stop the
@@ -303,6 +343,20 @@ class JobRunner:
                 return slot_index
         return None
 
+    # _free_slot_indexes()
+    # Which slot indexes are free right now.
+    # Inputs: none.
+    # Output: list of free slot indexes, lowest first.
+    # Use this for the poll. The coordinator records the first of them on the
+    # attempt, so a pool view can say which GPU a job is on -- a bare count
+    # cannot, which is why the poll names the slots rather than counting them.
+    def _free_slot_indexes(self) -> list[int]:
+
+        # A paused worker has nothing free, however many slots it has.
+        if self._state.is_paused():
+            return []
+        return [index for index in range(self._slot_count) if index not in self._jobs_by_slot]
+
     # stop()
     # Asks the loop to finish after the current iteration.
     # Inputs: none.
@@ -358,6 +412,19 @@ class JobRunner:
                 self._state.note_error(str(error))
                 time.sleep(_ERROR_BACKOFF_S)
 
+            except Exception as error:
+                # Anything else, recorded and survived rather than allowed to
+                # end the loop.
+                #
+                # This thread *is* the worker, and an exception out of it leaves
+                # a process that serves /status, says it is idle, and will never
+                # take work again -- which is exactly what happened when a
+                # transport error escaped the clause above. A worker that keeps
+                # failing loudly can be diagnosed; one that quietly stops
+                # cannot.
+                self._state.note_error(f"{type(error).__name__}: {error}")
+                time.sleep(_ERROR_BACKOFF_S)
+
     # _poll_once()
     # Long-polls for one job and starts it if one was offered.
     # Inputs: none.
@@ -369,16 +436,30 @@ class JobRunner:
         # Identity is set by ensure_enrolled() before the loop starts.
         assert self.identity is not None and self.identity.worker_id is not None
 
+        # Hold the request open only while nothing is running. A long poll with
+        # a job in flight delays the next heartbeat by however long it waits,
+        # which both breaks R5's "within one heartbeat" and can outlast the
+        # lease itself -- the coordinator would take the job away from a worker
+        # that was busy doing it.
+        wait_seconds = 0 if self._jobs_by_slot else int(_LONG_POLL_WAIT_S)
+
         # Say what this worker can take right now.
         offered = self._client.poll(
             worker_id=self.identity.worker_id,
-            free_slots=self.free_slots(),
-            engines=engine_registry.job_engine_names(),
+            free_slot_indexes=self._free_slot_indexes(),
+            capabilities=self.capabilities(),
+            wait_seconds=wait_seconds,
         )
 
         # Nothing queued.
         if not offered:
             return False
+
+        # The lease carries no worker id -- it is the answer to this worker's
+        # own poll, so the only worker it could belong to is this one. Filled in
+        # here so the envelope that every later call quotes is complete.
+        offered = dict(offered)
+        offered.setdefault("worker_id", self.identity.worker_id)
 
         # Validate the offer before acting on it. A malformed spec is refused
         # here rather than after a child process has been launched for it.
@@ -394,7 +475,7 @@ class JobRunner:
                     worker_id=str(offered.get("worker_id", self.identity.worker_id)),
                     lease_epoch=int(offered.get("lease_epoch", 0)),
                     outcome="failed",
-                    payload={"reason": "invalid_spec", "message": str(error)},
+                    failure_reason=f"invalid_spec: {error}",
                 )
             return False
 
@@ -429,10 +510,7 @@ class JobRunner:
                 worker_id=envelope.worker_id,
                 lease_epoch=envelope.lease_epoch,
                 outcome="failed",
-                payload={
-                    "reason": "preparation_failed",
-                    "message": f"{type(error).__name__}: {error}",
-                },
+                failure_reason=f"preparation_failed: {type(error).__name__}: {error}",
             )
             return
 
@@ -598,6 +676,13 @@ class JobRunner:
         # Refresh what /status reports.
         self._state.set_jobs(self._describe_jobs())
 
+        # And refresh the in-flight record, so it carries how far each job had
+        # actually got. Written once before launch it always said zero, so a job
+        # lost to a restart was reported lost with no progress at all -- which
+        # is most of what R15's report is for.
+        if self._jobs_by_slot:
+            self._write_inflight()
+
     # _finish_job()
     # Reports one finished job's outcome and frees its slot.
     # Inputs: the slot index and the job.
@@ -625,6 +710,27 @@ class JobRunner:
             # Losing the tail of a log must not stop the result being reported.
             pass
 
+        # One last heartbeat, carrying the progress the job finished on.
+        #
+        # Progress is overwritten in place on the attempt, and the last
+        # heartbeat before this point was sent up to a heartbeat interval ago --
+        # so a job shorter than that interval finished with its progress still
+        # reading 0 of null, which is what the first live round trip showed for
+        # a 300-frame job that had demonstrably processed all 300. `uploading`
+        # is also the honest state here: the work is done and the bytes are
+        # about to move.
+        try:
+            self._client.heartbeat(
+                attempt_id=job.attempt_id,
+                worker_id=job.worker_id,
+                lease_epoch=job.lease_epoch,
+                progress=job.current_progress(),
+                state="uploading",
+            )
+        except CoordinatorError:
+            # The answer does not matter -- this job is over either way.
+            pass
+
         terminal = job.terminal
         if terminal is not None:
             outcome = str(terminal.get("outcome", "failed"))
@@ -642,9 +748,21 @@ class JobRunner:
         # Offer the results file by hash before reporting the outcome. The
         # coordinator answers `already_have` or names somewhere to put it, so
         # the bytes only move when they are actually wanted (R11).
+        #
+        # The order matters and is not a preference: the coordinator refuses a
+        # result naming an artifact it has not been handed, so the hand-off has
+        # to complete first. Only what actually landed is named, so a success
+        # never points at bytes MARP does not hold.
+        delivered: list[dict[str, Any]] = []
+
         for role, artifact in job.artifacts.items():
             try:
-                payload.setdefault("artifacts", {})[role] = self._hand_over_artifact(job, artifact)
+                handover = self._hand_over_artifact(job, artifact)
+                payload.setdefault("artifacts", {})[role] = handover
+
+                if handover.get("delivered"):
+                    delivered.append({"sha256": str(artifact["sha256"]), "role": role})
+
             except CoordinatorError as error:
                 # Say the artifact exists and could not be delivered, rather
                 # than reporting a success with no result behind it.
@@ -654,6 +772,15 @@ class JobRunner:
                     "error": str(error),
                 }
 
+        # Send the terminal payload as one last log event.
+        #
+        # The result route records an outcome, a failure reason and artifact
+        # hashes, and nothing else -- so the engine's own summary, and a crash's
+        # traceback, have nowhere to go on that call. Events are where durable
+        # detail belongs (R12), and this is the only place a failure can be
+        # diagnosed from afterwards.
+        self._report_terminal_detail(job, outcome, payload)
+
         # Report the outcome. The route is idempotent, so a retry is safe.
         try:
             self._client.report_result(
@@ -661,7 +788,8 @@ class JobRunner:
                 worker_id=job.worker_id,
                 lease_epoch=job.lease_epoch,
                 outcome=outcome,
-                payload=payload,
+                artifacts=delivered,
+                failure_reason=_failure_reason(outcome, payload),
             )
         except CoordinatorError as error:
             self._state.note_error(f"could not report result for {job.attempt_id}: {error}")
@@ -683,29 +811,74 @@ class JobRunner:
 
         # Offer it.
         answer = self._client.check_artifact(
-            attempt_id=job.attempt_id,
-            worker_id=job.worker_id,
-            lease_epoch=job.lease_epoch,
             sha256=sha256,
             size_bytes=int(artifact.get("size_bytes", 0)),
-            kind=str(artifact.get("role", "unnamed")),
         )
 
         # Already stored: nothing to send.
         if answer.get("already_have"):
             return {"sha256": sha256, "delivered": True, "upload": "not_needed"}
 
-        # Otherwise the coordinator named somewhere to put it.
-        upload_target = answer.get("upload")
-        if not upload_target:
+        # Otherwise the coordinator named somewhere to put it, as a plain path.
+        upload_url = answer.get("upload_url")
+        if not upload_url:
             return {
                 "sha256": sha256,
                 "delivered": False,
                 "error": "coordinator neither had the artifact nor named an upload target",
             }
 
-        self._client.upload_artifact(upload_target, Path(str(artifact["path"])))
+        self._client.upload_artifact(
+            str(upload_url),
+            Path(str(artifact["path"])),
+            attempt_id=job.attempt_id,
+        )
         return {"sha256": sha256, "delivered": True, "upload": "sent"}
+
+    # _report_terminal_detail()
+    # Sends the engine's terminal payload as one final log event.
+    # Inputs: the job, the outcome name and the terminal payload.
+    # Output: none.
+    # Use this immediately before the terminal report, so the detail is already
+    # recorded whichever way the result call goes.
+    def _report_terminal_detail(
+        self,
+        job: JobProcess,
+        outcome: str,
+        payload: dict[str, Any],
+    ) -> None:
+
+        # A sequence number past everything the child sent. The child has
+        # exited by now, so nothing else will claim it -- and a colliding seq
+        # would be dropped silently by the coordinator's replay guard.
+        event = {
+            "seq": job.next_parent_seq(),
+            "kind": "log",
+            # Stamped like the child's own events, so the coordinator does not
+            # have to fall back to its own clock for the one event that says how
+            # the attempt ended.
+            "at": time.time(),
+            "level": "info",
+            "message": f"attempt finished as {outcome}",
+            "terminal": payload,
+        }
+
+        # Anything the child printed to stdout that was not an event goes here
+        # too: it has no sequence number of its own and would otherwise be lost.
+        stray = job.take_stray_output()
+        if stray:
+            event["stray_stdout"] = stray
+
+        try:
+            self._client.post_events(
+                attempt_id=job.attempt_id,
+                worker_id=job.worker_id,
+                lease_epoch=job.lease_epoch,
+                events=[event],
+            )
+        except CoordinatorError:
+            # Detail is worth having and not worth failing the report over.
+            pass
 
     # _describe_jobs()
     # Describes the running jobs for /status.

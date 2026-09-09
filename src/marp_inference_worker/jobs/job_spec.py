@@ -9,7 +9,7 @@
 # Only validation belongs here -- no HTTP, no execution, no engine knowledge.
 
 # Pydantic validates the coordinator payload and gives a JSON-safe round trip.
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 # Any types the deliberately free-form params mapping.
 from typing import Any
@@ -105,6 +105,22 @@ class ReductionRef(BaseModel):
     # Version of that named reduction.
     version: str
 
+    # Accept the version as a number as well as a string.
+    #
+    # The reduction registry keys on strings, but MARP's published job spec
+    # documents `version` as an integer -- so a submission written against the
+    # coordinator's own schema arrived as `1` and pydantic refused it, taking
+    # the whole job with it. Normalized here, at the one place the two
+    # vocabularies meet, rather than loosened everywhere downstream.
+    @field_validator("version", mode="before")
+    @classmethod
+    def _version_as_text(cls, value: object) -> object:
+
+        # Only integers are folded in; a float version would be a real mistake.
+        if isinstance(value, int) and not isinstance(value, bool):
+            return str(value)
+        return value
+
 
 # JobSpec
 # One unit of work as the coordinator describes it.
@@ -148,6 +164,24 @@ class AttemptEnvelope(BaseModel):
 
     # The work itself.
     spec: JobSpec
+
+    # Accept the coordinator's integer identifiers.
+    #
+    # MARP issues `attempt_id` and `worker_id` as integers; the worker keeps
+    # them as text because it also uses them as a workspace directory name and
+    # a URL segment. Coerced on the way in and converted back on the way out
+    # (see `coordinator_client.coordinator_id`), so the wire type is the
+    # coordinator's everywhere and the local type is the worker's everywhere.
+    # Without this the lease itself failed to validate and every offered job was
+    # reported back as an invalid spec.
+    @field_validator("attempt_id", "worker_id", mode="before")
+    @classmethod
+    def _identifier_as_text(cls, value: object) -> object:
+
+        # Only integers; anything else is passed through to normal validation.
+        if isinstance(value, int) and not isinstance(value, bool):
+            return str(value)
+        return value
 
 
 # HeartbeatAction

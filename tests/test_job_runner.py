@@ -27,6 +27,7 @@ from pathlib import Path
 # Any types the fake coordinator's payloads.
 from typing import Any
 
+from marp_inference_worker.jobs.coordinator_client import coordinator_event
 from marp_inference_worker.jobs.runner import JobRunner
 from marp_inference_worker.jobs.worker_state import WorkerState
 
@@ -91,20 +92,28 @@ class FakeCoordinator:
             "slot_count": slot_count,
             "worker_version": worker_version,
         })
-        return {"worker_id": f"worker-for-{local_id[:8]}"}
+        # A number, as MARP issues them. A symbolic id here would let the runner
+        # tests pass against something the real client refuses to put on the
+        # wire, which is the same class of drift as the missing `name` was.
+        return {"worker_id": 65}
 
     # poll()
     # Hands out the next offer, or None once they are exhausted.
-    def poll(self, worker_id: str, free_slots: int, engines: list[str]):
+    def poll(self, worker_id: str, free_slot_indexes: list[int], capabilities=None, wait_seconds: int = 0):
 
-        self.polls.append({"worker_id": worker_id, "free_slots": free_slots, "engines": engines})
+        self.polls.append({
+            "worker_id": worker_id,
+            "free_slot_indexes": free_slot_indexes,
+            "capabilities": capabilities,
+            "wait_seconds": wait_seconds,
+        })
         if self._offers:
             return self._offers.pop(0)
         return None
 
     # heartbeat()
     # Records the heartbeat and returns the scripted action.
-    def heartbeat(self, attempt_id, worker_id, lease_epoch, progress) -> dict[str, Any]:
+    def heartbeat(self, attempt_id, worker_id, lease_epoch, progress, state="running") -> dict[str, Any]:
 
         self.heartbeats.append(
             {
@@ -112,6 +121,7 @@ class FakeCoordinator:
                 "worker_id": worker_id,
                 "lease_epoch": lease_epoch,
                 "progress": progress,
+                "state": state,
             }
         )
 
@@ -122,32 +132,61 @@ class FakeCoordinator:
         return {"action": action}
 
     # post_events()
-    # Records a batch of log and metric events.
+    # Records a batch of log and metric events, in the coordinator's shape.
+    #
+    # Shaped through the real client's own translator rather than recorded raw.
+    # The child writes its fields at the top level and calls a metric batch
+    # `metrics`; the coordinator reads a `payload` object and accepts only
+    # `metric` or `log`. A fake that recorded the raw event would let a test
+    # assert a shape the coordinator never sees.
     def post_events(self, attempt_id, worker_id, lease_epoch, events) -> None:
 
         for event in events:
-            self.events.append({"attempt_id": attempt_id, **event})
+            shaped = coordinator_event(event)
+
+            # None means the coordinator could not have keyed it, so it would
+            # not have been sent at all.
+            if shaped is None:
+                continue
+
+            self.events.append({"attempt_id": attempt_id, **shaped})
 
     # check_artifact()
     # Answers whether the artifact is already held.
-    def check_artifact(self, attempt_id, worker_id, lease_epoch, sha256, size_bytes, kind):
+    def check_artifact(self, sha256, size_bytes):
 
-        self.artifact_checks.append(
-            {"attempt_id": attempt_id, "sha256": sha256, "size_bytes": size_bytes, "kind": kind}
-        )
+        self.artifact_checks.append({"sha256": sha256, "size_bytes": size_bytes})
         if self.already_have_artifact:
             return {"already_have": True}
-        return {"already_have": False, "upload": {"url": "http://fake/upload", "method": "PUT"}}
+
+        # A plain path, which is what the coordinator actually answers with.
+        return {
+            "already_have": False,
+            "upload_url": f"/api/v2/gpu/artifacts/upload/{sha256}",
+        }
 
     # upload_artifact()
     # Records that an upload happened.
-    def upload_artifact(self, upload_target, path) -> None:
+    def upload_artifact(self, upload_url, path, attempt_id=None) -> None:
 
-        self.uploads.append({"target": upload_target, "path": str(path), "bytes": path.stat().st_size})
+        self.uploads.append({
+            "url": upload_url,
+            "attempt_id": attempt_id,
+            "path": str(path),
+            "bytes": path.stat().st_size,
+        })
 
     # report_result()
     # Records the terminal report.
-    def report_result(self, attempt_id, worker_id, lease_epoch, outcome, payload) -> None:
+    def report_result(
+        self,
+        attempt_id,
+        worker_id,
+        lease_epoch,
+        outcome,
+        artifacts=None,
+        failure_reason=None,
+    ) -> dict[str, Any]:
 
         self.results.append(
             {
@@ -155,9 +194,25 @@ class FakeCoordinator:
                 "worker_id": worker_id,
                 "lease_epoch": lease_epoch,
                 "outcome": outcome,
-                "result": payload,
+                "artifacts": list(artifacts or []),
+                "failure_reason": failure_reason,
             }
         )
+        return {"accepted": True, "idempotent": False}
+
+    # terminal_detail()
+    # Returns the terminal payload one attempt reported, out of the events.
+    # Inputs: the attempt id.
+    # Output: the engine's terminal payload, or None if it never arrived.
+    # Use this rather than looking on the result: the result route records an
+    # outcome, a reason and artifact hashes and nothing else, so the engine's
+    # own summary travels as an event.
+    def terminal_detail(self, attempt_id) -> dict[str, Any] | None:
+
+        for event in reversed(self.events):
+            if event["attempt_id"] == attempt_id and "terminal" in (event.get("payload") or {}):
+                return event["payload"]["terminal"]
+        return None
 
     # close()
     # Present so the runner can shut the client down.
@@ -406,18 +461,24 @@ def test_job_runs_in_a_child_process_and_reports_success(tmp_path: Path) -> None
     assert result["worker_id"] == "worker-for-test"
     assert result["lease_epoch"] == 3
 
-    # The engine processed the whole range.
-    summary = result["result"]["summary"]
+    # The engine processed the whole range. Read off the event stream, which is
+    # where the engine's summary travels -- the result route records only an
+    # outcome, a reason and artifact hashes.
+    summary = coordinator.terminal_detail("attempt-happy")["summary"]
     assert summary["frames_expected"] == 5
     assert summary["frames_processed"] == 5
     assert summary["stopped_early"] is False
+
+    # The result names the artifact by hash, which is what ties the job to its
+    # bytes; per-frame detections are nowhere on the call.
+    assert result["artifacts"] == [{"sha256": summary["results"]["sha256"], "role": "observations"}]
 
     # The results file was offered by hash, and no detections travelled inline.
     assert len(coordinator.artifact_checks) == 1
     check = coordinator.artifact_checks[0]
     assert len(check["sha256"]) == 64
     assert check["size_bytes"] > 0
-    assert "detections" not in result["result"]
+    assert "detections" not in str(result)
 
     # The slot is free again.
     assert state.describe()["active_jobs"] == []
@@ -447,10 +508,16 @@ def test_artifact_is_uploaded_only_when_the_coordinator_asks(tmp_path: Path) -> 
     assert len(coordinator.uploads) == 1
     assert coordinator.uploads[0]["bytes"] > 0
 
-    # And the report says it was delivered.
-    artifacts = coordinator.results[0]["result"]["artifacts"]
-    assert artifacts["observations"]["delivered"] is True
-    assert artifacts["observations"]["upload"] == "sent"
+    # It went to the path the check answered with, quoting the attempt.
+    assert coordinator.uploads[0]["url"].endswith(coordinator.artifact_checks[0]["sha256"])
+    assert coordinator.uploads[0]["attempt_id"] == "attempt-upload"
+
+    # And the report names it, so the coordinator can record it against the job.
+    assert coordinator.results[0]["artifacts"] == [
+        {"sha256": coordinator.artifact_checks[0]["sha256"], "role": "observations"}
+    ]
+    detail = coordinator.terminal_detail("attempt-upload")
+    assert detail["artifacts"]["observations"]["upload"] == "sent"
 
 
 # test_artifact_is_not_uploaded_when_already_held(tmp_path)
@@ -469,8 +536,14 @@ def test_artifact_is_not_uploaded_when_already_held(tmp_path: Path) -> None:
     assert _wait_until(runner, lambda: len(coordinator.results) == 1)
 
     assert coordinator.uploads == []
-    artifacts = coordinator.results[0]["result"]["artifacts"]
-    assert artifacts["observations"]["upload"] == "not_needed"
+    detail = coordinator.terminal_detail("attempt-cached")
+    assert detail["artifacts"]["observations"]["upload"] == "not_needed"
+
+    # Named on the result even though nothing was sent: the coordinator already
+    # holds the bytes, so the job can still point at them.
+    assert coordinator.results[0]["artifacts"] == [
+        {"sha256": coordinator.artifact_checks[0]["sha256"], "role": "observations"}
+    ]
 
 
 # test_cancel_in_a_heartbeat_stops_a_running_job(tmp_path)
@@ -514,7 +587,7 @@ def test_cancel_in_a_heartbeat_stops_a_running_job(tmp_path: Path) -> None:
     assert result["outcome"] == "cancelled"
 
     # The engine noticed and unwound rather than being killed.
-    summary = result["result"]["summary"]
+    summary = coordinator.terminal_detail("attempt-cancel")["summary"]
     assert summary["stopped_early"] is True
 
     # It stopped part way: some work done, but not all of it. This is the
@@ -546,7 +619,7 @@ def test_abandon_in_a_heartbeat_also_stops_the_job(tmp_path: Path) -> None:
     assert _wait_until(runner, lambda: len(coordinator.results) == 1)
 
     assert coordinator.results[0]["outcome"] == "cancelled"
-    assert coordinator.results[0]["result"]["summary"]["frames_processed"] < 2000
+    assert coordinator.terminal_detail("attempt-abandon")["summary"]["frames_processed"] < 2000
 
 
 # test_pause_in_a_heartbeat_leaves_the_running_job_alone(tmp_path)
@@ -570,7 +643,7 @@ def test_pause_in_a_heartbeat_leaves_the_running_job_alone(tmp_path: Path) -> No
 
     # The job ran to completion despite the pause.
     assert coordinator.results[0]["outcome"] == "succeeded"
-    assert coordinator.results[0]["result"]["summary"]["frames_processed"] == 10
+    assert coordinator.terminal_detail("attempt-pause")["summary"]["frames_processed"] == 10
 
     # And the worker is now paused, so it will not be offered more.
     assert state.is_paused() is True
@@ -639,9 +712,10 @@ def test_job_that_cannot_run_is_refused_before_it_starts(tmp_path: Path) -> None
     result = coordinator.results[0]
     assert result["outcome"] == "failed"
 
-    # And it says why, by name, rather than reporting an opaque failure.
-    message = str(result["result"])
-    assert "an_engine_this_worker_does_not_have" in message
+    # And it says why, by name, rather than reporting an opaque failure. On the
+    # result itself, because `failure_reason` is the only part of a failure the
+    # coordinator keeps on the attempt row.
+    assert "an_engine_this_worker_does_not_have" in result["failure_reason"]
 
 
 # test_malformed_spec_is_rejected_without_launching_anything(tmp_path)
@@ -668,7 +742,7 @@ def test_malformed_spec_is_rejected_without_launching_anything(tmp_path: Path) -
     # And the coordinator was told, rather than being left to time the lease out.
     assert len(coordinator.results) == 1
     assert coordinator.results[0]["outcome"] == "failed"
-    assert coordinator.results[0]["result"]["reason"] == "invalid_spec"
+    assert coordinator.results[0]["failure_reason"].startswith("invalid_spec")
 
 
 # test_a_job_in_flight_at_restart_is_reported_lost(tmp_path)
@@ -714,10 +788,15 @@ def test_a_job_in_flight_at_restart_is_reported_lost(tmp_path: Path) -> None:
     # Reported lost, with the lease it was running under and how far it got.
     assert len(coordinator.results) == 1
     report = coordinator.results[0]
-    assert report["outcome"] == "lost"
+    # `failed`, not `lost`: the coordinator's outcome vocabulary is succeeded,
+    # failed and cancelled, and `lost` was answered 400 -- so the job stayed
+    # leased to a dead machine until its lease timed out. Reported as a failure
+    # with the loss named, which is what returns it to the queue (R15).
+    assert report["outcome"] == "failed"
+    assert "Lost" in report["failure_reason"]
     assert report["attempt_id"] == "attempt-was-running"
     assert report["lease_epoch"] == 9
-    assert report["result"]["progress"]["done"] == 431
+    assert "'done': 431" in report["failure_reason"]
 
     # The record is cleared, so the same job is not reported lost forever.
     assert not (state_dir / "in-flight.json").is_file()
@@ -818,18 +897,38 @@ def test_progress_reaches_the_coordinator_and_advances(tmp_path: Path) -> None:
 # batched and keyed by seq -- the path a real job's narrative takes.
 def test_engine_logs_reach_the_coordinator_as_events(tmp_path: Path) -> None:
 
-    coordinator = FakeCoordinator(offers=[_job_for(tmp_path, "attempt-events", frames=5)])
+    # Long enough to cross the engine's metric cadence more than once, so the
+    # rate below is measured rather than guessed at.
+    coordinator = FakeCoordinator(offers=[_job_for(tmp_path, "attempt-events", frames=90)])
     runner, _ = _runner(coordinator, tmp_path)
     runner.ensure_enrolled()
     runner._poll_once()
     assert _wait_until(runner, lambda: len(coordinator.results) == 1)
 
     # The mock engine logs the range it was given; that line must have arrived.
+    # Under `payload`, which is where the coordinator reads an event's contents
+    # -- the child writes its fields at the top level and they were being sent
+    # there, so every log line arrived with a null payload and no message.
     logs = [event for event in coordinator.events if event.get("kind") == "log"]
-    assert any("1000..1005" in event.get("message", "") for event in logs)
+    assert any("1000..1090" in (event["payload"].get("message") or "") for event in logs)
 
-    # Every event carries a seq, so a resent batch can be deduplicated.
+    # The metric batch arrived as `metric`, the kind the coordinator accepts.
+    # The child calls it `metrics`, which was refused -- and one refused event
+    # fails the whole batch, so a single metric lost every log line with it.
+    metrics = [event for event in coordinator.events if event.get("kind") == "metric"]
+    assert metrics, "the engine's metrics never reached the coordinator"
+    assert metrics[0]["payload"]["phase"] == "mock"
+
+    # And there is one metric per interval, not one per frame. Each is a durable
+    # row: per-frame emission put 38,000 rows in the coordinator's event table
+    # for 46,000 frames of mock work, which is not a rate a real video can
+    # afford. 90 frames at one per 30, plus the first, is four.
+    assert len(metrics) == 4, [event["payload"] for event in metrics]
+
+    # Every event carries a seq, so a resent batch can be deduplicated, and an
+    # `at` the coordinator can put in a timestamp column rather than a float.
     assert all("seq" in event for event in coordinator.events)
+    assert all(isinstance(event["at"], str) for event in coordinator.events)
 
 
 # test_slots_limit_how_many_jobs_run_at_once(tmp_path)
@@ -979,7 +1078,7 @@ def test_two_piece_split_covers_every_frame_exactly_once(tmp_path: Path) -> None
     frames_by_attempt = {}
     for result in coordinator.results:
         assert result["outcome"] == "succeeded", result
-        summary = result["result"]["summary"]
+        summary = coordinator.terminal_detail(result["attempt_id"])["summary"]
         assert summary["frames_expected"] == 300
         assert summary["frames_processed"] == 300
         frames_by_attempt[result["attempt_id"]] = summary
@@ -1018,3 +1117,177 @@ def test_two_piece_split_covers_every_frame_exactly_once(tmp_path: Path) -> None
     # single assertion is what an inclusive coordinator would have failed:
     # frame 300 would be missing from both pieces.
     assert sorted(first + second) == list(range(600))
+
+
+# test_the_fake_coordinator_matches_the_real_client()
+# Verifies the fake in this file against the real CoordinatorClient.
+# Inputs: none.
+# Output: pytest pass/fail result.
+#
+# **A mechanical guard against the drift that has already happened twice.**
+# `FakeCoordinator.enrol()` once took two arguments where the real client needs
+# five, and all 138 tests passed against it while the real coordinator answered
+# 400. Then the whole poll, heartbeat, artifact and result surface diverged the
+# same way, and again nothing failed.
+#
+# Checked in both directions: a fake missing a parameter the runner passes fails
+# at call time, but a fake that still accepts a parameter the real client has
+# dropped keeps a stale test alive, and only comparing both ways catches it.
+def test_the_fake_coordinator_matches_the_real_client() -> None:
+
+    import inspect
+
+    from marp_inference_worker.jobs.coordinator_client import CoordinatorClient
+
+    # Every method the runner calls on its client.
+    methods = [
+        "enrol",
+        "poll",
+        "heartbeat",
+        "post_events",
+        "check_artifact",
+        "upload_artifact",
+        "report_result",
+        "close",
+    ]
+
+    fake = FakeCoordinator()
+
+    for name in methods:
+        real_signature = inspect.signature(getattr(CoordinatorClient, name))
+        fake_signature = inspect.signature(getattr(FakeCoordinator, name))
+
+        real_parameters = [
+            parameter for parameter in real_signature.parameters if parameter != "self"
+        ]
+        fake_parameters = [
+            parameter for parameter in fake_signature.parameters if parameter != "self"
+        ]
+
+        # Names and order both, because the runner calls these by keyword and a
+        # renamed parameter is as breaking as a missing one.
+        assert fake_parameters == real_parameters, (
+            f"FakeCoordinator.{name} has drifted from CoordinatorClient.{name}: "
+            f"fake takes {fake_parameters}, the real client takes {real_parameters}"
+        )
+
+        assert hasattr(fake, name)
+
+
+# test_poll_does_not_wait_while_a_job_is_running(tmp_path)
+# Verifies the long poll is not used while there is work in flight.
+# Inputs: pytest temporary directory.
+# Output: pytest pass/fail result.
+#
+# A poll held open for a minute is a minute without a heartbeat. The lease is
+# sixty seconds, so on a machine with a spare slot the coordinator would take a
+# job away from the worker that was busy running it -- and cancel, which arrives
+# only in a heartbeat response, would be up to a minute late instead of the one
+# interval R5 promises.
+def test_poll_does_not_wait_while_a_job_is_running(tmp_path: Path) -> None:
+
+    coordinator = FakeCoordinator(
+        offers=[
+            _job_for(tmp_path, "attempt-wait-one", frames=400, frame_delay_s=0.005),
+            _job_for(tmp_path, "attempt-wait-two", frames=400, frame_delay_s=0.005),
+        ]
+    )
+
+    # Two slots, so the worker still has somewhere to put a second job and will
+    # go on polling while the first one runs.
+    runner, _ = _runner(coordinator, tmp_path, slots=2)
+    runner.ensure_enrolled()
+
+    # Idle: it asks to be held open, which is what makes the long poll a long
+    # poll at all.
+    assert runner._poll_once() is True
+    assert coordinator.polls[0]["wait_seconds"] > 0
+
+    # Busy: it asks for an immediate answer instead.
+    assert runner._poll_once() is True
+    assert coordinator.polls[1]["wait_seconds"] == 0
+
+    # And it named the slot it intends to use, not merely how many were free.
+    assert coordinator.polls[0]["free_slot_indexes"] == [0, 1]
+    assert coordinator.polls[1]["free_slot_indexes"] == [1]
+
+    _wait_until(runner, lambda: len(coordinator.results) == 2)
+
+
+# test_a_finished_attempt_reports_the_progress_it_finished_on(tmp_path)
+# Verifies the final heartbeat.
+# Inputs: pytest temporary directory.
+# Output: pytest pass/fail result.
+#
+# Progress is overwritten in place on the attempt, and heartbeats are ten
+# seconds apart, so a job shorter than that finished with its progress still
+# reading zero of nothing. Seen for real: a 300-frame job that had demonstrably
+# written 300 rows was recorded as 0 of null, which is what a job that leased
+# and never started looks like.
+def test_a_finished_attempt_reports_the_progress_it_finished_on(tmp_path: Path) -> None:
+
+    coordinator = FakeCoordinator(offers=[_job_for(tmp_path, "attempt-final", frames=40)])
+    runner, _ = _runner(coordinator, tmp_path)
+    runner.ensure_enrolled()
+    runner._poll_once()
+
+    assert _wait_until(runner, lambda: len(coordinator.results) == 1)
+
+    # The last heartbeat carries the count the job actually finished on.
+    last = coordinator.heartbeats[-1]
+    assert last["progress"]["done"] == 40
+    assert last["progress"]["total"] == 40
+
+    # And says the work is done and the bytes are moving, which is the only
+    # thing that ever puts an attempt into `uploading`.
+    assert last["state"] == "uploading"
+
+
+# test_the_in_flight_record_carries_live_progress(tmp_path)
+# Verifies the record a lost job is reported from is kept current.
+# Inputs: pytest temporary directory.
+# Output: pytest pass/fail result.
+#
+# The record is what R15's lost report is built out of. Written once before the
+# child was launched, it always said `done: 0` -- and an elapsed time measured
+# from a start that had not happened yet, which came out as the whole Unix
+# epoch. So a job lost to a restart was reported lost with no idea how far it
+# had got, which is most of what the report is for.
+def test_the_in_flight_record_carries_live_progress(tmp_path: Path) -> None:
+
+    import json as json_module
+
+    coordinator = FakeCoordinator(
+        offers=[_job_for(tmp_path, "attempt-inflight-progress", frames=400, frame_delay_s=0.005)]
+    )
+    runner, _ = _runner(coordinator, tmp_path)
+    runner.ensure_enrolled()
+    runner._poll_once()
+
+    record_path = tmp_path / "state" / "in-flight.json"
+
+    # Written before the child was launched, so it exists immediately -- and at
+    # that moment it honestly knows nothing.
+    assert record_path.is_file()
+    written_before_launch = json_module.loads(record_path.read_text(encoding="utf-8"))
+    assert written_before_launch["attempts"][0]["progress"]["done"] == 0
+
+    # An elapsed time of zero rather than the epoch. Asserted because the wrong
+    # value is a plausible-looking large number, not an obvious error.
+    assert written_before_launch["attempts"][0]["progress"]["elapsed_s"] == 0.0
+
+    # Once the job is actually reporting, the record follows it.
+    assert _wait_until(
+        runner,
+        lambda: json_module.loads(record_path.read_text(encoding="utf-8"))
+        ["attempts"][0]["progress"]["done"] > 0,
+        deadline_s=30.0,
+    ), "the in-flight record never picked up the job's progress"
+
+    record = json_module.loads(record_path.read_text(encoding="utf-8"))
+    progress = record["attempts"][0]["progress"]
+
+    assert progress["total"] == 400
+    assert 0 < progress["elapsed_s"] < 300, progress["elapsed_s"]
+
+    _wait_until(runner, lambda: len(coordinator.results) == 1)

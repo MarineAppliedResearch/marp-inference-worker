@@ -80,6 +80,16 @@ class JobProcess:
         # Events not yet forwarded to the coordinator, drained in batches.
         self._pending_events: list[dict[str, Any]] = []
 
+        # Highest sequence number the child has used, so the parent can send an
+        # event of its own afterwards without colliding with one of the child's.
+        self._highest_seq = -1
+
+        # Lines the child wrote to stdout that were not events. Kept here rather
+        # than queued as events because they carry no sequence number, and the
+        # coordinator keys events on one -- an invented seq would collide with a
+        # real event and be dropped as a duplicate.
+        self._stray_output: list[str] = []
+
         # Guards the two collections the reader thread writes to.
         self._lock = threading.Lock()
 
@@ -167,9 +177,7 @@ class JobProcess:
                 event = json.loads(line)
             except json.JSONDecodeError:
                 with self._lock:
-                    self._pending_events.append(
-                        {"kind": "log", "level": "warning", "message": line}
-                    )
+                    self._stray_output.append(line[:2000])
                 continue
 
             self._handle_event(event)
@@ -184,6 +192,12 @@ class JobProcess:
         kind = event.get("kind")
 
         with self._lock:
+
+            # Track the child's sequence numbering, so the parent can append an
+            # event after the child has gone without reusing one of its keys.
+            seq = event.get("seq")
+            if isinstance(seq, int) and not isinstance(seq, bool) and seq > self._highest_seq:
+                self._highest_seq = seq
 
             # Progress is kept as a latest-value, not queued: the coordinator
             # wants where the job is now, and queueing 108,000 progress events
@@ -223,6 +237,31 @@ class JobProcess:
             self._pending_events = []
         return events
 
+    # next_parent_seq()
+    # Returns a sequence number the child has not used and will not use.
+    # Inputs: none.
+    # Output: the next free sequence number for this attempt.
+    # Use this only after the child has exited, for an event the parent sends on
+    # the job's behalf. Each call advances, so two parent events do not collide.
+    def next_parent_seq(self) -> int:
+
+        with self._lock:
+            self._highest_seq += 1
+            return self._highest_seq
+
+    # take_stray_output()
+    # Removes and returns the non-event lines the child wrote to stdout.
+    # Inputs: none.
+    # Output: list of raw lines.
+    # Use this once, with the terminal report. A library printing to stdout
+    # would otherwise vanish, and it is often the only clue to a crash.
+    def take_stray_output(self) -> list[str]:
+
+        with self._lock:
+            stray = self._stray_output
+            self._stray_output = []
+        return stray
+
     # current_progress()
     # Returns the latest progress snapshot.
     # Inputs: none.
@@ -236,8 +275,15 @@ class JobProcess:
 
         # Elapsed time lets the coordinator spot a job that is running but not
         # advancing, which progress alone cannot show.
+        #
+        # `started_at` is 0.0 until start(), and subtracting that gives the
+        # whole epoch in seconds -- which is what the in-flight record written
+        # before launch was carrying, so a lost job reported an elapsed time of
+        # fifty-six years.
         progress["slot_index"] = self.slot_index
-        progress["elapsed_s"] = round(time.time() - self.started_at, 3)
+        progress["elapsed_s"] = (
+            round(time.time() - self.started_at, 3) if self.started_at else 0.0
+        )
         return progress
 
     # request_stop()

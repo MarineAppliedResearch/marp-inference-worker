@@ -837,7 +837,7 @@ Example output:
 
 ```text
 [INFO] Jellyfin resolver is available for missing local videos.
-[INFO] Opening video '20240730_190910 Fwd.mp4' using jellyfin_stream: http://47.208.203.78:8096/Videos/.../stream?static=true&api_key=...
+[INFO] Opening video '20240730_190910 Fwd.mp4' using jellyfin_stream: <JELLYFIN_BASE_URL>/Videos/<item>/stream?static=true&api_key=<elided>
 .
 ```
 

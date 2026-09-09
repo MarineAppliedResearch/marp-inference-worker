@@ -70,9 +70,27 @@ class FakeCoordinator:
 
     # enrol()
     # Records the enrolment and assigns a worker id.
-    def enrol(self, local_id: str, capabilities: dict[str, Any]) -> dict[str, Any]:
+    def enrol(
+        self,
+        local_id: str,
+        capabilities: dict[str, Any],
+        name: str,
+        slot_count: int,
+        worker_version: str | None = None,
+    ) -> dict[str, Any]:
 
-        self.enrolments.append({"local_id": local_id, "capabilities": capabilities})
+        # Signature mirrors CoordinatorClient.enrol deliberately. It used to
+        # take only (local_id, capabilities) and every test passed, while the
+        # real coordinator answered 400 because `name` is required -- a fake
+        # that has drifted from the contract tests nothing about it. Keyword
+        # names matter here: the runner calls them by keyword.
+        self.enrolments.append({
+            "local_id": local_id,
+            "capabilities": capabilities,
+            "name": name,
+            "slot_count": slot_count,
+            "worker_version": worker_version,
+        })
         return {"worker_id": f"worker-for-{local_id[:8]}"}
 
     # poll()

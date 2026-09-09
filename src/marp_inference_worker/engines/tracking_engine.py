@@ -171,12 +171,12 @@ class TrackingEngine(BaseEngine):
             str(reduction_ref["name"]), str(reduction_ref["version"])
         )
 
-        # Where the frames come from. The runner has already resolved the
-        # Jellyfin item to something openable and put it in the params, so this
-        # engine never learns what Jellyfin is.
-        video_source = params.get("video_source_url")
+        # Where the frames come from. The coordinator resolved the video and
+        # the spec carries a source this engine can open, so the engine never
+        # learns what that source is nor how it was arrived at (A8).
+        video_source = str((spec.get("video") or {}).get("url") or "")
         if not video_source:
-            raise JobUnrunnable("job params carried no video_source_url")
+            raise JobUnrunnable("job spec carried no video.url")
 
         # The model artifact, already fetched and hash-verified by the runner.
         model_path = Path(str(params["model_path"]))
@@ -433,7 +433,9 @@ class TrackingEngine(BaseEngine):
             frames=ended.track["frames"],
             keyframes=reduced,
             video_source_name=str(spec["video"]["source_name"]),
-            jellyfin_item_id=str(spec["video"]["jellyfin_item_id"]),
+            # Opaque provenance, passed through exactly as received. A job given
+            # a bare url carries none, and the observation then records null.
+            jellyfin_item_id=spec["video"].get("jellyfin_item_id"),
             frame_rate=frame_rate,
             data_type=data_type,
             reduction_name=str(reduction_ref["name"]),

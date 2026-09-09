@@ -59,9 +59,6 @@ from marp_inference_worker.system.resource_monitor import get_system_resources
 # The reduction registry, reported in capabilities.
 from marp_inference_worker.reduction import keyframes as keyframe_reduction
 
-# The video source resolver turns a Jellyfin item into something openable.
-from marp_inference_worker.media.video_source_resolver import VideoSourceResolver
-
 
 # How often a lease is held by heartbeat, in seconds.
 # Cancel, pause and abandon arrive in the response, so this interval is also the
@@ -136,7 +133,6 @@ class JobRunner:
         state_dir: Path,
         worker_state: Any,
         slot_count: int | None = None,
-        video_resolver: VideoSourceResolver | None = None,
     ) -> None:
 
         # The only channel to MARP.
@@ -154,10 +150,6 @@ class JobRunner:
         # it can run a CPU job that explicitly asked for CPU.
         discovered = device_module.cuda_device_count()
         self._slot_count = slot_count if slot_count is not None else max(1, discovered)
-
-        # Resolves a Jellyfin item to a stream the engine can open. Optional so
-        # a test can run the loop without a Jellyfin server.
-        self._video_resolver = video_resolver
 
         # Slot index -> the job running on it. A slot absent from this mapping
         # is free.
@@ -498,9 +490,9 @@ class JobRunner:
             return
 
         try:
-            # Fetch and hash-verify the model, and resolve the video, in the
-            # parent. Both can fail for reasons the coordinator should hear
-            # about as a refusal rather than as a crashed child.
+            # Fetch and hash-verify the model in the parent. It can fail for
+            # reasons the coordinator should hear about as a refusal rather than
+            # as a crashed child.
             prepared_params = self._prepare_job_params(envelope, slot_index)
 
         except Exception as error:
@@ -515,8 +507,8 @@ class JobRunner:
             return
 
         # Build the spec the child receives: the coordinator's spec with the
-        # resolved local details merged into params. The engine reads these and
-        # still learns nothing about Jellyfin or the coordinator.
+        # local model details merged into params. The engine reads these and
+        # still learns nothing about MARP or the coordinator.
         spec = envelope.spec.model_dump(mode="json")
         spec["params"] = prepared_params
 
@@ -545,10 +537,10 @@ class JobRunner:
     # Inputs: the attempt envelope and the slot index.
     # Output: the params mapping the child receives.
     #
-    # Two things happen here rather than in the engine, and both are deliberate.
-    # The model is fetched and its sha256 verified, so no engine can be handed
-    # unverified weights (R13). The Jellyfin item is resolved to an openable
-    # source, so the engine never learns what Jellyfin is (R7).
+    # One thing happens here rather than in the engine, deliberately: the model
+    # is fetched and its sha256 verified, so no engine can be handed unverified
+    # weights (R13). The video is not resolved anywhere in the worker -- the
+    # coordinator does that and the spec arrives carrying an openable url (A8).
     def _prepare_job_params(self, envelope: AttemptEnvelope, slot_index: int) -> dict[str, Any]:
 
         # Start from what the coordinator sent.
@@ -581,36 +573,7 @@ class JobRunner:
         params["model_path"] = cache_state["artifact_path"]
         params["model_sha256"] = cache_state["sha256"]
 
-        # Resolve the video. Without a resolver the job can still run if the
-        # coordinator supplied a source directly, which is how a test or a
-        # local file job works.
-        if "video_source_url" not in params:
-            if self._video_resolver is None:
-                raise ValueError(
-                    "no video resolver configured and job params carried no video_source_url"
-                )
-            params["video_source_url"] = self._resolve_video(envelope)
-
         return params
-
-    # _resolve_video()
-    # Turns the job's video reference into something OpenCV can open.
-    # Inputs: the attempt envelope.
-    # Output: a local path or stream url.
-    # Use this only when the coordinator did not supply a source outright.
-    def _resolve_video(self, envelope: AttemptEnvelope) -> str:
-
-        # The resolver's own interface takes MARP's video_source value, which is
-        # what the job spec carries as source_name.
-        assert self._video_resolver is not None
-        resolved = self._video_resolver.resolve(envelope.spec.video.source_name)
-
-        # A resolver that found nothing is a refusal, not a fallback.
-        if not resolved:
-            raise ValueError(
-                f"could not resolve video {envelope.spec.video.source_name!r} to a readable source"
-            )
-        return str(resolved)
 
     # _service_running_jobs()
     # Heartbeats every running job and acts on the answers.

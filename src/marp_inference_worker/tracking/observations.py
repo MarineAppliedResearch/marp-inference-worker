@@ -110,7 +110,7 @@ def build_observation(
     frames: list[dict[str, Any]],
     keyframes: list[dict[str, Any]],
     video_source_name: str,
-    jellyfin_item_id: str,
+    jellyfin_item_id: str | None,
     frame_rate: float,
     data_type: str,
     reduction_name: str,
@@ -133,7 +133,8 @@ def build_observation(
     # the live script was the operator's own local path, which on a distributed
     # worker would be a Jellyfin stream url and meaningless to MARP. The
     # coordinator fills all three from the job it issued -- which is why the
-    # Jellyfin item id is carried back out below, so it can.
+    # Jellyfin item id is carried back out below, so it can. It is optional:
+    # a job handed a bare url has none, and the worker must not invent one.
     #
     # Nothing the live script recorded is dropped: every one of those three is a
     # value the coordinator already holds, not a value the worker measured.
@@ -144,7 +145,9 @@ def build_observation(
         # The sub-second frame index within its own second, as MARP stores it.
         "frame": str(chosen_frame % int(frame_rate)),
         "video_source": video_source_name,
-        # So the coordinator can resolve session_id and videoLocation.
+        # So the coordinator can resolve session_id and videoLocation. Opaque
+        # provenance: echoed exactly as the job spec carried it, and null when
+        # the job carried none, because the worker has nothing to put there.
         "jellyfin_item_id": jellyfin_item_id,
         "mediaPosition": frame_to_media_position(chosen_frame, frame_rate),
         "actualPosition": frame_to_media_position(chosen_frame, frame_rate),

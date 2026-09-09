@@ -451,3 +451,53 @@ def test_infer_stream_is_a_generator() -> None:
     engine_source = inspect.getsource(tracking_engine.TrackingEngine.run)
     assert "list(iter_frame_range" not in engine_source
     assert "frame_stream = iter_frame_range(" in engine_source
+
+
+# test_an_observation_from_a_job_with_no_item_id_records_null()
+# Verifies what the observation carries when the provenance field is absent.
+# Inputs: none.
+# Output: pytest pass/fail result.
+#
+# Proves A8's "optional, echoed exactly as received" clause at the row level. A
+# job handed a bare url has no item id, and the worker must not invent one: the
+# key stays present so the output shape does not change per job, and its value
+# is null. A placeholder here would be worse than nothing, because the
+# coordinator resolves session_id and videoLocation from this field and would
+# resolve a fabricated one to the wrong video.
+def test_an_observation_from_a_job_with_no_item_id_records_null() -> None:
+
+    frames = [
+        {"frame": index, "time": index / _FRAME_RATE, "bbox": (0.5, 0.85, 0.06, 0.05),
+         "confidence": 0.9}
+        for index in range(60)
+    ]
+    reduced = keyframes.reduce_to_keyframes_v3_dirpad(
+        {"class_name": "Lingcod", "frames": frames}
+    )
+
+    observation = build_observation(
+        frames=frames,
+        keyframes=reduced,
+        video_source_name="20240727_185645 Fwd.mp4",
+        # What the spec carries for a job submitted with a bare url.
+        jellyfin_item_id=None,
+        frame_rate=_FRAME_RATE,
+        data_type="Fish",
+        reduction_name="v3_dirpad",
+        reduction_version="1",
+        track_id=7,
+        end_reason="aged_out",
+    )
+
+    # Present and null, not absent and not a placeholder string.
+    assert "jellyfin_item_id" in observation
+    assert observation["jellyfin_item_id"] is None
+
+    # And the field the coordinator actually needs to identify the video is
+    # unaffected -- source_name is required, so a row is never anonymous.
+    assert observation["video_source"] == "20240727_185645 Fwd.mp4"
+
+    # It still serializes, which is the point of a null over a missing key.
+    import json
+
+    assert json.loads(json.dumps(observation))["jellyfin_item_id"] is None

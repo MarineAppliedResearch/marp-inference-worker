@@ -36,7 +36,7 @@ about what does not and cannot happen, and a behavioural test can only ever samp
 
 | Requirement | Test | Tier | Proves |
 | --- | --- | --- | --- |
-| R1 | `test_job_runner.py::test_worker_never_receives_a_push_address` | source | No field of the job spec or attempt envelope is a callback address. The one `url` in the whole contract is the model artifact locator — an outbound fetch — and the test asserts that direction explicitly. |
+| R1 | `test_job_runner.py::test_worker_never_receives_a_push_address` | source | No field of the job spec or attempt envelope is a callback address. There are exactly two `url`s in the whole contract — the model artifact locator and, since A8, the video — and both are outbound fetches, which is the direction the test asserts explicitly. |
 | R1 | `test_status.py::test_pause_and_resume_change_what_status_reports` | unit | The loopback API serves the operator: pause and resume, with the reason recorded. |
 | R1 | `test_engine_contract.py::test_no_engine_imports_the_coordinator_or_the_runner` | source | The outbound-only boundary is closed at the import graph, not just by convention. |
 | R2 | `test_job_runner.py::test_worker_enrols_with_its_real_discovered_hardware` | runner | Nothing about the machine is passed in. Slots, CUDA devices, engines, reductions and the full hardware snapshot are all read off the host at enrolment. |
@@ -100,6 +100,13 @@ about what does not and cannot happen, and a behavioural test can only ever samp
 | R16 | `test_engine_contract.py::test_ultralytics_environment_is_set_by_the_worker_not_the_engine` | source | All three variables set in the child entry point, and asserted to be applied **before** the engine registry import — the only place it can work, since Ultralytics caches them at import. |
 | R16 | `test_engine_contract.py::test_ultralytics_version_is_pinned_exactly` | source | An `==` pin on 8.4.x in `pyproject.toml`, and the installed version matches it, so the pin is not aspirational. |
 | R16 | `test_job_context.py::test_metrics_mapping_is_not_schemad` | unit | Arbitrary metric names survive — Ultralytics' names differ by task and version. |
+| A8 | `test_job_runner.py::test_nothing_on_the_job_path_imports_jellyfin` | source | **The assertion that holds the decision.** No module in the worker package can import `jellyfin_client` or `video_source_resolver`, by any spelling — so the worker cannot reacquire knowledge of what Jellyfin is. Widened from the engine-level check to every module. Guards against a mistyped root by asserting the walk found modules at all. |
+| A8 | `test_job_runner.py::test_the_legacy_media_modules_are_still_on_disk` | source | The two modules were taken off the job path, not deleted — the legacy dataset and training scripts still import them. Also stops the check above passing trivially by deletion. |
+| A8 | `test_job_runner.py::test_the_video_source_url_back_door_is_gone` | source | `params.video_source_url` appears nowhere in the package. It was the back door every runner test used, which is why the resolver defect survived into production code: no test ever took the path that resolved anything. |
+| A8 | `test_job_runner.py::test_a_spec_without_a_video_url_is_refused_without_launching_anything` | runner | A spec with no `video.url` is refused at the schema, before a child process exists, and the coordinator is told which field was missing. Same boundary R9's inverted range is proved at. |
+| A8 | `test_job_runner.py::test_an_empty_video_url_is_refused_too` | runner | `""` is refused as well as absent — the shape a coordinator that resolved nothing would actually send, and the one a presence check would pass. |
+| A8 | `test_job_runner.py::test_a_job_runs_with_no_jellyfin_item_id_at_all` | runner | A spec carrying only a url and a source name runs to a `succeeded` result through the real loop and a real child. This is what "a worker can process any reachable source" means in practice. |
+| A8 | `test_tracking_pipeline.py::test_an_observation_from_a_job_with_no_item_id_records_null` | unit | When the job carried no item id the observation records `null` — key present, no placeholder. A fabricated value would be worse than nothing: the coordinator resolves `session_id` and `videoLocation` from this field. |
 
 ## Requirements with no test
 
@@ -213,8 +220,18 @@ environment.
 
 **Needs a real Jellyfin server:**
 
-- `VideoSourceResolver` resolving a job's `source_name` to a stream. Every runner test
-  supplies `video_source_url` directly. The resolver is pre-existing and unchanged.
+- ~~`VideoSourceResolver` resolving a job's `source_name` to a stream. Every runner test
+  supplies `video_source_url` directly. The resolver is pre-existing and unchanged.~~
+  **No longer a gap in the worker — it moved to the coordinator, 2026-09-09 (A8).** The
+  coordinator resolves the video and the job spec carries a playable `video.url`; the
+  worker opens what it is given and knows nothing about Jellyfin. The resolution itself
+  still needs verifying against a real Jellyfin server, but on MARP_API's side, and the
+  filename fuzzy-match scoring that resolved a `source_name` to an item goes with it —
+  it could resolve two similarly named dives to the wrong video with nothing to say so.
+  What is now asserted here instead is that nothing on the worker's job path can import
+  either media module (`test_nothing_on_the_job_path_imports_jellyfin`), and that
+  `params.video_source_url` no longer exists to supply one
+  (`test_the_video_source_url_back_door_is_gone`).
 - ~~OpenCV opening a Jellyfin stream and seeking to a range start. **Seeking is the
   specific risk**: `CAP_PROP_POS_FRAMES` on a long-GOP stream can land on the wrong frame,
   which would silently offset every observation in the range.~~ **Closed 2026-09-09** for

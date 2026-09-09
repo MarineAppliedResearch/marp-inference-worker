@@ -728,15 +728,17 @@ Build direct/original stream URLs
 Convert Jellyfin relative URLs into absolute URLs
 ```
 
-Environment variables used for development testing:
+**None of this is worker configuration.** A worker is configured by one service token and
+the coordinator's address, and nothing else — settled as A2 and made true again by A8, which
+moved video resolution to the coordinator: the job spec carries a playable `video.url` and
+the worker never learns what Jellyfin is. `jellyfin_client.py` and `video_source_resolver.py`
+stay on disk only for the legacy dataset and training scripts in `src/old_scripts/` and the
+manual `scripts/verify_seek_accuracy.py`, all of which are outside the job path.
+`test_nothing_on_the_job_path_imports_jellyfin` enforces that boundary structurally.
 
-```powershell
-$env:JELLYFIN_BASE_URL="http://47.208.203.78:8096"
-$env:JELLYFIN_USERNAME="guest1"
-$env:JELLYFIN_PASSWORD="guest1"
-```
-
-Do not hardcode these credentials into source code. Environment variables are acceptable for local development. Long term, this should become settings/config.
+Those scripts read the client's three `JELLYFIN_*` variables from the environment. Run them
+with credentials you already hold; do not write a host or a credential into a tracked file,
+here or in source.
 
 Manual smoke testing confirmed:
 

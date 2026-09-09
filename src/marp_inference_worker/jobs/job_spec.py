@@ -32,16 +32,26 @@ class ModelRef(BaseModel):
 
 
 # VideoRef
-# Names the video a job runs over, in Jellyfin's terms and MARP's terms.
-# Both are carried because the Jellyfin item id is what streams and the source
-# name is what MARP's observation rows record.
+# Names the video a job runs over: how to open it, and what MARP calls it.
+# The coordinator resolves the video and hands over a source the worker can
+# open, so the worker knows nothing about MARP's library or about Jellyfin (A8).
+# It does not search, does not score a filename match, and holds no media
+# credential -- which also means a worker can process any reachable source.
 class VideoRef(BaseModel):
 
-    # Jellyfin library item this job's frames come from.
-    jellyfin_item_id: str
+    # The only thing the worker uses to open the video. Required, and refused
+    # empty: a spec that cannot name its source must be rejected at the boundary
+    # rather than by a child process that has already been launched for it.
+    url: str = Field(min_length=1)
 
-    # MARP `video_source` value, the filename as the database records it.
+    # MARP `video_source` value, the filename as the database records it. This
+    # is what appears as `video_source` on every observation.
     source_name: str
+
+    # Opaque provenance, optional. Echoed into the observation output exactly as
+    # received and never resolved, parsed or acted on -- the worker cannot tell
+    # what kind of identifier it is, and a job given a bare url carries none.
+    jellyfin_item_id: str | None = None
 
 
 # FrameRange

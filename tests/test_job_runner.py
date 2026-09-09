@@ -276,16 +276,17 @@ def _mock_job(
                 "sha256": model_sha256,
                 "url": str(model_path),
             },
-            "video": {"jellyfin_item_id": "item-1", "source_name": "20240727_185645 Fwd.mp4"},
+            # The coordinator resolved the video, so the spec carries the url
+            # outright (A8). The mock engine never opens it.
+            "video": {
+                "url": "file:///not-opened-by-the-mock-engine.mp4",
+                "source_name": "20240727_185645 Fwd.mp4",
+                "jellyfin_item_id": "item-1",
+            },
             # A range is always present, even for a whole video (R9), and it is
             # half-open: this job owns start_frame up to but NOT end_frame.
             "range": {"start_frame": start_frame, "end_frame": start_frame + frames},
-            "params": {
-                "frame_delay_s": frame_delay_s,
-                # Supplied so the runner needs no Jellyfin server. Resolution is
-                # exercised separately and is not what these tests are about.
-                "video_source_url": "not-used-by-the-mock-engine",
-            },
+            "params": {"frame_delay_s": frame_delay_s},
             "reduction": {"name": "v3_dirpad", "version": "1"},
         },
     }
@@ -1004,12 +1005,18 @@ def test_worker_never_receives_a_push_address(tmp_path: Path) -> None:
         annotation = JobSpec.model_fields[nested].annotation
         assert not (set(annotation.model_fields) & forbidden), nested
 
-    # There is exactly one url in the whole contract, and it is an outbound
-    # fetch: where the worker GOES to get a model artifact. That direction is
-    # the distinction that matters -- a locator the worker reads from cannot be
-    # used to reach the worker, whereas a callback address could.
+    # There are exactly two urls in the whole contract and both are outbound
+    # fetches: where the worker GOES to get a model artifact, and where it GOES
+    # to read the video (A8). Direction is the distinction that matters -- a
+    # locator the worker reads from cannot be used to reach the worker, whereas
+    # a callback address could. This allowance was widened from one url to two
+    # when A8 moved video resolution to the coordinator; it must not be widened
+    # again without the same argument about direction.
     model_ref = JobSpec.model_fields["model"].annotation
     assert "url" in model_ref.model_fields
+
+    video_ref = JobSpec.model_fields["video"].annotation
+    assert "url" in video_ref.model_fields
 
     urls_elsewhere = [
         (name, field)
@@ -1019,9 +1026,14 @@ def test_worker_never_receives_a_push_address(tmp_path: Path) -> None:
     ]
     assert urls_elsewhere == [], urls_elsewhere
 
-    for nested in ("video", "range", "reduction"):
+    # And nowhere else at all: those two are the only ones.
+    for nested in ("range", "reduction"):
         annotation = JobSpec.model_fields[nested].annotation
         assert not [name for name in annotation.model_fields if "url" in name.lower()], nested
+
+    # The video's url is the only one it may carry -- a second url field there
+    # would be somewhere to hide a callback address.
+    assert [name for name in video_ref.model_fields if "url" in name.lower()] == ["url"]
 
 
 # test_two_piece_split_covers_every_frame_exactly_once(tmp_path)
@@ -1291,3 +1303,204 @@ def test_the_in_flight_record_carries_live_progress(tmp_path: Path) -> None:
     assert 0 < progress["elapsed_s"] < 300, progress["elapsed_s"]
 
     _wait_until(runner, lambda: len(coordinator.results) == 1)
+
+
+# test_a_spec_without_a_video_url_is_refused_without_launching_anything(tmp_path)
+# Verifies the video contract at the boundary.
+# Inputs: pytest temporary directory.
+# Output: pytest pass/fail result.
+#
+# Proves A8's required-url clause where an inverted range is already proved: the
+# coordinator resolves the video and guarantees a url, so a spec that arrives
+# without one is a coordinator bug and is refused at the schema -- before a
+# child process exists that would open nothing and fail on its first read.
+def test_a_spec_without_a_video_url_is_refused_without_launching_anything(
+    tmp_path: Path,
+) -> None:
+
+    offer = _job_for(tmp_path, "attempt-no-url", frames=5)
+    del offer["spec"]["video"]["url"]
+
+    coordinator = FakeCoordinator(offers=[offer])
+    runner, _ = _runner(coordinator, tmp_path)
+    runner.ensure_enrolled()
+
+    # Nothing was taken and nothing was launched.
+    assert runner._poll_once() is False
+    assert runner._jobs_by_slot == {}
+
+    # And the coordinator was told which field was missing, not just that the
+    # spec was bad -- the other half of this contract is a separate repository.
+    assert len(coordinator.results) == 1
+    assert coordinator.results[0]["outcome"] == "failed"
+    assert coordinator.results[0]["failure_reason"].startswith("invalid_spec")
+    assert "url" in coordinator.results[0]["failure_reason"]
+
+
+# test_an_empty_video_url_is_refused_too(tmp_path)
+# Verifies the url is refused empty as well as absent.
+# Inputs: pytest temporary directory.
+# Output: pytest pass/fail result.
+#
+# Proves the same clause against the shape a bug actually produces. A missing
+# key is the obvious case; a coordinator that resolved a video and got nothing
+# back is far more likely to send an empty string, which would pass a presence
+# check and then fail inside a child as an unopenable source.
+def test_an_empty_video_url_is_refused_too(tmp_path: Path) -> None:
+
+    offer = _job_for(tmp_path, "attempt-empty-url", frames=5)
+    offer["spec"]["video"]["url"] = ""
+
+    coordinator = FakeCoordinator(offers=[offer])
+    runner, _ = _runner(coordinator, tmp_path)
+    runner.ensure_enrolled()
+
+    assert runner._poll_once() is False
+    assert runner._jobs_by_slot == {}
+    assert coordinator.results[0]["failure_reason"].startswith("invalid_spec")
+
+
+# test_a_job_runs_with_no_jellyfin_item_id_at_all(tmp_path)
+# Verifies the item id really is optional end to end.
+# Inputs: pytest temporary directory.
+# Output: pytest pass/fail result.
+#
+# Proves A8's "opaque provenance, optional" clause at the tier that can see it.
+# A worker must be able to process any reachable source, so a spec carrying only
+# a url and a source name has to run -- and this runs the real loop and a real
+# child process rather than only validating the schema.
+def test_a_job_runs_with_no_jellyfin_item_id_at_all(tmp_path: Path) -> None:
+
+    offer = _job_for(tmp_path, "attempt-bare-url", frames=5)
+    del offer["spec"]["video"]["jellyfin_item_id"]
+
+    coordinator = FakeCoordinator(offers=[offer])
+    runner, _ = _runner(coordinator, tmp_path)
+    runner.ensure_enrolled()
+
+    # Taken, not refused.
+    assert runner._poll_once() is True
+
+    assert _wait_until(runner, lambda: len(coordinator.results) == 1)
+    assert coordinator.results[0]["outcome"] == "succeeded"
+
+
+# _job_path_module_paths()
+# Returns every source file of the worker package except the two legacy media
+# modules that are allowed to know what Jellyfin is.
+# Inputs: none.
+# Output: list of (path, module name) pairs.
+# Use this for the boundary checks below.
+def _job_path_module_paths() -> list[tuple[Path, str]]:
+
+    import marp_inference_worker
+
+    package_root = Path(marp_inference_worker.__file__).resolve().parent
+
+    # The two files that stay on disk for the legacy dataset and training
+    # scripts in src/old_scripts/ and scripts/, both outside the package.
+    legacy = {"jellyfin_client.py", "video_source_resolver.py"}
+
+    found: list[tuple[Path, str]] = []
+    for path in sorted(package_root.rglob("*.py")):
+        if path.name in legacy:
+            continue
+        relative = path.relative_to(package_root).with_suffix("")
+        found.append((path, "marp_inference_worker." + ".".join(relative.parts)))
+    return found
+
+
+# test_the_legacy_media_modules_are_still_on_disk()
+# Verifies the two modules were moved off the job path, not deleted.
+# Inputs: none.
+# Output: pytest pass/fail result.
+#
+# Proves the other half of A8's consequence. The legacy dataset and training
+# scripts still import both, so deleting them breaks work that has nothing to do
+# with the job path -- and without this the check below would pass trivially if
+# somebody removed the files instead of the imports.
+def test_the_legacy_media_modules_are_still_on_disk() -> None:
+
+    import marp_inference_worker
+
+    media_root = Path(marp_inference_worker.__file__).resolve().parent / "media"
+
+    assert (media_root / "jellyfin_client.py").is_file()
+    assert (media_root / "video_source_resolver.py").is_file()
+
+
+# test_nothing_on_the_job_path_imports_jellyfin()
+# Verifies the boundary is closed at the import level, package-wide.
+# Inputs: none.
+# Output: pytest pass/fail result.
+#
+# Proves A8 structurally, and it is the assertion that actually holds the
+# decision. The worker knows nothing about MARP or Jellyfin: the coordinator
+# resolves the video and hands over a url. An import is how that would come
+# back -- the previous version authenticated to Jellyfin and searched it by
+# filename with fuzzy match scoring, which can resolve two similarly named dives
+# to the wrong video with nothing to say so. A structural check fails at the
+# moment somebody adds the import, rather than after a job depends on it.
+#
+# Same pattern as test_engine_contract's engine-level check, widened from the
+# engines to every module in the package.
+def test_nothing_on_the_job_path_imports_jellyfin() -> None:
+
+    import ast
+
+    forbidden_modules = {
+        "marp_inference_worker.media.jellyfin_client",
+        "marp_inference_worker.media.video_source_resolver",
+    }
+
+    checked = _job_path_module_paths()
+
+    # The walk found something, so a mistyped root cannot pass as clean.
+    assert len(checked) > 20, f"only {len(checked)} modules found"
+
+    for path, module_name in checked:
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+
+        for node in ast.walk(tree):
+
+            # `import x.y.z`
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    assert alias.name not in forbidden_modules, (
+                        f"{module_name} imports {alias.name}"
+                    )
+                    assert "jellyfin" not in alias.name.lower(), (
+                        f"{module_name} imports {alias.name}"
+                    )
+
+            # `from x.y import z`
+            if isinstance(node, ast.ImportFrom) and node.module:
+                assert node.module not in forbidden_modules, (
+                    f"{module_name} imports {node.module}"
+                )
+                assert "jellyfin" not in node.module.lower(), (
+                    f"{module_name} imports {node.module}"
+                )
+
+                # And no name pulled out of any module, by any spelling.
+                for alias in node.names:
+                    assert "jellyfin" not in alias.name.lower(), (
+                        f"{module_name} imports {alias.name} from {node.module}"
+                    )
+
+
+# test_the_video_source_url_back_door_is_gone()
+# Verifies the params escape hatch was removed, not merely unused.
+# Inputs: none.
+# Output: pytest pass/fail result.
+#
+# Proves the last clause of A8. `params.video_source_url` was how the worker
+# opened a video when no resolver was configured, and every runner test supplied
+# it -- which is exactly why the resolver defect survived into production code:
+# the tests never took the path that used the resolver. The field is gone, and a
+# name check is what stops it being reintroduced as a convenience.
+def test_the_video_source_url_back_door_is_gone() -> None:
+
+    for path, module_name in _job_path_module_paths():
+        source = path.read_text(encoding="utf-8")
+        assert "video_source_url" not in source, f"{module_name} still names video_source_url"

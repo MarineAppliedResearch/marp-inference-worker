@@ -235,7 +235,11 @@ def test_the_lease_offer_validates_with_the_integer_ids_marp_issues() -> None:
         "spec": {
             "engine": "mock",
             "model": {"name": "m.pt", "sha256": "a" * 64},
-            "video": {"jellyfin_item_id": "item-1", "source_name": "v.mp4"},
+            "video": {
+                "url": "http://media.invalid/v.mp4",
+                "source_name": "v.mp4",
+                "jellyfin_item_id": "item-1",
+            },
             "range": {"start_frame": 0, "end_frame": 300},
             "params": {},
             # An integer, which is how MARP's own published spec documents it.

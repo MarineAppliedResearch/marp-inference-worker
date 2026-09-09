@@ -321,7 +321,13 @@ class JobRunner:
     def run_forever(self) -> None:
 
         # Identity and enrolment first; nothing else can happen without them.
-        self.ensure_enrolled()
+        # Enrol on every start, not only the first, so a machine that gained a
+        # GPU, changed driver or installed an engine re-reports its hardware.
+        # Enrolment is idempotent on the coordinator side (keyed on name), so
+        # this refreshes the pool row rather than creating a second one. Found
+        # live: this machine's pool entry still read "no GPU" after CUDA was
+        # working, because capabilities had only ever been sent once.
+        self.ensure_enrolled(force=True)
 
         # Report a job that did not survive the last restart, before taking new
         # work, so MARP can re-queue it promptly.

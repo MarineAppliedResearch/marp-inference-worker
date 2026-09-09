@@ -2,28 +2,36 @@
 name = "marp-inference-worker"
 version = "0.1.0"
 description = "Agnostic MARP inference worker service."
-requires-python = ">=3.10"
+# 3.12 deliberately, not newer: torch and ultralytics wheels lag new Python
+# releases, and 3.11 is what the previous environment was built against and no
+# longer exists on any current machine. The floor is a floor, not a preference --
+# `marp-inference-worker` is developed and tested on 3.12.
+requires-python = ">=3.12,<3.13"
 dependencies = [
     "fastapi",
     "uvicorn[standard]",
     "pydantic",
     "httpx",
-    "ultralytics",
+    # Pinned exactly. Ultralytics ships a release most days and changes metric
+    # names, argument names and default behaviour within a minor version, so a
+    # range means two workers on the same job spec can disagree (R16).
+    "ultralytics==8.4.145",
+    "opencv-python",
     "psutil",
     "nvidia-ml-py",
     "loguru",
     "scipy",
+    # ByteTrack's dependencies. It is required, not optional: the tracking stage
+    # imports BYTETracker from yolox.tracker.byte_tracker.
+    #
+    # `lap` publishes Windows wheels. `cython-bbox` does not -- it is a source
+    # distribution and needs a C compiler. On Windows that means the Visual
+    # Studio "Desktop development with C++" workload; verified building against
+    # MSVC 14.51 with Python 3.12. On Linux the system compiler is enough.
     "lap",
-    "scikit-image",
-    "thop",
-    "ninja",
-    "tabulate",
-    "tensorboard",
-    "motmetrics",
-    "filterpy",
-    "h5py",
     "cython-bbox",
-    "sortedcontainers",
+    "cython",
+    "filterpy",
 ]
 [project.optional-dependencies]
 dev = [
@@ -31,6 +39,11 @@ dev = [
     "httpx",
     "ruff",
 ]
+
+[project.scripts]
+# The process a GPU machine actually runs: the outbound job loop plus the
+# operator's loopback API.
+marp-worker = "marp_inference_worker.worker_main:main"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

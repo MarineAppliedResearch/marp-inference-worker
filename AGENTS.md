@@ -43,12 +43,34 @@ gets it.
 **Work happens on `develop`.** Other branches exist and are not the question; the
 registry says `develop` and that is the answer.
 
-Dormant since 2026-07. One thing still needs doing before an agent is pointed at it: the
-checked-in `.venv` points at a Python that does not exist on the current machine and needs
-recreating against 3.12 — deliberately 3.12 rather than newer, because `torch` and
-`ultralytics` wheels lag new Python releases.
+### The environment
 
-Running it needs an NVIDIA GPU. Building it does not.
+The old `.venv` points at a Python that does not exist for the current user and is
+abandoned rather than repaired; it is git-ignored, so deleting it costs nothing. Build a
+fresh one against 3.12 — deliberately 3.12 rather than newer, because `torch` and
+`ultralytics` wheels lag new Python releases, and `pyproject.toml` pins the floor and the
+ceiling. Run `py -0p` to see which interpreters this machine has.
+
+```
+py -3.12 -m venv .venv312
+.venv312\Scripts\python -m pip install -e ".[dev]"
+```
+
+**ByteTrack is required, not optional** — the tracking stage imports `BYTETracker` from the
+vendored `ByteTrack/` tree, which is a source checkout and not a wheel. Its `cython-bbox`
+dependency has no Windows wheel and compiles from source, so a Windows machine needs the
+Visual Studio "Desktop development with C++" workload. Without it the install fails on
+`cython-bbox` with a missing-compiler error; `lap`, the other compiled dependency, does
+publish Windows wheels.
+
+The vendored ByteTrack uses `np.float`, `np.int` and `np.bool`, which numpy removed in
+1.24. `tracking/byte_tracker_adapter.py` restores those aliases before importing it, and
+is the one place to undo when ByteTrack is updated. The tree itself is left identical to
+upstream on purpose. Note that the import succeeds without the shim — the failure appears
+only on the first frame that has something on it.
+
+Running inference needs an NVIDIA GPU. Building and testing do not: `pytest` runs green
+with no GPU, and what that leaves unproven is listed in `.marp/verification.md`.
 
 <!-- marp:shared start -->
 <!-- Canonical source: MARP/AGENTS.md. Do not edit this block in a component repository;

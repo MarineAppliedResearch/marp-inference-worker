@@ -9,7 +9,7 @@ reconstructing it from a conversation. Read `.marp/task.md` for the spec and
 | Repo | Branch | Commits | Tests | Pushed |
 |---|---|---|---|---|
 | `MARP_API` | `3-gpu-orchestration-api` | 5 | 264 pass | yes |
-| `marp-inference-worker` | `3-worker-dial-out-loop` | 5 | 138 pass | yes |
+| `marp-inference-worker` | `3-worker-dial-out-loop` | 7 | 180 pass | 6 of 7 |
 
 Tracking issue: `MarineAppliedResearch/marp-inference-worker#3` — its comments
 carry the settled decisions. Dashboard design: `MARP_API#104`.
@@ -64,10 +64,22 @@ capability, and both engines (`marp_tracking`, `mock`).
 1. **The job round trip.** lease → progress → cancel → result → artifact has
    never run. The `mock` engine needs no GPU, so this is the cheapest next step
    and it exercises nine of the twelve routes.
-2. **Real YOLO over a real Jellyfin video.** Now possible on this machine.
-   Highest-risk part is frame-range *seeking* against a stream Jellyfin may
-   transcode rather than direct-play — manual step 3 in
-   `.marp/verification.md` exists for exactly this.
+2. ~~**Real YOLO over a real Jellyfin video.**~~ **Done, 9 Sep 2026**, coordinator
+   excluded — see *Results — real model over real video* in
+   `.marp/verification.md`. Stock `yolov8n` over a CAMPA2021 clip, driven
+   through `jobs.child_main` with a hand-written envelope.
+
+   The headline: **seeking is exact.** `CAP_PROP_POS_FRAMES` landed on the
+   frame it was asked for on all 22 targets tried, across a 979-frame clip and
+   a 38,159-frame one. The stream direct-plays rather than transcodes, which is
+   why — ffmpeg can seek by byte offset in an indexed MP4. A **transcoded**
+   stream is still unmeasured and is the remaining risk here.
+
+   Also settled: `infer_stream`'s normalization of Ultralytics `Results` is
+   correct against the real 8.4.145 object, and the `[0,300)` / `[300,600)`
+   seam holds on real video — 0..299 and 300..413.
+
+   Still not run: anything coordinator-mediated. Manual steps 4-7 are open.
 3. **The dashboard** (`R15`) is not built, by decision. Design first: `MARP_API#104`.
 
 ## Three bugs the end-to-end run found, all now fixed

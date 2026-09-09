@@ -3,11 +3,16 @@
 Worker half of MARP's distributed GPU compute: the dial-out loop, the engine contract, and
 the detect → track → reduce pipeline.
 
-**There is no GPU in this environment.** That shapes everything below. Every requirement
-that can be proved without one is proved; the ones that cannot are named in *Known gaps*
-rather than claimed. The tier that matters most here is not `unit` — it is `runner`, which
-launches a real child process over a real pipe, because that is the only tier below a GPU
-that can watch a job be cancelled.
+**This plan was written on a machine with no GPU**, and that shapes everything below: every
+requirement that could be proved without one is proved, and the ones that could not are
+named in *Known gaps* rather than claimed. The tier that matters most below a GPU is not
+`unit` — it is `runner`, which launches a real child process over a real pipe, because
+that is the only tier below a GPU that can watch a job be cancelled.
+
+**A CUDA machine and a reachable Jellyfin server have since become available**, and some of
+those gaps are now closed. *Results — real model over real video* at the end of this file
+is the authority on what has actually been observed; where it and *Known gaps* disagree,
+it wins, and the gap rows it closes say so.
 
 ## Tiers
 
@@ -18,7 +23,8 @@ that can watch a job be cancelled.
 | `runner` | the real job loop against a fake coordinator: real child process, real pipe, real heartbeats, real stop file. Mock engine, so no GPU and no model. | seconds |
 | `pipeline` | the real vendored ByteTrack, the real accumulator, the real ported reduction, over synthetic detections. No GPU. | seconds |
 | `source` | a structural assertion over the code itself — an import graph, a syntax tree, a pin | milliseconds |
-| `gpu` | real YOLO, real video, real CUDA | **cannot run here** |
+| `gpu` | real YOLO, real video, real CUDA | minutes, and **not in CI** — run by hand, see *Results — real model over real video* |
+| `media` | the seek analysis over a fake capture, in-process. No stream, no GPU. | milliseconds |
 
 `source` needs a word of justification, because a test that reads code rather than running
 it is usually a smell. Three things in this task are genuinely structural claims and
@@ -54,6 +60,12 @@ about what does not and cannot happen, and a behavioural test can only ever samp
 | R9 | `test_job_runner.py::test_two_piece_split_covers_every_frame_exactly_once` | runner | The half-open convention, asserted rather than documented. Two adjacent pieces `[0,300)` and `[300,600)` cover `0..599` exactly once: no frame in both, none missing, and the first piece does **not** touch frame 300. |
 | R9 | `test_job_runner.py::test_malformed_spec_is_rejected_without_launching_anything` | runner | An inverted range is refused at the schema, before a child process exists. |
 | R9 | `test_job_runner.py` (all job tests) | runner | Every spec carries a range, including in the fixture — nothing special-cases a whole video. |
+| R9 | `test_seek_verification.py::test_a_seek_that_lands_short_is_reported_as_an_offset` | media | A capture that *reports* frame 300 while decoding frame 267 is caught and the offset named. Believing the reported position is the failure this exists for, and no other test in this repository can see it. |
+| R9 | `test_seek_verification.py::test_locating_a_run_narrows_what_locating_one_frame_cannot` | media | **Why the comparison is by run.** On video that repeats inside a window, one frame occurs at five indices and a run that reaches past the window occurs at one. A single-frame comparison invents offsets that are not there — it did, on the first real measurement. |
+| R9 | `test_seek_verification.py::test_a_short_landing_inside_a_repeating_stretch_is_still_caught` | media | The dangerous case: the seek lands short *and* the frame it landed on is pixel-identical to the target. Still reported as an offset. |
+| R9 | `test_seek_verification.py::test_summarize_will_not_pass_on_ambiguous_results_alone` | media | A set in which nothing was unambiguous must not report green — it says nothing about the decoder. |
+| R9 | `test_seek_verification.py::test_summarize_of_nothing_does_not_pass` | media | A measurement that ran on nothing does not look green. |
+| R9 | `scripts/verify_seek_accuracy.py` | gpu/media | The measurement itself, against a real stream. This is manual step 3, as a command rather than a procedure. |
 | R10 | `test_tracking_pipeline.py::test_full_pipeline_produces_one_observation_for_one_animal` | pipeline | The three stages, joined, with the **real** ByteTrack: id assigned, track gathered, reduced to labelled keyframes, shaped as an observation. |
 | R10 | `test_tracking_pipeline.py::test_vendored_bytetrack_is_importable_and_usable` | pipeline | The vendored tracker actually tracks. Not skipped when absent — see *Regression coverage*. |
 | R10 | `test_track_accumulator.py::test_accumulated_track_is_in_the_shape_the_reduction_reads` | unit | The join between stage 2 and stage 3, which would otherwise fail only on a real job. |
@@ -175,9 +187,11 @@ environment.
 
 **Needs a GPU — nothing here observes any of it:**
 
-- Real YOLO inference. `infer_stream` has never run against a real model. Its normalization
-  of Ultralytics `Results` objects — `boxes.xyxy`, `boxes.conf`, `boxes.cls`, `orig_shape`
-  — is written against the 8.4 API and is **unverified against a real Results object**.
+- ~~Real YOLO inference. `infer_stream` has never run against a real model. Its
+  normalization of Ultralytics `Results` objects — `boxes.xyxy`, `boxes.conf`, `boxes.cls`,
+  `orig_shape` — is written against the 8.4 API and is **unverified against a real Results
+  object**.~~ **Closed 2026-09-09**: verified against ultralytics 8.4.145 on CUDA. All four
+  attributes exist and carry what the code assumes. See the results section.
 - `load_weights` placing a model on a CUDA device, and `unload_all` actually releasing VRAM.
 - Device resolution against real hardware. Every `test_device.py` case with more than zero
   GPUs monkeypatches the count; the *zero* case is the only one that is real here.
@@ -201,9 +215,12 @@ environment.
 
 - `VideoSourceResolver` resolving a job's `source_name` to a stream. Every runner test
   supplies `video_source_url` directly. The resolver is pre-existing and unchanged.
-- OpenCV opening a Jellyfin stream and seeking to a range start. **Seeking is the specific
-  risk**: `CAP_PROP_POS_FRAMES` on a long-GOP stream can land on the wrong frame, which
-  would silently offset every observation in the range. Manual step 3 exists for this.
+- ~~OpenCV opening a Jellyfin stream and seeking to a range start. **Seeking is the
+  specific risk**: `CAP_PROP_POS_FRAMES` on a long-GOP stream can land on the wrong frame,
+  which would silently offset every observation in the range.~~ **Closed 2026-09-09** for
+  direct-played MP4 over Jellyfin's `?static=true` endpoint: measured exact on 22 targets
+  across two videos, one of them 38,159 frames. It is **not** closed for a transcoded
+  stream, which nothing here has yet met — see the results section.
 
 **Not covered for other reasons:**
 
@@ -244,16 +261,25 @@ For the GPU machine, in order. Each says what to expect.
    `test_tracking_engine_refuses_a_gpu_job_on_a_machine_without_one`, which asserts the
    preflight does **not** refuse. If it refuses on a GPU machine, the check is too strict.
 
-3. **Frame-range seek accuracy.** The highest-risk untested thing.
-   Pick a Jellyfin video. Run one job over frames 0–300 and another over 300–600. In the
-   second job's results, the first observation's lowest `framenum` must be **≥ 300**. If
-   frames repeat across the two, `CAP_PROP_POS_FRAMES` is landing short and every
-   observation in every non-zero range is offset.
+3. **Frame-range seek accuracy.** The highest-risk untested thing, and now a command:
+   ```
+   .venv312\Scripts\python scripts\verify_seek_accuracy.py <jellyfin_item_id>
+   ```
+   It decodes the stream sequentially as ground truth, then seeks to each target on a
+   freshly opened capture and reports where each landed. Expect `PASSED` and an exit code
+   of 0. A `verdict` of `offset` on any target means `CAP_PROP_POS_FRAMES` is landing
+   short and **every observation in every non-zero range is offset** — stop and report it.
+   `exact_ambiguous` is not a failure: it means the video repeats over the whole decoded
+   run, which is a property of the content.
 
-   Note the range is half-open, so those two jobs are `[0,300)` and `[300,600)` and they
-   share the bound 300 — the first job must not process it. The convention is asserted in
-   `test_two_piece_split_covers_every_frame_exactly_once`; this step checks the *decoder*
-   honours it against a real stream, which no test here can.
+   Then the same question through two real jobs, which is what actually matters: one over
+   `[0, 300)` and one over `[300, 600)`. The ranges are half-open and share the bound 300,
+   so the first job must not process it — in its results the highest `framenum` must be
+   ≤ 299, and in the second's the lowest must be ≥ 300. The convention is asserted in
+   `test_two_piece_split_covers_every_frame_exactly_once`; these two steps check the
+   *decoder* honours it against a real stream, which no in-process test can.
+
+   Results of both, on a real CAMPA2021 clip: *Results — real model over real video*.
 
 4. **A real inference job.** Point the worker at MARP with its token, queue one tracking
    job over a short range, and watch `/status` on the worker machine.
@@ -342,3 +368,322 @@ Of those, 35 are in pre-existing files under the same rules, so the repository h
 been clean under this configuration. Restricted to real correctness rules
 (`--select F,E9,RUF015,RUF059,PLW1510,SIM115`) after fixes: **2 findings**, both left
 deliberately and named in *Known gaps*.
+
+---
+
+## Results — real model over real video
+
+Run 9 Sep 2026 on the development machine, which by then had a GPU and a reachable video
+server: Windows 11, Python 3.12.10, **NVIDIA GeForce RTX 5060 Laptop GPU**,
+torch 2.11.0+cu128, torchvision 0.26.0+cu128, ultralytics 8.4.145, numpy 2.5.3,
+OpenCV 5.0.0 (FFMPEG backend), ByteTrack vendored + cython-bbox built against MSVC 14.51.
+
+Model: **stock `yolov8n`**, not the MARP fish model. Deliberate. Its classes are COCO, so
+it was expected to find no fish, and the point of the run was the machinery — decode, seek,
+detect → track → reduce, the reduction, and the results file — not the biology.
+
+`yolov8n.pt`, 6,549,796 bytes,
+sha256 `f59b3d833e2ff32e194b5bb8e08d211dc7c5bdf144b90d2c8412c47ccfc83b36`, fetched
+deliberately from `ultralytics/assets` rather than by an implicit download inside a job,
+because the child process sets `YOLO_OFFLINE` (R16).
+
+Video: CAMPA2021 / Dive 119 / `20210614_153127_Fwd`, Jellyfin item
+`0580f9fc5d3e0633998c3b02a236358c`. 39.168 s, 1920x1080 h264, 25 fps, 979 frames.
+The long-video seek check used `20210614_153913_Fwd` from the same dive, 38,159 frames.
+
+No coordinator was involved in any of this. Jobs were driven through the real child entry
+point, `python -m marp_inference_worker.jobs.child_main <envelope.json>`, with the envelope
+written by hand — which is exactly the contract `run(ctx, spec)` was built to allow.
+
+### Direct play, not transcode
+
+Established rather than assumed, because a transcoded stream need not have the same frame
+count as the source and "frame 300" would then mean something different to every viewer.
+Four facts, all from the running server:
+
+- `PlaybackInfo` reports the source with `Protocol: File`, `SupportsDirectPlay: true`, and
+  **both `TranscodingUrl` and `DirectStreamUrl` empty** — Jellyfin saw nothing to convert.
+- The worker's stream url is the `?static=true` endpoint, which serves the original file.
+- `HEAD` on it answers `Content-Length: 4758539`, **byte-for-byte the `Size` Jellyfin
+  reports for the source file**, with `Accept-Ranges: bytes` and no `Transfer-Encoding`.
+- A `Range: bytes=0-15` request answers `206` with `content-range: bytes 0-15/4758539` and
+  the bytes `000000206674797069736f6d…` — an unfragmented MP4 `ftyp isom` box.
+
+A transcode would be chunked, without a content length, without byte ranges, and not the
+size of the source. This also explains *why* the seek is exact: ffmpeg can seek by byte
+offset in a seekable MP4 with an index, decode from the correct keyframe, and discard up to
+the requested frame.
+
+**Frame rate reported as 0 did not occur here** — this stream reports 25.0, matching
+Jellyfin's own `AverageFrameRate`. The floor-to-1 guard in `open_video` was therefore not
+exercised, and remains a gap.
+
+### Seek accuracy — the headline
+
+`CAP_PROP_POS_FRAMES` landed on **exactly** the frame it was asked for, on every target
+tried, on both videos. 22 targets in total. No offset, constant or varying.
+
+The first measurement said otherwise and was wrong, which is worth recording because the
+mistake is easy and the wrong answer is alarming. Mapping each decoded frame to *the first
+ground-truth index with the same pixel hash* produced this:
+
+```
+ target  landed  offset
+    250     250      +0
+    299     267     -32
+    300     267     -33
+    301     267     -34
+    400     271    -129
+    500     500      +0
+distinct offsets: [-129, -34, -33, -32, -17, 0]
+VERDICT: offset VARIES by target -- not correctable by a constant.
+```
+
+That is a measurement artefact, not a decoder fault. **547 of this clip's 979 frames are
+pixel-identical to another frame** — only 432 are distinct — in 148 runs of identical
+consecutive frames, with a 16-frame period from about frame 250 onward. The seek was
+landing on frame 300; frame 300 is simply the same picture as frame 267.
+
+Comparing a *run* of decoded frames instead of one frame settles it:
+
+```
+ target  exact?  reported  candidate sequential indices for the frame we got
+      1     YES       1.0  [1]
+     25     YES      25.0  [25]
+    100     YES     100.0  [100]
+    150     YES     150.0  [150]
+    200     YES     200.0  [200]
+    250     YES     250.0  [250]
+    299     YES     299.0  [267, 268, 269, 283, 284, 285, 299, 300, 301, 315, ...]
+    300     YES     300.0  [267, 268, 269, 283, 284, 285, 299, 300, 301, 315, ...]
+    301     YES     301.0  [269, 285, 301, 317, 333, 349, 365, ...]
+    302     YES     302.0  [270, 286, 302, 318, 334, 350, 366, 382, 398]
+    400     YES     400.0  [271, 272, 273, 287, 288, 289, 303, 304, 305, 319, ...]
+    500     YES     500.0  [500]
+    600     YES     600.0  [600, 616, 632, 648, 664, 680, 696, 712]
+    700     YES     700.0  [588, 604, 620, 636, 652, 668, 684, 700, 716]
+    750     YES     750.0  [750]
+    900     YES     900.0  [883, 884, 885, 899, 900, 901]
+    978     YES     978.0  [930, 946, 962, 978]
+
+exact on 17/17 targets
+```
+
+Every remaining candidate sits at the target plus or minus a multiple of 16, which is the
+content's own period — not something a broken seek would produce. Where the content is
+unique the answer is a singleton and unambiguous, and it is exact there too.
+
+The 25-minute video removes the ambiguity entirely, because every one of its frames is
+distinct. Each seek was followed by 40 decoded frames and that run located in the ground
+truth:
+
+```
+ground truth: 9045 frames, 9045 distinct, 199s
+
+seek    300: reported     300.0  first-frame exact=True  run of 40 occurs at [300]
+seek   1500: reported    1500.0  first-frame exact=True  run of 40 occurs at [1500]
+seek   3000: reported    3000.0  first-frame exact=True  run of 40 occurs at [3000]
+seek   6000: reported    6000.0  first-frame exact=True  run of 40 occurs at [6000]
+seek   9000: reported    9000.0  first-frame exact=True  run of 40 occurs at [9000]
+```
+
+`iter_frame_range(capture, geometry, 300, 310)` was checked directly: its first frame's
+`index` is 300 and its pixels are sequential frame 300.
+
+The analysis is now `media/seek_verification.py` with `scripts/verify_seek_accuracy.py`
+over it, so manual step 3 is a command. Against the same clip:
+
+```
+  target   reported          verdict  candidates
+       1        1.0            exact  [1]
+     100      100.0            exact  [100]
+     299      299.0  exact_ambiguous  [267, 283, 299, 315, 331, 347, 363]
+     300      300.0  exact_ambiguous  [268, 284, 300, 316, 332, 348, 364]
+     301      301.0  exact_ambiguous  [269, 285, 301, 317, 333, 349, 365]
+     600      600.0  exact_ambiguous  [600, 616, 632, 648, 664, 680]
+     900      900.0            exact  [900]
+
+verdicts        : {'exact': 3, 'exact_ambiguous': 4}
+distinct offsets: [-32, -16, 0, 16, 32, 48, 64, 80]
+PASSED
+```
+
+### The real Results object
+
+`infer_stream`'s normalization was written against the 8.4 API and had never met a real
+`Results`. **It is correct.** On ultralytics 8.4.145, `result.boxes` is present,
+`boxes.xyxy` is `(17, 4)`, `boxes.conf` is `(17,)`, `boxes.cls` is `(17,)`, and
+`orig_shape` is `(1080, 1920)` — height first, which is the order `_run_frame_prediction`
+assumes. `model.names` is a plain `dict` of 80 COCO ids, so the `.get(class_id, ...)`
+lookups work. Nothing had to be changed.
+
+### What stock yolov8n does on ROV video, and why it cannot form a track
+
+Over all 979 frames at `conf=0.01`, the **highest detection confidence anywhere is
+0.1797**. Not one frame has a detection above 0.2. The classes are what COCO has to offer
+a seafloor: `clock` 1141, `person` 852, `tv` 310, `refrigerator` 238, `surfboard` 176,
+`elephant` 172.
+
+At MARP's real settings — `confidence=0.15`, `track_thresh=0.3` — a job over `[0, 300)`
+sees **2 detections and produces 0 observations**. That is the honest result and it is not
+a failure.
+
+It is worth being precise about *why* no track forms, because it is structural and not a
+threshold to nudge. Two gates in the vendored ByteTrack:
+
+- `det_thresh = args.track_thresh + 0.1` (`byte_tracker.py:154`), and a new track is only
+  started when its score clears `det_thresh` (`:266`).
+- `matching.fuse_score` multiplies IoU similarity by the detection score
+  (`matching.py:173`), and `linear_assignment` rejects a cost above `match_thresh`. With a
+  score of 0.18 the best achievable fused similarity is 0.18, so the cost is at least 0.82
+  and can never clear MARP's `match_thresh=0.7`. **No association across frames is
+  possible at any IoU.** Lowering `confidence` alone therefore changes nothing: at
+  `track_thresh=0.0`, 979 detections over 300 frames still produced exactly one track,
+  which was seen once and aged out.
+
+So the reduction was exercised on real video under a deliberately artificial tracker
+configuration — `confidence=0.01`, `track_thresh=0.0`, `match_thresh=0.97` — whose only
+purpose was to let COCO-class noise associate. **No code was changed to achieve it**; those
+three values are ordinary job params. Everything below is therefore evidence about the
+machinery and about nothing else.
+
+### The two-piece seam, on real video
+
+Two runs, `[0, 300)` and `[300, 600)`, same settings, same video.
+
+| | `[0, 300)` | `[300, 600)` |
+| --- | --- | --- |
+| outcome | `succeeded` | `succeeded` |
+| device | `cuda:0` | `cuda:0` |
+| frames_expected / processed | 300 / 300 | 300 / 300 |
+| frames_short_of_range | 0 | 0 |
+| detections_seen | 979 | 1215 |
+| observations | 1 | 1 |
+| results sha256 | `47267c06…daf191` | `c336d3bd…fb1a70` |
+| results bytes | 3329 | 734 |
+| keyframe `framenum` range | **0 … 299** | **300 … 413** |
+| track_id | 1 | 1 |
+| track_end_reason | `range_end` | `range_end` |
+
+**The seam holds.** The first piece's highest `framenum` is 299 — it never processed frame
+300 — and the second piece's lowest is exactly 300. The last metrics event of the first run
+is `step=299` and the first of the second is `step=329`, consistent with the same thing.
+Both pieces carry `track_id: 1` from two independent trackers, which is exactly why R10a
+forbids comparing ids across ranges.
+
+### A results record, verbatim
+
+The whole of the second piece's `observations.jsonl`, one JSON object per line as R11 says:
+
+```json
+{"comname": "clock", "count": 1, "tc": "00:00:14", "frame": "7", "video_source": "20210614_153127_Fwd.mp4", "jellyfin_item_id": "0580f9fc5d3e0633998c3b02a236358c", "mediaPosition": "00:00:14.279", "actualPosition": "00:00:14.279", "keyframes": [{"subset": "1", "comname": "clock", "type": "start", "framenum": 300, "x": 0.8039578912681559, "y": 0.2955575830743181, "width": 0.0811110492599446, "height": 0.13830153021656155}, {"subset": "1", "comname": "clock", "type": "end", "framenum": 413, "x": 0.8039542095078498, "y": 0.2955645023890501, "width": 0.08111274314254842, "height": 0.13830199240320623}], "reduction": {"name": "v3_dirpad", "version": "1"}, "track_id": 1, "track_end_reason": "range_end", "observation_frame": 357}
+```
+
+The first piece's record is the same shape with 16 keyframes labelled `start`,
+`middle` x14, `end`, at framenums 0, 175-226 and 299 — so the reduction really did pick
+keyframes rather than pass the track through, and `reduction: {name: v3_dirpad, version:
+1}` travels on the row as R10b requires.
+
+### Two things noticed and deliberately left alone
+
+**Normalized keyframe boxes can exceed 1.0.** Some keyframes in the first piece carry a
+`width` of 1.2236 — wider than the frame. The engine normalizes ByteTrack's `track.tlbr`,
+which is a Kalman *prediction* and is not clipped to the picture.
+
+This is **not new**: `src/old_scripts/object_tracking_live.py:407-410` normalizes
+`track.tlbr` exactly the same way and just as unclipped, so MARP's existing observations
+already contain values like these and the port is faithful. It is therefore not a new
+implementation decision to surface at the gate — but it is worth knowing before anyone
+"fixes" it, because clamping would change what is stored and an unclamped value does carry
+information: the tracker believed the animal extended past the frame edge.
+
+One small divergence from that line while looking at it: the legacy script does
+`map(int, track.tlbr)` and normalizes truncated integers; the worker keeps floats. A
+sub-pixel difference in a normalized coordinate, not a semantic one, and the float is the
+better value.
+
+**Ultralytics prints to the child's stdout.** The first ultralytics import in a fresh
+`YOLO_CONFIG_DIR` writes three lines beginning `Creating new Ultralytics Settings v0.0.8
+file` — and since R16 gives every job its own config directory, that happens on **every**
+job, on the same stream the child's event protocol uses. It is handled: `_read_events`
+records a non-JSON line as stray output rather than failing, and `runner.py:868` collects
+it. Verified by seeing the lines arrive and the job still succeed. Noted because it looks
+alarming in a log and because anything that tightens that reader would break every job.
+
+### What this proves, and what it does not
+
+Proved, on real hardware against a real stream:
+
+- Jellyfin direct play, opened by OpenCV, with correct geometry.
+- Seeking to a frame lands on that frame, on a 979-frame clip and on a 38,159-frame one.
+- The half-open range convention is honoured by the *decoder*, not merely by the schema.
+- `infer_stream` against a real `Results` object, on CUDA, one frame at a time.
+- detect → track → reduce end to end, with the real vendored ByteTrack.
+- `reduce_to_keyframes_v3_dirpad` on a real track, producing start/middle/end keyframes.
+- The results file, written as JSONL, hashed by the process that wrote it, and handed over
+  through `ctx.publish_artifact` with `role: observations`.
+- `run(ctx, spec)` driven with no coordinator at all, through the real child entry point.
+- The per-job Ultralytics environment (R16) applied before the first ultralytics import.
+
+**Not** proved, and not claimed:
+
+- **Nothing about detection quality.** Stock yolov8n found no fish, as expected, and every
+  observation above came from COCO noise under an artificial tracker configuration. The
+  MARP fish model has still never run here.
+- The tracker's real settings producing a real track. Structurally impossible with this
+  model on this video, per the fuse_score arithmetic above.
+- Anything coordinator-mediated: lease, heartbeat, progress upstream, cancel, terminal
+  report, artifact hand-off. Another agent held MARP_API and its database for the duration,
+  so no `/api/v2/gpu/...` route was called. Manual steps 4, 5, 6 and 7 remain open.
+- A transcoded stream. Every measurement above is against direct play, and a transcode is
+  the case where frame numbering could differ from the source's.
+- A frame rate reported as 0. This stream reports 25.
+- The model cache's hash verification (R13). Driving the child entry point directly skips
+  the parent runner's fetch-and-verify, so the sha256 above was recorded but not checked by
+  the worker.
+
+### Test suite
+
+`.venv312\Scripts\python -m pytest -q`, before this work and twice:
+
+```
+166 passed, 2 warnings in 69.68s (0:01:09)
+166 passed, 2 warnings in 67.34s (0:01:07)
+```
+
+After adding `test_seek_verification.py`:
+
+```
+180 passed, 2 warnings in 93.97s (0:01:33)
+```
+
+The 14 new tests were each checked for vacuity by mutating what they guard. All five
+mutations tried went red, including reintroducing the original defect — comparing one frame
+instead of a run — which fails three of them:
+
+```
+--- mutation: locate_run compares one frame, not the run ---   3 failed, 11 passed
+--- mutation: locate_run returns only the first match ---      5 failed,  9 passed
+--- mutation: verdict calls an ambiguous match exact ---       1 failed, 13 passed
+--- mutation: summarize no longer requires an exact ---        1 failed, 13 passed
+--- mutation: summarize no longer fails on an offset ---       1 failed, 13 passed
+--- mutation: measure_seek leaks the capture ---               1 failed, 13 passed
+```
+
+Two failures were seen and fixed while writing them, recorded because the doctrine asks for
+real results including failures:
+
+- `test_a_seek_that_lands_short_is_reported_as_an_offset` and
+  `test_summarize_fails_when_any_seek_landed_elsewhere` both failed with an unexpected
+  extra offset. The test fixture built frames with a fill of `value % 256`, so a
+  400-frame "unique" video contained 144 duplicate frames. The fixture was wrong in
+  exactly the way the module under test exists to catch.
+- `test_a_short_landing_inside_a_repeating_stretch_is_still_caught` asserted
+  `offsets == [-32]` and got `[-48, -32]`, because the run it decodes stays inside the
+  repeating stretch and so also matches one period earlier. The assertion was wrong, not
+  the code: what matters is that the target is *not* among the matches. Narrowed to that.
+
+Ruff on the three new files reports 3 findings, all of them the repository's own house
+style rather than anything new: two `I001` from the comment-per-import-group convention
+`AGENTS.md` requires, and one `UP035` for `from typing import Iterable` where the rest of
+the tree does the same. The one finding unique to the new code, `PIE808`, was fixed.

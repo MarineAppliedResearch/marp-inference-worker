@@ -16,9 +16,12 @@
 
 # json reads and writes the in-flight record used to report a lost job.
 import json
+import socket
 
 # time paces the loop and the heartbeat interval.
 import time
+
+from .worker_state import worker_version
 
 # Path types the state and workspace directories.
 from pathlib import Path
@@ -176,7 +179,18 @@ class JobRunner:
             return
 
         # Enrol with the discovered hardware.
-        record = self._client.enrol(self.identity.local_id, self.capabilities())
+        #
+        # Hostname plus a slice of the durable local id: readable in the pool
+        # view, stable across restarts, and unique between two machines that
+        # happen to share a hostname.
+        display_name = f"{socket.gethostname()}-{self.identity.local_id[:8]}"
+        record = self._client.enrol(
+            self.identity.local_id,
+            self.capabilities(),
+            name=display_name,
+            slot_count=self._slot_count,
+            worker_version=worker_version(),
+        )
 
         # Persist the assigned id, so a restart does not enrol again.
         self.identity.worker_id = str(record["worker_id"])

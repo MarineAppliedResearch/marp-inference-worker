@@ -117,10 +117,33 @@ class CoordinatorClient:
     # Output: response body carrying the coordinator's worker id.
     # Use this at start, and again whenever the coordinator says it does not
     # know this worker -- which is how a re-enrolment happens (R3).
-    def enrol(self, local_id: str, capabilities: dict[str, Any]) -> dict[str, Any]:
+    def enrol(
+        self,
+        local_id: str,
+        capabilities: dict[str, Any],
+        name: str,
+        slot_count: int,
+        worker_version: str | None = None,
+    ) -> dict[str, Any]:
 
         # Hardware is discovered and reported, never configured (R2).
-        body = {"local_id": local_id, "capabilities": capabilities}
+        #
+        # `name` is required by the coordinator and is what it keys a
+        # re-enrolment on, so it has to be stable across restarts AND unique
+        # across machines. A bare hostname is stable but collides -- two
+        # volunteers both called DESKTOP-1 would share one pool entry and
+        # silently steal each other's leases -- so the durable local id is
+        # folded in. First discovered by running the two halves against each
+        # other: the worker had been sending only `local_id` and enrolment
+        # answered 400.
+        body = {
+            "local_id": local_id,
+            "name": name,
+            "slot_count": slot_count,
+            "capabilities": capabilities,
+        }
+        if worker_version:
+            body["worker_version"] = worker_version
 
         # Enrolment must return a body; an empty one is a contract violation.
         result = self._post("/workers/enrol", body)

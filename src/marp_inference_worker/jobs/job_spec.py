@@ -45,15 +45,31 @@ class VideoRef(BaseModel):
 
 
 # FrameRange
-# The half-open frame span this job covers.
+# The frame span this job covers, half-open: [start_frame, end_frame).
 # A range is always present, even for a whole video, so nothing in the worker has
 # to special-case "the entire thing" (R9).
+#
+# **Half-open is the agreed convention on both sides**, settled 2026-09-09 with
+# MARP_API. Two reasons it is worth being exact about. The count is a plain
+# subtraction, `end - start`, with no off-by-one to get wrong; and consecutive
+# pieces share a bound, so a video split into pieces is just
+# `[0,300) [300,600) [600,900)` with nothing to add or subtract between them.
+#
+# Inclusive-on-both-ends was the alternative and it drops one frame at every
+# piece boundary -- silently, because each piece looks complete on its own. A
+# ten-hour video split into ten pieces would lose nine frames and no test on
+# either side would have noticed.
+#
+# A human-facing label may well read "frames 0-999" for `[0, 1000)`. That
+# display is inclusive; the contract is not. Do not read a label back into a
+# spec without subtracting.
 class FrameRange(BaseModel):
 
     # First frame index this job is responsible for, inclusive.
     start_frame: int = Field(ge=0)
 
     # One past the last frame index this job is responsible for, exclusive.
+    # This frame belongs to the NEXT piece, and this job must not process it.
     end_frame: int = Field(gt=0)
 
     # Reject an inverted or empty range at the boundary rather than mid-decode.

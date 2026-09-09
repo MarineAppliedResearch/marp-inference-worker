@@ -187,6 +187,7 @@ def _mock_job(
     model_sha256: str,
     frames: int = 5,
     frame_delay_s: float = 0.0,
+    start_frame: int = 1000,
 ) -> dict[str, Any]:
 
     return {
@@ -203,8 +204,9 @@ def _mock_job(
                 "url": str(model_path),
             },
             "video": {"jellyfin_item_id": "item-1", "source_name": "20240727_185645 Fwd.mp4"},
-            # A range is always present, even for a whole video (R9).
-            "range": {"start_frame": 1000, "end_frame": 1000 + frames},
+            # A range is always present, even for a whole video (R9), and it is
+            # half-open: this job owns start_frame up to but NOT end_frame.
+            "range": {"start_frame": start_frame, "end_frame": start_frame + frames},
             "params": {
                 "frame_delay_s": frame_delay_s,
                 # Supplied so the runner needs no Jellyfin server. Resolution is
@@ -226,6 +228,7 @@ def _job_for(
     attempt_id: str,
     frames: int = 5,
     frame_delay_s: float = 0.0,
+    start_frame: int = 1000,
 ) -> dict[str, Any]:
 
     # Contents keyed by attempt id, so each job gets its own cache entry and
@@ -235,7 +238,9 @@ def _job_for(
         contents=f"model for {attempt_id}".encode(),
         name=f"{attempt_id}.pt",
     )
-    return _mock_job(attempt_id, model_path, model_sha256, frames, frame_delay_s)
+    return _mock_job(
+        attempt_id, model_path, model_sha256, frames, frame_delay_s, start_frame
+    )
 
 
 # _runner()
@@ -900,3 +905,98 @@ def test_worker_never_receives_a_push_address(tmp_path: Path) -> None:
     for nested in ("video", "range", "reduction"):
         annotation = JobSpec.model_fields[nested].annotation
         assert not [name for name in annotation.model_fields if "url" in name.lower()], nested
+
+
+# test_two_piece_split_covers_every_frame_exactly_once(tmp_path)
+# Verifies the half-open range convention across a piece boundary.
+# Inputs: pytest temporary directory.
+# Output: pytest pass/fail result.
+#
+# Proves R9's convention rather than merely documenting it: a range is
+# [start_frame, end_frame), so consecutive pieces share a bound and the union of
+# two adjacent pieces is exactly their span with nothing dropped and nothing
+# done twice.
+#
+# This is the test that would have caught a divergence between the worker and
+# the coordinator, and until now nothing on either side would have. MARP_API had
+# implemented both bounds inclusive, which drops one frame at every piece
+# boundary -- silently, because each piece looks complete on its own, and a
+# ten-hour video in ten pieces would lose nine frames with every other test
+# still green. The convention was settled half-open on 2026-09-09.
+#
+# Run at the `runner` tier deliberately. The schema can only reject an inverted
+# range; whether a job actually processes end_frame is a question about what the
+# engine did, so it has to be read off two real jobs' results.
+def test_two_piece_split_covers_every_frame_exactly_once(tmp_path: Path) -> None:
+
+    import json
+
+    # One video split at 300. The two pieces share that bound: the first ends
+    # where the second begins, and 300 belongs to the second alone.
+    pieces = [
+        _job_for(tmp_path, "attempt-piece-one", frames=300, start_frame=0),
+        _job_for(tmp_path, "attempt-piece-two", frames=300, start_frame=300),
+    ]
+
+    # The ranges are adjacent, which is what makes this a split rather than two
+    # unrelated jobs. Asserted so a later edit to the fixture cannot quietly
+    # turn it into a test of two disjoint ranges.
+    assert pieces[0]["spec"]["range"] == {"start_frame": 0, "end_frame": 300}
+    assert pieces[1]["spec"]["range"] == {"start_frame": 300, "end_frame": 600}
+    assert pieces[0]["spec"]["range"]["end_frame"] == pieces[1]["spec"]["range"]["start_frame"]
+
+    coordinator = FakeCoordinator(offers=list(pieces))
+
+    # Two slots, so both pieces run as they would on two workers.
+    runner, _ = _runner(coordinator, tmp_path, slots=2)
+    runner.ensure_enrolled()
+
+    assert runner._poll_once() is True
+    assert runner._poll_once() is True
+
+    assert _wait_until(runner, lambda: len(coordinator.results) == 2), "both pieces never reported"
+
+    # Both succeeded, and each processed exactly its own count -- which for a
+    # half-open range is end minus start, a plain subtraction.
+    frames_by_attempt = {}
+    for result in coordinator.results:
+        assert result["outcome"] == "succeeded", result
+        summary = result["result"]["summary"]
+        assert summary["frames_expected"] == 300
+        assert summary["frames_processed"] == 300
+        frames_by_attempt[result["attempt_id"]] = summary
+
+    assert set(frames_by_attempt) == {"attempt-piece-one", "attempt-piece-two"}
+
+    # Now read the frame indices the engine actually wrote, per piece. The
+    # summary counts could both be 300 while overlapping or skipping, so the
+    # counts alone do not settle it -- the indices do.
+    indices_by_attempt: dict[str, list[int]] = {}
+    for attempt_id in frames_by_attempt:
+        results_path = tmp_path / "state" / "jobs" / attempt_id / "work" / "observations.jsonl"
+        assert results_path.is_file(), f"no results file for {attempt_id}"
+
+        indices_by_attempt[attempt_id] = [
+            json.loads(line)["frame"]
+            for line in results_path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+
+    first = indices_by_attempt["attempt-piece-one"]
+    second = indices_by_attempt["attempt-piece-two"]
+
+    # Each piece stayed inside its own half-open range. The upper bound is the
+    # assertion that matters: the first piece must NOT have touched frame 300.
+    assert min(first) == 0 and max(first) == 299
+    assert min(second) == 300 and max(second) == 599
+    assert 300 not in first, "first piece processed its end_frame; the range is half-open"
+
+    # No frame was done twice, within a piece or across the boundary.
+    assert len(first) == len(set(first))
+    assert len(second) == len(set(second))
+    assert not (set(first) & set(second)), "pieces overlap at the boundary"
+
+    # And the union is exactly the whole span, so nothing was dropped. This
+    # single assertion is what an inclusive coordinator would have failed:
+    # frame 300 would be missing from both pieces.
+    assert sorted(first + second) == list(range(600))

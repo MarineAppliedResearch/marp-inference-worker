@@ -51,6 +51,7 @@ about what does not and cannot happen, and a behavioural test can only ever samp
 | R7 | `test_engine_contract.py::test_model_manager_no_longer_probes_for_method_names` | source | The two `hasattr` reach-throughs are gone and the typed accessor replaced them. |
 | R7 | `test_engine_contract.py::test_frame_only_engine_cannot_be_dispatched_a_job` | unit | The capability split is real and enforced by `isinstance`, both directions. |
 | R8 | `test_tracking_pipeline.py::test_infer_stream_is_a_generator` | source | `infer_stream` and `iter_frame_range` are both generator functions, `infer_stream` feeds Ultralytics one frame at a time, and the tracking engine consumes the reader **without** listing it — the mistake that would quietly undo all of it. |
+| R9 | `test_job_runner.py::test_two_piece_split_covers_every_frame_exactly_once` | runner | The half-open convention, asserted rather than documented. Two adjacent pieces `[0,300)` and `[300,600)` cover `0..599` exactly once: no frame in both, none missing, and the first piece does **not** touch frame 300. |
 | R9 | `test_job_runner.py::test_malformed_spec_is_rejected_without_launching_anything` | runner | An inverted range is refused at the schema, before a child process exists. |
 | R9 | `test_job_runner.py` (all job tests) | runner | Every spec carries a range, including in the fixture — nothing special-cases a whole video. |
 | R10 | `test_tracking_pipeline.py::test_full_pipeline_produces_one_observation_for_one_animal` | pipeline | The three stages, joined, with the **real** ByteTrack: id assigned, track gathered, reduced to labelled keyframes, shaped as an observation. |
@@ -142,6 +143,23 @@ Three defects were found during this work. Each has a named test at a tier that 
    → `test_job_context.py::test_publish_artifact_hashes_the_real_bytes`, which asserts
    `kind == "artifact"` **and** `role == "observations"` separately.
 
+4. **The frame-range convention diverged between the worker and the coordinator.** This
+   worker read the range as half-open; MARP_API had implemented both bounds inclusive,
+   which drops one frame at every piece boundary — silently, because each piece looks
+   complete on its own. A ten-hour video in ten pieces would have lost nine frames with
+   every other test on both sides still green. Settled half-open, `[start_frame,
+   end_frame)`, on 2026-09-09; MARP_API is being corrected to match.
+   → `test_job_runner.py::test_two_piece_split_covers_every_frame_exactly_once`, at the
+   `runner` tier because the schema can only reject an inverted range — whether a job
+   actually processes `end_frame` is a question about what the engine did, so it is read
+   off two real jobs' results files.
+
+   Checked for vacuity rather than assumed: mutating the mock engine to
+   `range(start, end + 1)` fails it twice over, independently, on
+   `assert summary["frames_processed"] == 300` (`301 == 300`) and on
+   `assert max(first) == 299` (`300 == 299`). Both the count and the frame indices catch
+   it, so relaxing either one still leaves the convention guarded.
+
 Two of the fixed pre-existing defects also get regression tests, because the fix is
 otherwise unobservable — the broken and fixed code behave identically on correct input:
 
@@ -232,6 +250,11 @@ For the GPU machine, in order. Each says what to expect.
    frames repeat across the two, `CAP_PROP_POS_FRAMES` is landing short and every
    observation in every non-zero range is offset.
 
+   Note the range is half-open, so those two jobs are `[0,300)` and `[300,600)` and they
+   share the bound 300 — the first job must not process it. The convention is asserted in
+   `test_two_piece_split_covers_every_frame_exactly_once`; this step checks the *decoder*
+   honours it against a real stream, which no test here can.
+
 4. **A real inference job.** Point the worker at MARP with its token, queue one tracking
    job over a short range, and watch `/status` on the worker machine.
    Expect: progress advancing, `nvidia-smi` showing one process on slot 0's GPU, and a
@@ -269,7 +292,7 @@ Command: `.venv312\Scripts\python -m pytest -q`
 
 ```
 ........................................................................ [ 52%]
-.................................................................        [100%]
+..................................................................       [100%]
 ============================== warnings summary ===============================
 .venv312\Lib\site-packages\fastapi\testclient.py:1
   StarletteDeprecationWarning: Using `httpx` with `starlette.testclient` is
@@ -282,7 +305,7 @@ Command: `.venv312\Scripts\python -m pytest -q`
     _PortalFactoryType = Callable[[], AbstractContextManager[anyio.abc.BlockingPortal]]
 
 -- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
-137 passed, 2 warnings in 24.10s
+138 passed, 2 warnings in 22.44s
 ```
 
 Both warnings are from installed libraries, not from this code.

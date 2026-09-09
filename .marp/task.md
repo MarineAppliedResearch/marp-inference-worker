@@ -80,7 +80,8 @@ deliberately out of scope here.
   `artifacts/check` by sha256, answering `already_have` or an upload target — outside
   `bodyParser`. Every state-changing call carries `(attempt_id, worker_id, lease_epoch)`
   and a mismatch is answered `abandon`. The job spec carries `engine`, `model{name,sha256}`,
-  `video{jellyfin_item_id, source_name}`, `range{start_frame, end_frame}`, `params`, and
+  `video{jellyfin_item_id, source_name}` — **the video clause is superseded by A8: it is now
+  `video{url, source_name, jellyfin_item_id?}`** — `range{start_frame, end_frame}`, `params`, and
   `reduction{name, version}`; `range` is always present so nothing special-cases a whole
   video.
 - [x] **A2 · environment · blocking** — answered 2026-09-09: a fresh GPU worker runs a
@@ -116,6 +117,49 @@ deliberately out of scope here.
   animal is still there. No overlap, no stitching, and track ids are never compared across
   ranges. Two observations for one animal crossing a seam is the accepted outcome.
 
+- [x] **A8 · api contract · blocking** — answered 2026-09-09 by Isaac, and it **reverses part
+  of A1**: **the coordinator resolves the video and the job spec carries a playable URL.**
+  The worker is not to know what Jellyfin is. It does not search, does not score a filename
+  match, and holds no media credential — it is handed a source it can open and opens it.
+  This also settles the wider point: a worker can process **any** reachable source, not only
+  a Jellyfin item, because a URL is all the contract carries.
+
+  Consequences, all of which are work: `media/jellyfin_client.py` and
+  `media/video_source_resolver.py` come off the job path entirely (they stay for the legacy
+  dataset scripts that still import them); `JobRunner`'s `video_resolver` argument and
+  `_resolve_video` are deleted rather than fixed; the spec's `video` field carries the URL as
+  a required value instead of `jellyfin_item_id` being mandatory; and the three `JELLYFIN_*`
+  variables stop being worker configuration.
+
+  Recorded against the earlier decision it supersedes: *"The worker is handed a Jellyfin
+  credential outright."* That is no longer the design.
+- [x] **A9 · security/permissions · blocking** — **a Jellyfin stream URL carries its own
+  credential**, so A8 cannot be implemented without deciding what is handed over. A
+  direct-play URL embeds an api_key; putting it in the job spec stores a media credential in
+  the database, returns it in `GET /gpu/jobs/:id` to anything holding `jobs:read`, and hands
+  it to every machine that leases the job — **including a volunteer's, which is the stated end
+  goal.** A leaked URL is read access to the media library for as long as the key lives.
+
+  Three shapes, needing a choice: a **short-lived token per attempt**, minted at lease time
+  and expiring with the lease, so a leaked URL dies quickly; the **coordinator proxying the
+  bytes**, so no media credential ever leaves MARP and the worker sees only a MARP URL
+  carrying its own worker token; or **accepting the exposure** for office machines and
+  revisiting before any outside machine runs.
+
+  Note this also forces *when* resolution happens: a URL with an expiring token cannot be
+  resolved at submit time and left sitting in a queue, so it has to be resolved **at lease
+  time**, which is a change to the poll handler rather than to job creation.
+
+  **Answered 2026-09-09 by Isaac: accept the exposure for now and revisit later.** So the
+  coordinator may hand over a URL with a long-lived media key embedded, and that key is
+  readable by anything holding `jobs:read` and by every machine that leases a job.
+
+  The condition to revisit on is not a date, it is an event: **this is only acceptable while
+  every worker is a machine MARP controls.** The first machine outside the office — the
+  stated end goal of the whole design — makes it a media-library leak. Whoever enrols that
+  machine has to answer this first, and resolution moving to lease time is the change that
+  buys the short-lived token, so the poll handler is where it lands when it does.
+
 
 ## Decisions
 
@@ -126,7 +170,9 @@ re-opened here:
   host, url or port field anywhere in the contract.
 - There is no "volunteer" concept. A worker is a worker; who owns the machine is not part
   of the design. No trust tiers, no result validation, no scoped media credentials.
-- The worker is handed a Jellyfin credential outright.
+- ~~The worker is handed a Jellyfin credential outright.~~ **Superseded by A8, 2026-09-09.**
+  The coordinator resolves the video and hands the worker a playable url; the worker holds
+  no media credential and knows nothing about Jellyfin.
 - Multi-GPU jobs are supported. Where an engine's own callbacks are unavailable — as with
   Ultralytics' multi-GPU re-exec — progress is read from the run's `results.csv`.
 - A job runs on one worker start to finish. No cross-machine resume.

@@ -104,7 +104,8 @@ class TrackAccumulator:
     # observe()
     # Records one frame of one track.
     # Inputs: track id, class name, absolute frame index, frame time in seconds,
-    # the normalized centre-form bbox, and the detection confidence.
+    # the normalized centre-form bbox, and the detection confidence -- None when
+    # the track was predicted onto this frame with no detection behind it.
     # Output: none.
     # Use this once per tracked box per frame. The bbox must already be
     # normalized to (xCenter, yCenter, width, height) in 0..1, because that is
@@ -116,7 +117,7 @@ class TrackAccumulator:
         frame_index: int,
         frame_time_s: float,
         bbox_normalized: tuple[float, float, float, float],
-        confidence: float,
+        confidence: float | None,
     ) -> None:
 
         # First sighting of this track opens it.

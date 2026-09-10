@@ -367,7 +367,10 @@ class TrackingEngine(BaseEngine):
             # animal is labelled by what is actually there.
             best_iou = 0.0
             class_id = -1
-            confidence = 0.0
+            # None, not 0.0: no detection behind this track on this frame is a
+            # different fact from a detection that scored zero, and the two must
+            # not arrive at the observation looking the same.
+            confidence: float | None = None
             for detection in detections:
                 iou = calculate_iou((x1, y1, x2, y2), detection["bbox_xyxy"])
                 if iou > best_iou:
@@ -379,7 +382,7 @@ class TrackingEngine(BaseEngine):
             # behind it on this frame, so its class is not known.
             if best_iou <= _CLASS_MATCH_IOU:
                 class_id = -1
-                confidence = 0.0
+                confidence = None
 
             # Resolve the class name through the model's own names.
             class_name = "Unknown"

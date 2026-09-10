@@ -704,3 +704,98 @@ Ruff on the three new files reports 3 findings, all of them the repository's own
 style rather than anything new: two `I001` from the comment-per-import-group convention
 `AGENTS.md` requires, and one `UP035` for `from typing import Iterable` where the rest of
 the tree does the same. The one finding unique to the new code, `PIE808`, was fixed.
+
+## Results — the whole loop, through the coordinator, on the new video contract
+
+Run 9 Sep 2026, after A8 moved video resolution to the coordinator. These are the
+**coordinator-mediated** results: jobs submitted to MARP over HTTP, leased by a real worker
+holding **no Jellyfin credentials of any kind**, running the real MARP model on the real GPU
+against real Jellyfin footage. Everything earlier in this file that drove the engine directly
+is superseded as *evidence*, though the tests themselves still stand.
+
+Worker 65, one slot, RTX 5060 Laptop. Model `CAMPA_GR1_TEST6-mixed`, sha256 `9283b8ee…`,
+seven invertebrate classes. Video: CAMPA2024 Dive 8, Jellyfin item
+`4ac4749aae0a8d75ac99f2d8d50717ce`, 24.1 minutes, 36,159 frames.
+
+### The spec carried only an item id (A8)
+
+Submitted `video: { jellyfin_item_id: … }` — no url, no `source_name`. The stored job row kept
+exactly that. The coordinator resolved it **at lease time** and the worker was handed a url it
+could open:
+
+```
+log  resolved device cuda:0 for slot 0
+log  opened video 1920x1080 at 25.000 fps, container reports 36159 frames
+```
+
+The observation rows carry `video_source: 20240730_171520_Fwd.mp4`, filled by the coordinator
+from the Jellyfin item, and `jellyfin_item_id` echoed through unresolved as provenance.
+
+### R13 is now exercised for real, not only at the unit tier
+
+*Known gaps* previously recorded that R13 was untested end to end, because driving
+`child_main` directly skips the parent runner's fetch-and-verify. This run went through the
+runner. The cache directory is named for the **verified** hash:
+
+```
+models/cache/CAMPA_GR1_TEST6-mixed-best.pt_9283b8ee1d1ac22ddfe5e8394a95c950cf65e1dfce3c772a1559c0408f52cff8/
+```
+
+A 136 MB model was fetched, hashed and accepted on the hash the job named. That gap is closed.
+
+### R9 and R10a — the seam, on real footage, through the coordinator
+
+Two jobs over adjacent half-open ranges of one video, each resolved independently:
+
+| | job 1256 `[18000, 18300)` | job 1257 `[18300, 18600)` |
+| --- | --- | --- |
+| observations | 6 | 7 |
+| keyframe framenums | **18000 … 18299** | **18300 … 18599** |
+| track ids | 1, 2, 4, 6, 7, 9 | 1, 2, 4, 6, 8, 11, 13 |
+| overlapping frames | *(none)* | *(none)* |
+
+The first piece never touches 18300 and the second starts exactly there. **Both pieces
+independently produced track ids 1, 2, 4 and 6**, which is R10a's reason for existing stated
+as data rather than as a rule: ids are meaningful only inside one range, and comparing them
+across a seam would merge unrelated animals.
+
+### R5 — cancel arrives in a heartbeat
+
+Job 1258, 6,000 frames. Cancelled by hand at **18:13:06** with the attempt at 240/6000.
+
+```
+18:13:06  cancel accepted   changed: true   job -> cancelled
+18:13:14  job cancelled     att 949 running    360/6000
+18:13:24  job cancelled     att 949 cancelled  390/6000  "the worker reported cancelled"
+```
+
+**18 seconds**, and the attempt lands `cancelled` rather than `failed`. Two heartbeat
+intervals on a 10 s heartbeat: one to deliver the action, one for the wind-down and terminal
+report. A design that promises "within one heartbeat" is wrong about this.
+
+### R15 — a machine that dies
+
+Job 1259. The worker process was killed outright at **18:14:21** with the attempt at 150/6000
+— no graceful stop, no final report, exactly what a reclaimed machine looks like.
+
+```
+18:14:21  worker killed          att 950 running
+18:14:33 .. 18:15:14            att 950 still reads running   (lease not yet expired)
+18:15:26  att 950 abandoned      "Lease expired: no heartbeat before lease_expires_at."
+          job  1259 queued       re-leasable
+```
+
+**65 seconds** — the 60 s lease plus the sweep that notices. Judged on the coordinator's
+clock, because a dead machine cannot report its own death. The job returned to the queue
+rather than being lost, which is what R15 asks for.
+
+### What this run does not prove
+
+- **A transcoded stream.** This item direct-plays; seek accuracy was measured against that.
+  A stream Jellyfin transcodes may not share its source's frame count, which would make a
+  frame number mean different things to different readers. Still the largest open risk.
+- **Two machines on adjacent ranges.** The seam above is two sequential jobs on one worker.
+  The logic is proven; the deployment is not.
+- **Detection quality.** Six or seven sea cucumbers per 300 frames is plausible for this
+  footage and nobody has checked the boxes against the video. Nothing here says the model is
+  right, only that the pipeline carries its answers faithfully.

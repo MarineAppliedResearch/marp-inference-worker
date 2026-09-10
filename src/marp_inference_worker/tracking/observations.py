@@ -123,6 +123,18 @@ def build_observation(
     chosen = pick_observation_time(frames, data_type)
     chosen_frame = chosen["frame"] if chosen else frames[0]["frame"]
 
+    # The detection score at exactly the frame above, and at no other frame, so
+    # a reader can open that frame and see what scored it. Deliberately not a
+    # mean or a max over the track: a summary statistic cannot be checked
+    # against anything anybody can look at.
+    #
+    # None when that frame carried no detection. ByteTrack predicts through
+    # gaps with its Kalman filter, so a track can sit on a frame with nothing
+    # detected behind it -- the same case that already labels the class
+    # "Unknown" rather than guessing. Borrowing a neighbouring frame's score
+    # would put a number in a scientific record that no frame measured.
+    chosen_confidence = (chosen if chosen else frames[0]).get("confidence")
+
     # The fields below are exactly what the live script posts, with two
     # additions the worker is now able to supply and the coordinator needs:
     # which reduction produced the keyframes (R10b), and why the track ended.
@@ -158,4 +170,6 @@ def build_observation(
         "track_id": track_id,
         "track_end_reason": end_reason,
         "observation_frame": chosen_frame,
+        # The score at observation_frame, or null when that frame had none.
+        "confidence": chosen_confidence,
     }

@@ -501,3 +501,212 @@ def test_an_observation_from_a_job_with_no_item_id_records_null() -> None:
     import json
 
     assert json.loads(json.dumps(observation))["jellyfin_item_id"] is None
+
+
+# _confidence_for(frame_index)
+# The detection score this test hands the pipeline for a given frame.
+# Inputs: the frame index.
+# Output: a score that names its own frame in its last three digits.
+# Use this so a confidence that arrives attributed to the wrong frame is
+# unmistakable: 0.470 could only have come from frame 70. Above ByteTrack's
+# 0.30 track_thresh, or no track would ever be initiated.
+def _confidence_for(frame_index: int) -> float:
+
+    return 0.40 + frame_index / 1000.0
+
+
+# _descending_animal_detections(frame_index)
+# Builds one frame's detections for an animal descending through frame.
+# Inputs: the frame index.
+# Output: a detection list in the shape the detector produces.
+# Use this when the Fish survey rule has to fire: the centre crosses y > 0.8
+# part way through, so pick_observation_time lands on a mid-track frame rather
+# than on the first, the last or the middle one.
+def _descending_animal_detections(frame_index: int) -> list[dict]:
+
+    # Pixel coordinates, as the detector emits. Descends 11px a frame, so the
+    # normalized centre passes 0.8 around frame 70 of 78.
+    x1 = 400.0 + frame_index * 2.0
+    y1 = 60.0 + frame_index * 11.0
+    return [
+        {
+            "bbox_xyxy": [x1, y1, x1 + 120.0, y1 + 90.0],
+            "confidence": _confidence_for(frame_index),
+            "class_id": 0,
+        }
+    ]
+
+
+# _NamedClasses
+# The one thing the tracking engine asks of a loaded model when attaching a
+# class to a track: a `names` mapping. Substituted so these tests need no GPU
+# and no weights while the tracker, the matcher and the accumulator stay real.
+class _NamedClasses:
+
+    # The class id the synthetic detections carry.
+    names = {0: "Rockfish"}
+
+
+# _run_pipeline_over(frame_count, detections_visible_from)
+# Drives the real tracker and the real engine matcher over synthetic detections.
+# Inputs: how many frames to run, and the frame from which the engine is handed
+# no detections to match its tracks against.
+# Output: the list of EndedTrack the accumulator closed at the range end.
+# Use this so both confidence tests exercise TrackingEngine._observe_tracks --
+# the code that actually decides what score a frame is recorded with -- rather
+# than a copy of its matching loop, which could agree with itself while the
+# engine was wrong.
+def _run_pipeline_over(frame_count: int, detections_visible_from: int = 10**9) -> list:
+
+    from marp_inference_worker.engines.tracking_engine import TrackingEngine
+
+    engine = TrackingEngine()
+    tracker, args = byte_tracker_adapter.create_tracker({"track_buffer": 30})
+    accumulator = TrackAccumulator(track_buffer=args.as_dict["track_buffer"])
+
+    for frame_index in range(frame_count):
+        detections = _descending_animal_detections(frame_index)
+
+        # The tracker always sees the real detections, so the track it reports
+        # is a real track.
+        tracked = tracker.update(
+            byte_tracker_adapter.detections_to_array(detections),
+            [_FRAME_HEIGHT, _FRAME_WIDTH],
+            (_FRAME_HEIGHT, _FRAME_WIDTH),
+        )
+
+        # From detections_visible_from onward the engine is handed nothing to
+        # match against, which is the predicted-track case: ByteTrack carries a
+        # box forward with its Kalman filter and no detection sits behind it.
+        # Real footage produces this occasionally; forcing it makes it testable.
+        visible = [] if frame_index >= detections_visible_from else detections
+
+        engine._observe_tracks(
+            accumulator=accumulator,
+            tracked=tracked,
+            detections=visible,
+            yolo_model=_NamedClasses(),
+            frame_index=frame_index,
+            frame_time_s=frame_index / _FRAME_RATE,
+            frame_width=_FRAME_WIDTH,
+            frame_height=_FRAME_HEIGHT,
+        )
+
+    return list(accumulator.finish_range())
+
+
+# _observation_from(ended)
+# Reduces one ended track and shapes it as MARP stores it.
+# Inputs: one EndedTrack.
+# Output: the observation mapping.
+# Use this so the two confidence tests differ only in the pipeline they ran.
+def _observation_from(ended) -> dict:
+
+    reduce = keyframes.get_reduction("v3_dirpad", "1")
+    reduced = reduce(ended.track)
+
+    return build_observation(
+        frames=ended.track["frames"],
+        keyframes=reduced,
+        video_source_name="20240727_185645 Fwd.mp4",
+        jellyfin_item_id="item-1",
+        frame_rate=_FRAME_RATE,
+        data_type="Fish",
+        reduction_name="v3_dirpad",
+        reduction_version="1",
+        track_id=ended.track_id,
+        end_reason=ended.reason,
+    )
+
+
+# test_observation_confidence_is_the_score_at_the_observation_frame()
+# Verifies the confidence on an observation is the score at its own frame.
+# Inputs: none.
+# Output: pytest pass/fail result.
+#
+# MARP's observations.confidence holds the detection score at the chosen
+# observation frame -- not a mean over the track and not a max. The score and
+# the frame must agree, so a reviewer can open exactly that frame and see what
+# scored it.
+#
+# Asserted at the pipeline tier because the value has to survive three joins to
+# get here: the engine's IoU match picks it, the accumulator stores it per
+# frame, and the observation shaper has to read it off the frame the survey rule
+# chose. A unit test on a mock would agree with whichever frame the mock used.
+#
+# The score names its own frame, and the test also asserts it is none of the
+# five wrong answers -- first, last, min, max, mean -- because each of those
+# would pass a bare "confidence is present and plausible" check.
+def test_observation_confidence_is_the_score_at_the_observation_frame() -> None:
+
+    ended = _run_pipeline_over(78)
+    assert len(ended) == 1, f"expected one track, got {len(ended)}"
+
+    observation = _observation_from(ended[0])
+    frames = ended[0].track["frames"]
+
+    # Present on every observation, alongside the frame it describes.
+    assert "confidence" in observation
+    observation_frame = observation["observation_frame"]
+
+    # The survey rule chose a frame part way through, which is what makes the
+    # wrong answers below distinguishable at all.
+    assert frames[0]["frame"] < observation_frame < frames[-1]["frame"]
+
+    # The score at that frame, and at no other frame.
+    assert observation["confidence"] == _confidence_for(observation_frame)
+
+    # The same value read back off the accumulated frame, so this is a fact
+    # about the track rather than about the formula above.
+    at_frame = next(f for f in frames if f["frame"] == observation_frame)
+    assert observation["confidence"] == at_frame["confidence"]
+
+    # None of the five plausible wrong answers.
+    scores = [f["confidence"] for f in frames]
+    assert observation["confidence"] != scores[0], "took the first frame's score"
+    assert observation["confidence"] != scores[-1], "took the last frame's score"
+    assert observation["confidence"] != min(scores), "took the minimum"
+    assert observation["confidence"] != max(scores), "took the maximum"
+    assert observation["confidence"] != sum(scores) / len(scores), "took the mean"
+
+
+# test_observation_confidence_is_null_when_that_frame_had_no_detection()
+# Verifies the predicted-track case records no score rather than a wrong one.
+# Inputs: none.
+# Output: pytest pass/fail result.
+#
+# A track can exist on a frame with no detection behind it -- ByteTrack predicts
+# through gaps with its Kalman filter -- and the observation frame is chosen by
+# the survey rule, which has no reason to land on a frame that was detected.
+# That frame is already labelled "Unknown" rather than mislabelled; the score is
+# recorded as null for the same reason. Borrowing a neighbouring frame's score
+# would put a number in a scientific record that no frame measured.
+#
+# The key stays present so the output shape does not vary per row.
+def test_observation_confidence_is_null_when_that_frame_had_no_detection() -> None:
+
+    # Nothing matches the track from frame 66 on, and the Fish rule fires
+    # around frame 70, so the observation frame is one of the undetected ones.
+    ended = _run_pipeline_over(78, detections_visible_from=66)
+    assert len(ended) == 1, f"expected one track, got {len(ended)}"
+
+    observation = _observation_from(ended[0])
+    frames = ended[0].track["frames"]
+
+    assert observation["observation_frame"] >= 66
+    assert "confidence" in observation
+    assert observation["confidence"] is None
+
+    # Null for this frame specifically, not a track with no scores at all:
+    # the frames that did have a detection behind them still carry theirs.
+    early = [f["confidence"] for f in frames if f["frame"] < 66]
+    assert early, "the track never had a detected frame, so this proves nothing"
+    assert all(score is not None for score in early)
+
+    # The class name is unaffected -- it was learned at the first sighting.
+    assert observation["comname"] == "Rockfish"
+
+    # And it serializes as null, which is why a None beats a missing key.
+    import json
+
+    assert json.loads(json.dumps(observation))["confidence"] is None

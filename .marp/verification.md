@@ -207,16 +207,23 @@ environment.
   loses callbacks is **not implemented and not tested** — it is a training-path concern and
   Milestone 1 is inference.
 
-**Needs a real coordinator:**
+**Needs a real coordinator — all four closed 2026-09-09:**
 
-- Every coordinator call is exercised against `FakeCoordinator`. The real HTTP shapes of
+- ~~Every coordinator call is exercised against `FakeCoordinator`. The real HTTP shapes of
   the five `/api/v2/gpu/…` routes are **unverified** — A1 is a written agreement, not a
   tested one. The first end-to-end run against MARP_API is where a field-name mismatch will
-  surface.
-- Long-poll behaviour: a 204 on timeout, and the interval fallback. The fake answers
-  immediately, so the timeout path is untested.
-- `report_result` idempotency on retry.
-- The artifact upload target's real shape (`url`, `method`, `headers`).
+  surface.~~ **Closed, and it was right.** The first run against the real MARP_API found
+  exactly that: `worker_id` sent as a string where MARP validates integers, returning 400 on
+  poll, heartbeat, events *and* result. Six more wire-shape defects followed. This line
+  predicted its own bug, which is the argument for writing gaps down.
+- ~~Long-poll behaviour: a 204 on timeout, and the interval fallback.~~ **Closed**: an idle
+  worker's poll returns 204 and it keeps dialling out, measured over `last_seen_at` ages of
+  1.5 s to 55.6 s against a live coordinator.
+- ~~`report_result` idempotency on retry.~~ **Closed**: a replayed terminal report answered
+  `idempotent: true` twice with one artifact row.
+- ~~The artifact upload target's real shape (`url`, `method`, `headers`).~~ **Closed**: the
+  route answers a plain `upload_url` and takes a POST, not the `upload{url,method}` object
+  and PUT the worker had been written against.
 
 **Needs a real Jellyfin server:**
 
@@ -245,11 +252,14 @@ environment.
   child for 60 s to reach it.
 - A child dying without a terminal event (OOM kill, native crash). The `stderr` fallback is
   written and untested.
-- Two workers on adjacent ranges of one real video. The seam is proved with two
-  accumulators standing in for two workers, which is the logic but not the deployment.
-- `worker_main.main()` has never been run. The token/address reads and the loopback bind
-  are unexercised — `uvicorn.run` is called with `host="127.0.0.1"` and no test asserts the
-  socket is unreachable from off-machine.
+- Two workers on adjacent ranges of one real video. **Narrowed 2026-09-09**: the seam is
+  now proved on real footage through the real coordinator, but as two *sequential* jobs on
+  one worker (18000–18299 then 18300–18599, no overlap). Two machines at once is still
+  untested, and that is the deployment rather than the logic.
+- ~~`worker_main.main()` has never been run.~~ **Run repeatedly on 2026-09-09** against a
+  live coordinator: the token and address reads work and `/status` serves on loopback. What
+  remains untested is the negative — **no test asserts the socket is unreachable from
+  off-machine**, which is the half that matters for R1.
 - Ruff is **not clean**, and was not before this work: pre-existing files carry 35 findings
   under the configured rules. Two findings remain in files touched here and are left
   deliberately — one in the pre-existing `frame_source.py`, and one unused unpacked variable

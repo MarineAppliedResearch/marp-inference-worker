@@ -27,6 +27,20 @@ The OpenAPI JSON schema is available at:
 http://127.0.0.1:8000/openapi.json
 ```
 
+## Install
+
+Install runtime dependencies from `pyproject.toml`:
+
+```powershell
+pip install -e .
+```
+
+Install development dependencies (includes runtime + `dev` extras from `pyproject.toml`):
+
+```powershell
+pip install -e ".[dev]"
+```
+
 ## Development Setup
 
 Create and activate a virtual environment:

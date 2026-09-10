@@ -43,12 +43,34 @@ gets it.
 **Work happens on `develop`.** Other branches exist and are not the question; the
 registry says `develop` and that is the answer.
 
-Dormant since 2026-07. One thing still needs doing before an agent is pointed at it: the
-checked-in `.venv` points at a Python that does not exist on the current machine and needs
-recreating against 3.12 — deliberately 3.12 rather than newer, because `torch` and
-`ultralytics` wheels lag new Python releases.
+### The environment
 
-Running it needs an NVIDIA GPU. Building it does not.
+The old `.venv` points at a Python that does not exist for the current user and is
+abandoned rather than repaired; it is git-ignored, so deleting it costs nothing. Build a
+fresh one against 3.12 — deliberately 3.12 rather than newer, because `torch` and
+`ultralytics` wheels lag new Python releases, and `pyproject.toml` pins the floor and the
+ceiling. Run `py -0p` to see which interpreters this machine has.
+
+```
+py -3.12 -m venv .venv312
+.venv312\Scripts\python -m pip install -e ".[dev]"
+```
+
+**ByteTrack is required, not optional** — the tracking stage imports `BYTETracker` from the
+vendored `ByteTrack/` tree, which is a source checkout and not a wheel. Its `cython-bbox`
+dependency has no Windows wheel and compiles from source, so a Windows machine needs the
+Visual Studio "Desktop development with C++" workload. Without it the install fails on
+`cython-bbox` with a missing-compiler error; `lap`, the other compiled dependency, does
+publish Windows wheels.
+
+The vendored ByteTrack uses `np.float`, `np.int` and `np.bool`, which numpy removed in
+1.24. `tracking/byte_tracker_adapter.py` restores those aliases before importing it, and
+is the one place to undo when ByteTrack is updated. The tree itself is left identical to
+upstream on purpose. Note that the import succeeds without the shim — the failure appears
+only on the first frame that has something on it.
+
+Running inference needs an NVIDIA GPU. Building and testing do not: `pytest` runs green
+with no GPU, and what that leaves unproven is listed in `.marp/verification.md`.
 
 <!-- marp:shared start -->
 <!-- Canonical source: MARP/AGENTS.md. Do not edit this block in a component repository;
@@ -714,15 +736,17 @@ Build direct/original stream URLs
 Convert Jellyfin relative URLs into absolute URLs
 ```
 
-Environment variables used for development testing:
+**None of this is worker configuration.** A worker is configured by one service token and
+the coordinator's address, and nothing else — settled as A2 and made true again by A8, which
+moved video resolution to the coordinator: the job spec carries a playable `video.url` and
+the worker never learns what Jellyfin is. `jellyfin_client.py` and `video_source_resolver.py`
+stay on disk only for the legacy dataset and training scripts in `src/old_scripts/` and the
+manual `scripts/verify_seek_accuracy.py`, all of which are outside the job path.
+`test_nothing_on_the_job_path_imports_jellyfin` enforces that boundary structurally.
 
-```powershell
-$env:JELLYFIN_BASE_URL="http://47.208.203.78:8096"
-$env:JELLYFIN_USERNAME="guest1"
-$env:JELLYFIN_PASSWORD="guest1"
-```
-
-Do not hardcode these credentials into source code. Environment variables are acceptable for local development. Long term, this should become settings/config.
+Those scripts read the client's three `JELLYFIN_*` variables from the environment. Run them
+with credentials you already hold; do not write a host or a credential into a tracked file,
+here or in source.
 
 Manual smoke testing confirmed:
 
@@ -821,7 +845,7 @@ Example output:
 
 ```text
 [INFO] Jellyfin resolver is available for missing local videos.
-[INFO] Opening video '20240730_190910 Fwd.mp4' using jellyfin_stream: http://47.208.203.78:8096/Videos/.../stream?static=true&api_key=...
+[INFO] Opening video '20240730_190910 Fwd.mp4' using jellyfin_stream: <JELLYFIN_BASE_URL>/Videos/<item>/stream?static=true&api_key=<elided>
 .
 ```
 

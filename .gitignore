@@ -8,7 +8,10 @@ __pycache__/
 .ruff_cache/
 
 # Virtual environments
-.venv/
+# Globbed: this repository has needed a second interpreter's venv beside the
+# first (.venv312 against Python 3.12), and an un-ignored one is 20,000 files
+# of commit-eligible noise.
+.venv*/
 venv/
 env/
 
@@ -24,12 +27,18 @@ env/
 Thumbs.db
 
 # Runtime/cache data
-data/
-datasets/
-models/
-runs/
-logs/
-tmp/
+# Anchored to the repository root with a leading slash, deliberately. Unanchored,
+# `models/` matched src/marp_inference_worker/models/ as well as the artifact
+# cache, so the entire source models package -- model_spec.py included, which
+# every engine imports -- was ignored and had never been committed. A fresh clone
+# could not import the worker. The other five are anchored for the same reason
+# before they trip over a source directory of the same name.
+/data/
+/datasets/
+/models/
+/runs/
+/logs/
+/tmp/
 
 # Model artifacts
 *.pt

@@ -702,7 +702,18 @@ Testing models and datasets before the new worker job system exists
 
 Do not use them as the destination for new production architecture.
 
-Reusable logic from the old scripts should gradually move into structured packages such as:
+**Read them as reference; do not migrate their code.** These scripts carry real problems --
+that is much of why the worker is being rebuilt rather than extended -- so lifting a
+function out of one and dropping it into a package moves the problems with it. What is
+worth taking is the *knowledge*: what the workflow did, what it got right, what it got
+wrong, and which numbers and orderings turned out to matter. Then implement it properly in
+the structured packages, to this repository's own design and comment rules, with tests.
+
+So the useful question about an old script is **"what does this tell me about what we did
+before, and what we should do now"** -- never "which lines can I copy". A structured
+package that looks like the script it replaced has not been rebuilt.
+
+The packages that new work belongs in:
 
 ```text
 src/marp_inference_worker/media/

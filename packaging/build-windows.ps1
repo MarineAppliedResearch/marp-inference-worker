@@ -47,7 +47,7 @@ try {
     Assert-LastExit 'Reading the worker revision'
     if (-not $Version) {
         $ProjectText = Get-Content -LiteralPath (Join-Path $Repository 'pyproject.toml') -Raw
-        $Version = [regex]::Match($ProjectText, '(?m)^version = "([^"]+)"$').Groups[1].Value
+        $Version = [regex]::Match($ProjectText, '(?m)^version = "([^"]+)"\r?$').Groups[1].Value
     }
     if ($Version -notmatch '^[A-Za-z0-9._-]+$') { throw 'Version contains unsafe path characters.' }
     $ReleaseKey = "$Version-$Runtime"

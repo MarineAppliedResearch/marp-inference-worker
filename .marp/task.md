@@ -1,7 +1,7 @@
 ---
 task: MarineAppliedResearch/marp-inference-worker#10
 repos: [marp-inference-worker, marp-api]
-status: verifying
+status: ready-for-pr
 needs: []
 ---
 
@@ -123,8 +123,7 @@ against the isolated API and its disposable PostgreSQL database.
 
 ## Status
 
-- **Gate:** verifying. The approved G4 plan has passed and its recorded evidence awaits
-  human review.
+- **Gate:** ready-for-pr. The approved G4 plan passed and the human approved its evidence.
 - **Notes:** The worker now initializes the range total and reports the seven agreed phases
   through the existing event and heartbeat path. MARP_API persists phase and elapsed time,
   exposes both live and terminal snapshots, and remains compatible with partial progress

@@ -619,6 +619,87 @@ def _observation_from(ended) -> dict:
     )
 
 
+# test_keyframe_confidence_is_the_score_at_each_keyframes_own_frame()
+# Verifies every reduced keyframe retains its own raw-frame confidence.
+# Inputs: none.
+# Output: pytest pass/fail result.
+#
+# The real tracker and accumulator produce distinct scores. That makes copied,
+# aggregated, and omitted scores distinguishable while exercising the complete
+# observation payload.
+def test_keyframe_confidence_is_the_score_at_each_keyframes_own_frame() -> None:
+
+    ended = _run_pipeline_over(78)
+    assert len(ended) == 1, f"expected one track, got {len(ended)}"
+
+    # Reduce the real accumulated frames and index the source values by the
+    # frame number that each keyframe names.
+    frames = ended[0].track["frames"]
+    reduced = keyframes.reduce_to_keyframes_v3_dirpad(ended[0].track)
+    frames_by_number = {frame["frame"]: frame for frame in frames}
+
+    assert len(reduced) >= 2
+    assert all("confidence" in keyframe for keyframe in reduced)
+    assert [keyframe["confidence"] for keyframe in reduced] == [
+        frames_by_number[keyframe["framenum"]]["confidence"] for keyframe in reduced
+    ]
+
+    # Distinct scores prove the reducer did not copy one track-level value onto
+    # every keyframe or aggregate the track into one result.
+    assert len({keyframe["confidence"] for keyframe in reduced}) >= 2
+
+    # The observation shaper must preserve the keyframes, including JSON null,
+    # because this is the payload the coordinator hands to MARP_API ingest.
+    observation = _observation_from(ended[0])
+
+    import json
+
+    serialized_keyframes = json.loads(json.dumps(observation))["keyframes"]
+    assert [keyframe["confidence"] for keyframe in serialized_keyframes] == [
+        keyframe["confidence"] for keyframe in reduced
+    ]
+
+
+# test_a_predicted_keyframe_keeps_an_explicit_null_confidence()
+# Verifies a keyframe without a matched detection does not borrow a score.
+# Inputs: none.
+# Output: pytest pass/fail result.
+#
+# ByteTrack can predict a box through a detection gap. The raw frame already
+# records None in that case, and reduction must preserve that scientific fact.
+def test_a_predicted_keyframe_keeps_an_explicit_null_confidence() -> None:
+
+    # The final frames remain tracked through ByteTrack's prediction but have no
+    # matched detection, so the selected end keyframe must carry null.
+    ended = _run_pipeline_over(78, detections_visible_from=66)
+    assert len(ended) == 1, f"expected one track, got {len(ended)}"
+
+    frames = ended[0].track["frames"]
+    reduced = keyframes.reduce_to_keyframes_v3_dirpad(ended[0].track)
+    frames_by_number = {frame["frame"]: frame for frame in frames}
+    null_keyframes = [
+        keyframe
+        for keyframe in reduced
+        if frames_by_number[keyframe["framenum"]]["confidence"] is None
+    ]
+
+    assert null_keyframes
+    assert all("confidence" in keyframe for keyframe in null_keyframes)
+    assert all(keyframe["confidence"] is None for keyframe in null_keyframes)
+
+    # The complete observation payload serializes Python None as the JSON null
+    # that MARP_API's existing ingest path accepts.
+    observation = _observation_from(ended[0])
+
+    import json
+
+    serialized_keyframes = json.loads(json.dumps(observation))["keyframes"]
+    serialized_by_frame = {
+        keyframe["framenum"]: keyframe["confidence"] for keyframe in serialized_keyframes
+    }
+    assert all(serialized_by_frame[keyframe["framenum"]] is None for keyframe in null_keyframes)
+
+
 # test_observation_confidence_is_the_score_at_the_observation_frame()
 # Verifies the confidence on an observation is the score at its own frame.
 # Inputs: none.

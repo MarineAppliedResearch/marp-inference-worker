@@ -67,11 +67,13 @@ begin
     Exit;
 
   Parameters := ExpandConstant(
-    '-NoProfile -ExecutionPolicy Bypass -File &quot;{tmp}\marp-worker-payload\bootstrap-windows.ps1&quot; ' +
-    '-PayloadRoot &quot;{tmp}\marp-worker-payload&quot; -InstallRoot &quot;{app}&quot; ' +
-    '-CoordinatorUrl &quot;{code:GetCoordinatorUrl}&quot; ' +
-    '-ActivationCodeFile &quot;{tmp}\marp-worker-activation.txt&quot;');
+    '-NoProfile -ExecutionPolicy Bypass -File "{tmp}\marp-worker-payload\bootstrap-windows.ps1" ' +
+    '-PayloadRoot "{tmp}\marp-worker-payload" -InstallRoot "{app}" ' +
+    '-CoordinatorUrl "{code:GetCoordinatorUrl}" ' +
+    '-ActivationCodeFile "{tmp}\marp-worker-activation.txt"');
   WizardForm.StatusLabel.Caption := 'Downloading and preparing the MARP worker. This can take several minutes...';
+  SaveStringToFile(ExpandConstant('{app}\setup.log'),
+    'Starting MARP worker bootstrap.' + #13#10, False);
 
   if not Exec(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'), Parameters,
       '', SW_SHOW, ewWaitUntilTerminated, ResultCode) then
@@ -79,6 +81,8 @@ begin
 
   if ResultCode <> 0 then
   begin
+    SaveStringToFile(ExpandConstant('{app}\setup.log'),
+      'Bootstrap process exited with code ' + IntToStr(ResultCode) + '.' + #13#10, True);
     MsgBox('MARP worker setup failed. Error details are saved in:' + #13#10 +
       ExpandConstant('{app}\setup.log'), mbError, MB_OK);
     RaiseException('MARP worker setup failed.');

@@ -453,6 +453,142 @@ def test_infer_stream_is_a_generator() -> None:
     assert "frame_stream = iter_frame_range(" in engine_source
 
 
+# test_frame_reader_reports_seek_complete_at_the_real_boundary()
+# Verifies phase reporting can distinguish seek time from inference time without
+# changing the frame reader's lazy, streaming behavior.
+def test_frame_reader_reports_seek_complete_at_the_real_boundary() -> None:
+
+    from marp_inference_worker.media.frame_range_reader import VideoGeometry, iter_frame_range
+
+    calls = []
+
+    class Capture:
+        def set(self, _property, frame):
+            calls.append(("seek", frame))
+            return True
+
+        def read(self):
+            calls.append(("read", None))
+            return True, "image"
+
+    frames = list(
+        iter_frame_range(
+            Capture(),
+            VideoGeometry(width=1, height=1, frame_rate=30.0, total_frames=20),
+            10,
+            11,
+            on_seek_complete=lambda: calls.append(("seek_complete", None)),
+        )
+    )
+
+    assert calls == [("seek", 10), ("seek_complete", None), ("read", None)]
+    assert [frame.index for frame in frames] == [10]
+
+
+# test_tracking_engine_reports_phases_in_actual_work_order()
+# Drives the engine orchestration with lightweight collaborators so the test can
+# observe every boundary without requiring a GPU or changing pipeline geometry.
+def test_tracking_engine_reports_phases_in_actual_work_order(tmp_path: Path, monkeypatch) -> None:
+
+    from types import SimpleNamespace
+
+    from marp_inference_worker.engines import tracking_engine
+    from marp_inference_worker.media.frame_range_reader import DecodedFrame, VideoGeometry
+
+    class Context:
+        def __init__(self):
+            self.params = {"model_path": str(tmp_path / "model.pt"), "device": "cpu"}
+            self.checkpoint_dir = tmp_path
+            self.phases = []
+
+        def log(self, _message, level="info"):
+            return None
+
+        def report_progress(self, _done, _total, _unit, phase=None):
+            if phase is not None:
+                self.phases.append(phase)
+
+        def report_metrics(self, **_fields):
+            return None
+
+        def should_stop(self):
+            return False
+
+        def publish_artifact(self, _path, _kind):
+            return "0" * 64
+
+    class Detector:
+        def load_weights(self, _path, _device):
+            return SimpleNamespace(names={})
+
+        def infer_stream(self, _model, frames, _confidence):
+            for frame in frames:
+                yield SimpleNamespace(frame=frame, detections=[])
+
+        def unload_all(self):
+            return None
+
+    class Capture:
+        def release(self):
+            return None
+
+    class Accumulator:
+        active_track_count = 0
+        discarded_track_count = 0
+
+        def __init__(self, track_buffer):
+            self.track_buffer = track_buffer
+
+        def take_aged_out(self, _frame_index):
+            return []
+
+        def finish_range(self):
+            return []
+
+    def frame_stream(_capture, _geometry, start, _end, on_seek_complete=None):
+        on_seek_complete()
+        yield DecodedFrame(index=start, time_s=start / 30.0, image="image")
+
+    monkeypatch.setattr(tracking_engine, "resolve_device", lambda *_args: "cpu")
+    monkeypatch.setattr(
+        tracking_engine,
+        "open_video",
+        lambda _source: (Capture(), VideoGeometry(1920, 1080, 30.0, 100)),
+    )
+    monkeypatch.setattr(tracking_engine, "iter_frame_range", frame_stream)
+    monkeypatch.setattr(
+        tracking_engine,
+        "create_tracker",
+        lambda _params: (
+            SimpleNamespace(update=lambda *_args: []),
+            SimpleNamespace(as_dict={"track_buffer": 30}),
+        ),
+    )
+    monkeypatch.setattr(tracking_engine, "TrackAccumulator", Accumulator)
+
+    ctx = Context()
+    engine = tracking_engine.TrackingEngine()
+    engine._detector = Detector()
+    engine.run(
+        ctx,
+        {
+            "range": {"start_frame": 10, "end_frame": 11},
+            "video": {"url": "fake://video", "source_name": "video.mp4"},
+            "params": ctx.params,
+            "reduction": {"name": "v3_dirpad", "version": "1"},
+        },
+    )
+
+    assert ctx.phases == [
+        "opening_video",
+        "loading_model",
+        "seeking",
+        "inferring",
+        "reducing",
+        "publishing",
+    ]
+
+
 # test_an_observation_from_a_job_with_no_item_id_records_null()
 # Verifies what the observation carries when the provenance field is absent.
 # Inputs: none.

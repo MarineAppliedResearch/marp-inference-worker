@@ -79,6 +79,12 @@ def main(argv: list[str]) -> int:
         stream=sys.stdout,
     )
 
+    # A useful total and phase exist before preflight or the first decoded frame.
+    frame_range = spec.get("range") or {}
+    start_frame = int(frame_range.get("start_frame", 0))
+    end_frame = int(frame_range.get("end_frame", start_frame))
+    ctx.report_progress(0, max(0, end_frame - start_frame), "frames", phase="starting")
+
     try:
         # Resolve the engine by name. A frame-only engine is refused here.
         engine = engine_registry.get_job_engine(str(spec["engine"]))

@@ -125,6 +125,7 @@ class MockEngine(BaseEngine, FrameInferenceCapable):
         stopped_early = False
 
         ctx.log(f"mock job over frames {start_frame}..{end_frame}")
+        ctx.report_progress(0, total, "frames", phase="inferring")
 
         with results_path.open("w", encoding="utf-8") as results_file:
             for frame_index in range(start_frame, end_frame):
@@ -159,6 +160,7 @@ class MockEngine(BaseEngine, FrameInferenceCapable):
                     break
 
         # Hand the file over by hash, as a real engine does.
+        ctx.report_progress(frames_processed, total, "frames", phase="publishing")
         results_sha256 = ctx.publish_artifact(results_path, "observations")
 
         return {

@@ -97,6 +97,10 @@ class ChildJobContext:
         # a batch that gets resent after a network failure.
         self._next_seq = 0
 
+        # The last phase named in progress. Phase changes are durable log events;
+        # repeated frame counters in the same phase remain heartbeat-only.
+        self._progress_phase: str | None = None
+
         # Cached stop answer plus when it was taken, to keep should_stop() cheap.
         self._stop_cached = False
         self._stop_checked_at = 0.0
@@ -158,12 +162,36 @@ class ChildJobContext:
 
     # report_progress()
     # Reports how far through the work the engine is.
-    # Inputs: units done, total units, and the unit name.
+    # Inputs: units done, total units, unit name, and optional phase name.
     # Output: none.
-    def report_progress(self, done: int, total: int | None, unit: str) -> None:
+    def report_progress(
+        self,
+        done: int,
+        total: int | None,
+        unit: str,
+        phase: str | None = None,
+    ) -> None:
+
+        # Preserve the current phase when callers report only a new counter.
+        next_phase = phase if phase is not None else self._progress_phase
+
+        # Keep a durable history of transitions without storing every counter.
+        if phase is not None and phase != self._progress_phase:
+            self._emit(
+                "log",
+                {
+                    "level": "info",
+                    "message": f"entered phase: {phase}",
+                    "phase": phase,
+                },
+            )
+            self._progress_phase = phase
 
         # The parent keeps only the latest of these and sends it on heartbeat.
-        self._emit("progress", {"done": done, "total": total, "unit": unit})
+        self._emit(
+            "progress",
+            {"done": done, "total": total, "unit": unit, "phase": next_phase},
+        )
 
     # report_metrics()
     # Reports engine metrics for one step of one phase.

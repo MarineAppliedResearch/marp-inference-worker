@@ -79,7 +79,13 @@ class JobContext(Protocol):
     # Reports how far through the work the engine is.
     # Inputs: units finished, total units expected, and what a unit is ("frames").
     # Output: none.
-    def report_progress(self, done: int, total: int | None, unit: str) -> None: ...
+    def report_progress(
+        self,
+        done: int,
+        total: int | None,
+        unit: str,
+        phase: str | None = None,
+    ) -> None: ...
 
     # report_metrics()
     # Reports engine metrics for one step of one phase.

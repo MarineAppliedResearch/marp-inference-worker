@@ -1,94 +1,131 @@
 ---
-task: MarineAppliedResearch/marp-inference-worker#9
-repos: [marp-inference-worker]
-status: verifying
+task: MarineAppliedResearch/marp-inference-worker#10
+repos: [marp-inference-worker, marp-api]
+status: ready-for-pr
 needs: []
 ---
 
 ## Goal
 
-Every keyframe produced by the tracking pipeline retains the model confidence measured on
-that keyframe's own frame, so MARP can rank or filter representative images without falling
-back to box area.
+While a distributed GPU attempt is running, MARP shows what stage the worker is in and a
+usable frame proportion. An operator can distinguish startup, model/video preparation,
+inference, reduction, and result publication instead of seeing a motionless counter with no
+total and guessing whether the job is slow or stuck.
 
 ## Requirements
 
-- **R1** — Every keyframe emitted by the selected reduction carries a `confidence` field.
-- **R2** — A keyframe's confidence is the raw detection confidence recorded on that exact
-  frame, carried through unchanged. It is not a track average, an extremum, a recomputed
-  score, or a score borrowed from a neighbouring frame.
-- **R3** — When the selected raw frame has no matched detection and therefore records
-  `confidence: None`, the emitted keyframe keeps the field with a null value rather than
-  inventing a score or omitting the field.
-- **R4** — The confidence survives the complete reduction and observation-shaping path and
-  remains JSON serializable for the existing MARP_API ingest consumer.
-- **R5** — Keyframe selection, start/middle/end labels, frame numbers, and directional box
-  padding remain unchanged.
-- **R6** — Numeric and null keyframe confidence survive the real MARP_API coordinator result
-  flow and are stored unchanged in a disposable PostgreSQL database.
+- **R1** — A leased frame-range attempt has a non-null total before its first processed
+  frame. The total is the half-open range length, `end_frame - start_frame`.
+- **R2** — The worker's live progress snapshot includes a phase that describes the work it
+  is performing, including preparation, model/video setup, seeking, inference, reduction,
+  and publication.
+- **R3** — Phase changes travel through the existing child-process event channel and
+  heartbeat request. No inbound connection, new worker endpoint, or second reporting loop is
+  added.
+- **R4** — MARP_API accepts an optional phase from new workers, persists the latest value on
+  `gpu_job_attempts`, and returns it in both job detail and worker-pool views.
+- **R5** — Compatibility is additive: an older worker that omits phase continues to
+  heartbeat, while a newer worker remains usable with a coordinator that ignores the extra
+  field.
+- **R6** — A refused heartbeat with the wrong worker or lease epoch writes no total, phase,
+  elapsed time, state, or heartbeat timestamp.
+- **R7** — Terminal attempts retain their last accepted progress snapshot so history can
+  explain where work ended.
+- **R8** — Existing frame counts, attempt states, control actions, event batching, result
+  publication, and inference output are unchanged.
+- **R9** — The change is verified across the real worker HTTP client, MARP_API, and a
+  disposable PostgreSQL database. A test must observe the phase and total through the API,
+  rather than only inspecting an in-memory worker object.
+- **R10** — This issue supplies data for the ML dashboard but does not implement or redesign
+  the dashboard.
+- **R11** — The inaccurate `job_pressure.active_jobs = 0` placeholder is recorded as an
+  adjacent defect and left outside this issue.
 
 ## Open assumptions
 
-- [x] **A1 · scientific/data-meaning · blocking** — answered 2026-09-13: yes, the confidence
-  measured on the raw detection box deliberately accompanies the directionally padded
-  keyframe box. The confidence describes the model result on the named frame; padding is
-  geometry added afterward and must not cause the score to be recomputed. Directional
-  padding may be replaced by a different detection representation in future work, but that
-  is outside this additive repair.
-- [x] **A2 · api contract · blocking** — answered 2026-09-13: keep `v3_dirpad` version `1`.
-  Adding the missing `confidence` field repairs its output contract; frame selection and box
-  geometry remain unchanged. A future change to padding, selection, or other reduction
-  behavior should use a new reducer name or version so stored results remain attributable.
+- [x] **A1 · api contract/behavioural · blocking** — answered 2026-09-13: which phases are
+  published? The implementation needs stable strings that tests, stored rows, and the
+  dashboard can share. The code's real stages support `starting`, `opening_video`,
+  `loading_model`, `seeking`, `inferring`, `reducing`, and `publishing`. A proposed
+  `finishing` phase would require one extra heartbeat after artifact upload just before the
+  terminal result, and may be too brief to be useful. **Recommendation:** use the seven real
+  stages above, omit `finishing`, and preserve the engine's actual order instead of
+  rearranging work to match a label list. Training will define its own phase names later.
+- [x] **A2 · database/schema · blocking** — answered 2026-09-13: MARP_API persists the worker's existing
+  `elapsed_s` alongside phase? The worker already sends it and MARP_API currently discards
+  it. Persisting it as `progress_elapsed_s` would let a dashboard show average throughput
+  after reload; phase plus `last_heartbeat_at` alone says what is alive but not how long the
+  attempt has spent getting there. **Recommendation:** add it in the same additive migration
+  as `progress_phase`, because this issue's purpose is distinguishing slow from stuck and
+  the data already crosses the wire.
+- [x] **A3 · api contract/audit · blocking** — answered 2026-09-13: every phase transition is durable
+  in `gpu_job_events`, or only the latest phase be kept on the attempt? **Recommendation:**
+  emit one ordinary structured `log` event per transition, using the existing event kind and
+  table. Seven small events per attempt preserve the history without adding an event kind or
+  schema.
+- [x] **A4 · api contract · blocking** — answered 2026-09-13: MARP_API does not enforce the worker's phase
+  vocabulary? A closed enum makes typographical errors fail but forces worker and
+  coordinator releases to move together when training adds new phases.
+  **Recommendation:** validate a non-empty string with a short length limit, store it as
+  `varchar`, and lets the dashboard display an unknown future phase as text. This is the
+  generic contract that future training phases will use with their own phase names and
+  progress units.
+- [x] **A5 · cross-repository · blocking** — settled by inspection 2026-09-13: this is one
+  cross-repository change. The worker produces the phase; MARP_API owns the heartbeat
+  contract, migration, persistence, and query shapes. Neither half alone satisfies #10.
+- [x] **A6 · product/UI · blocking** — settled by issue #10 and MARP_API#104: dashboard
+  rendering remains in the dashboard implementation. This issue ends when its API data is
+  correct and observable.
+- [x] **A7 · scope · blocking** — settled by repository rules: do not repair the unrelated
+  `job_pressure` placeholder while touching progress. Report it and leave it for its own
+  issue.
 
 ## Decisions
 
-- **2026-09-13** — The MARP_API ingest path already accepts numeric keyframe confidence and
-  stores null otherwise; issue #9 requires no API-side contract or schema change.
-- **2026-09-13** — Predicted frames use the same established semantics as observation
-  confidence: no matched detection means an explicit null, never a nearby detection's score.
-- **2026-09-13** — Confidence continues to describe the raw model detection while the
-  keyframe box remains directionally padded. The existing reducer stays at version `1` for
-  this additive repair.
+- **2026-09-13** — Keep the worker-pull architecture and existing heartbeat channel.
+- **2026-09-13** — Initialize the total from the job's required half-open range; probing the
+  media container is not needed to know the leased piece size.
+- **2026-09-13** — Store only current progress on the attempt. Any transition history uses
+  the existing append-only event stream.
+- **2026-09-13** — The worker issue is the coordinating issue for both repositories; API
+  commits and the pull request reference it in full.
+- **2026-09-13** — Phase reporting is generic across job kinds. Issue #10 names inference
+  phases only; the training implementation will define its actual phases and units later.
 
 ## Plan
 
-1. Add the confidence from each selected raw frame to the keyframe emitted by
-   `reduce_to_keyframes_v3_dirpad`, without changing selection or padding.
-2. Add focused pipeline tests proving distinct per-frame scores remain attached to their own
-   keyframes and that an undetected selected frame remains null.
-3. Confirm the complete observation payload serializes those values in the shape consumed by
-   MARP_API.
-4. Submit an observations artifact through MARP_API's real job-result HTTP flow and compare
-   every persisted keyframe confidence with the artifact.
-5. Write the G3 verification plan for human review before running it.
+1. Settle A1–A4 and record the shared contract in both task branches.
+2. Initialize worker progress from the leased range and carry phase through child events,
+   parent state, local status, in-flight recovery, and heartbeat payloads.
+3. Mark the actual tracking and publication boundaries without changing their order.
+4. Add an additive MARP_API migration and model fields for the accepted live snapshot.
+5. Validate and persist the optional heartbeat fields, expose them through job and worker
+   reads, and regenerate the API and developer documentation.
+6. Write the G3 cross-repository verification plan, including a real worker/API/database
+   round trip, for human approval before running it.
 
 ## Acceptance criteria
 
-- Reduced keyframes contain the confidence from their own source frames.
-- At least two selected frames with different scores prove the value is not copied from one
-  track-level source.
-- A selected predicted frame produces `"confidence": null` after JSON serialization.
-- Existing keyframe selection, labels, frame numbers, and padded coordinates are unchanged.
-- No MARP_API code or database migration is required.
-- MARP_API's real result-ingest path stores both numeric and null keyframe confidence in its
-  disposable PostgreSQL database.
+- Before the first detection, a running attempt read from MARP_API has a total and a
+  meaningful current phase.
+- During a real piece, the phase advances through the stages the worker actually enters and
+  the frame count advances during inference.
+- After terminal reporting, the attempt retains its final accepted snapshot.
+- Old heartbeat bodies remain valid and invalid lease holders remain unable to modify the
+  attempt.
+- The worker, API, and disposable database agree on the same phase and total end to end.
 
 ## Test plan
 
-Written in `.marp/verification.md`. The focused tests belong in
-`tests/test_tracking_pipeline.py`, where the real tracker, accumulator, reducer, and
-observation shaper can observe whether a score stayed attached to its frame. Awaiting human
-review before anything is run.
+Written at G3 after A1–A4 are answered. The focused worker runner tests and MARP_API GPU
+group will cover each repository; the end-to-end tier must run the real worker client
+against the isolated API and its disposable PostgreSQL database.
 
 ## Status
 
-- **Gate:** verifying
-- **Notes:** Branch `9-keyframe-confidence` is based on current `origin/develop`. Local code
-  inspection confirms `TrackAccumulator` already stores per-frame confidence and
-  `reduce_to_keyframes_v3_dirpad` drops it only when constructing each output dictionary.
-  A1 and A2 were answered by Isaac on 2026-09-13. The implementation and focused tests are
-  written. The approved focused verification passed all three selected pipeline tests. Ruff
-  found five pre-existing issues also present on `origin/develop`; none points to an issue #9
-  addition. The full worker tracking file passed 16/16. A fresh MARP_API workspace from the
-  merged #157 `develop` persisted numeric and null confidence through the real HTTP result
-  flow; its complete GPU subsystem passed 96/96. The G4 evidence awaits human review.
+- **Gate:** ready-for-pr. The approved G4 plan passed and the human approved its evidence.
+- **Notes:** The worker now initializes the range total and reports the seven agreed phases
+  through the existing event and heartbeat path. MARP_API persists phase and elapsed time,
+  exposes both live and terminal snapshots, and remains compatible with partial progress
+  payloads. Targeted worker, API, migration, generated-contract, and real cross-repository
+  checks passed against the isolated disposable database.

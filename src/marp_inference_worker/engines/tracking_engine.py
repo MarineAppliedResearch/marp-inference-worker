@@ -190,6 +190,7 @@ class TrackingEngine(BaseEngine):
         data_type = str(params.get("data_type", "Fish"))
 
         # Open the video and read its geometry once.
+        ctx.report_progress(0, expected_frames, "frames", phase="opening_video")
         capture, geometry = open_video(str(video_source))
         ctx.log(
             f"opened video {geometry.width}x{geometry.height} at {geometry.frame_rate:.3f} fps, "
@@ -198,6 +199,7 @@ class TrackingEngine(BaseEngine):
 
         # Build the model, the tracker and the accumulator for this range only.
         # A fresh tracker per range is what makes the boundary a seam (R10a).
+        ctx.report_progress(0, expected_frames, "frames", phase="loading_model")
         yolo_model = self._detector.load_weights(model_path, device)
         tracker, tracker_args = create_tracker(params)
         accumulator = TrackAccumulator(track_buffer=tracker_args.as_dict["track_buffer"])
@@ -219,7 +221,16 @@ class TrackingEngine(BaseEngine):
                 # Detection is a generator over a generator: the frame reader
                 # yields one decoded frame, the detector yields its boxes, and
                 # neither retains what came before (R8).
-                frame_stream = iter_frame_range(capture, geometry, start_frame, end_frame)
+                ctx.report_progress(0, expected_frames, "frames", phase="seeking")
+                frame_stream = iter_frame_range(
+                    capture,
+                    geometry,
+                    start_frame,
+                    end_frame,
+                    on_seek_complete=lambda: ctx.report_progress(
+                        0, expected_frames, "frames", phase="inferring"
+                    ),
+                )
                 for frame_detections in self._detector.infer_stream(
                     yolo_model, frame_stream, confidence
                 ):
@@ -287,6 +298,9 @@ class TrackingEngine(BaseEngine):
                 # was shorter, or because a stop was requested. Every track
                 # still open ends here. It is not carried forward and it is not
                 # stitched to whatever the next range finds (R10a).
+                ctx.report_progress(
+                    frames_processed, expected_frames, "frames", phase="reducing"
+                )
                 for ended in accumulator.finish_range():
                     observations_written += self._write_observation(
                         results_file=results_file,
@@ -300,7 +314,9 @@ class TrackingEngine(BaseEngine):
 
             # Report the final frame count, which the cadence above may have
             # skipped past, before handing the file over.
-            ctx.report_progress(frames_processed, expected_frames, "frames")
+            ctx.report_progress(
+                frames_processed, expected_frames, "frames", phase="publishing"
+            )
 
             # Hand the results file over by hash. The coordinator is told the
             # hash and asks for the bytes only if it does not already have them.

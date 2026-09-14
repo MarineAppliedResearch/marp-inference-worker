@@ -65,6 +65,16 @@ try {
     $Work = Join-Path $OutputRoot 'work'
     New-Item -ItemType Directory -Force -Path $VersionDir, $LauncherDir, $Work | Out-Null
 
+    # Build from the exact committed tree in an isolated copy. Installing a
+    # local setuptools project regenerates egg-info beside that project; doing
+    # it in the checkout made a failed package build dirty its own source and
+    # then fail the clean-tree reproducibility guard on retry.
+    $WorkerZip = Join-Path $Work 'worker-source.zip'
+    $WorkerSource = Join-Path $Work 'worker-source'
+    git archive --format=zip --output=$WorkerZip $WorkerCommit
+    Assert-LastExit 'Exporting the committed worker source'
+    Expand-Archive -LiteralPath $WorkerZip -DestinationPath $WorkerSource
+
     $Uv = (Get-Command uv.exe -ErrorAction Stop).Source
     $env:UV_CACHE_DIR = Join-Path $Repository '.marp\local\uv-cache'
     $BuildVenv = Join-Path $Work 'venv'
@@ -75,26 +85,26 @@ try {
     if (-not $PythonVersion.StartsWith('3.12.')) { throw "Expected Python 3.12, got $PythonVersion." }
     & $Uv pip sync --python $Python (Join-Path $PSScriptRoot 'requirements-windows-cu126.lock.txt') --torch-backend cu126
     Assert-LastExit 'Installing the locked CUDA 12.6 dependency set'
-    & $Uv pip install --python $Python --no-deps $Repository
+    & $Uv pip install --python $Python --no-deps $WorkerSource
     Assert-LastExit 'Installing the worker source'
 
     $PyInstallerDist = Join-Path $Work 'pyinstaller-dist'
     $PyInstallerWork = Join-Path $Work 'pyinstaller-work'
     $PyInstallerCommon = @(
         '--noconfirm', '--clean',
-        '--paths', (Join-Path $Repository 'ByteTrack'),
+        '--paths', (Join-Path $WorkerSource 'ByteTrack'),
         '--distpath', $PyInstallerDist,
         '--workpath', $PyInstallerWork,
         '--specpath', $Work
     )
     & $Python -m PyInstaller @PyInstallerCommon --onedir --name marp-worker `
         --collect-all torch --collect-all ultralytics --collect-all yolox `
-        (Join-Path $Repository 'src\marp_inference_worker\worker_main.py')
+        (Join-Path $WorkerSource 'src\marp_inference_worker\worker_main.py')
     Assert-LastExit 'Building the worker executable'
     Copy-Item -Path (Join-Path $PyInstallerDist 'marp-worker\*') -Destination $VersionDir -Recurse -Force
 
     & $Python -m PyInstaller @PyInstallerCommon --onefile --name marp-worker-launcher `
-        (Join-Path $Repository 'src\marp_inference_worker\installation\launcher.py')
+        (Join-Path $WorkerSource 'src\marp_inference_worker\installation\launcher.py')
     Assert-LastExit 'Building the stable launcher'
     Copy-Item -LiteralPath (Join-Path $PyInstallerDist 'marp-worker-launcher.exe') -Destination $LauncherDir
 

@@ -15,6 +15,7 @@
 # count, VRAM, driver, disk and engine list are discovered (R2).
 
 # os reads the two environment variables this worker is configured with.
+import argparse
 import os
 
 # threading runs the job loop beside the API server.
@@ -49,7 +50,7 @@ _STATE_DIR_ENV = "MARP_WORKER_STATE_DIR"
 # Use this from start_worker(). Raises when the token or address is missing,
 # because a worker with neither cannot do anything and should say so at start
 # rather than failing silently on its first poll.
-def build_runner():
+def build_runner(screen_mode: str = "off"):
 
     # Imported here so importing this module does not pull the runner's
     # dependency tree into a test that only wanted the API.
@@ -72,7 +73,12 @@ def build_runner():
 
     # Build the client and the runner.
     client = CoordinatorClient(base_url=coordinator_url, service_token=service_token)
-    runner = JobRunner(client=client, state_dir=state_dir, worker_state=WORKER_STATE)
+    runner = JobRunner(
+        client=client,
+        state_dir=state_dir,
+        worker_state=WORKER_STATE,
+        screen_mode=screen_mode,
+    )
 
     # Publish the discovered capabilities so /status has them before the first
     # poll, and so an operator can see what the machine reported.
@@ -89,9 +95,9 @@ def build_runner():
 # Use this from the service entry point. A thread rather than a second process:
 # the loop and the API have to share one WorkerState, and a job's real isolation
 # is its own child process, which the runner already gives it.
-def start_worker():
+def start_worker(screen_mode: str = "off"):
 
-    runner = build_runner()
+    runner = build_runner(screen_mode)
 
     # Daemon, so a stopped API server does not leave the loop running. The
     # runner's own jobs are separate processes and are stopped through it.
@@ -108,12 +114,21 @@ def start_worker():
 # Use this as the process a GPU machine starts.
 def main() -> None:
 
+    parser = argparse.ArgumentParser(description="Run the MARP inference worker")
+    parser.add_argument(
+        "--screen",
+        choices=("off", "window", "fullscreen"),
+        default="off",
+        help="permit watched jobs to open a local display",
+    )
+    args = parser.parse_args()
+
     # uvicorn serves the operator API.
     import uvicorn
 
     # Start taking work first, so a worker is useful even if the API fails to
     # bind -- the API is a window, not the service.
-    runner = start_worker()
+    runner = start_worker(args.screen)
 
     try:
         # Loopback only. Not a default that can be overridden by an environment

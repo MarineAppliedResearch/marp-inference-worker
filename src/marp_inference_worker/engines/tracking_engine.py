@@ -189,6 +189,19 @@ class TrackingEngine(BaseEngine):
         # Dataset type drives which survey rule picks the observation frame.
         data_type = str(params.get("data_type", "Fish"))
 
+        watch = None
+        screen_mode = str(params.get("_watch_screen_mode", "off"))
+        if params.get("watch") is True and screen_mode in {"window", "fullscreen"}:
+            from marp_inference_worker.watch import WatchDisplay
+
+            watch = WatchDisplay(
+                screen_mode=screen_mode,
+                workspace=ctx.checkpoint_dir.parent,
+                warn=lambda message: ctx.log(message, level="warning"),
+            )
+            if not watch.start():
+                watch = None
+
         # Open the video and read its geometry once.
         ctx.report_progress(0, expected_frames, "frames", phase="opening_video")
         capture, geometry = open_video(str(video_source))
@@ -247,7 +260,7 @@ class TrackingEngine(BaseEngine):
                     )
 
                     # Record each track's box on this frame.
-                    self._observe_tracks(
+                    live_tracks = self._observe_tracks(
                         accumulator=accumulator,
                         tracked=tracked,
                         detections=detections,
@@ -257,6 +270,10 @@ class TrackingEngine(BaseEngine):
                         frame_width=geometry.width,
                         frame_height=geometry.height,
                     )
+
+                    if watch is not None and not watch.present(frame, frame.index, live_tracks):
+                        watch.close()
+                        watch = None
 
                     # Close and write out any track the tracker has lost.
                     for ended in accumulator.take_aged_out(frame.index):
@@ -352,6 +369,8 @@ class TrackingEngine(BaseEngine):
             # child process is reaped.
             capture.release()
             self._detector.unload_all()
+            if watch is not None:
+                watch.close()
 
     # _observe_tracks()
     # Records this frame's tracked boxes into the accumulator.
@@ -371,8 +390,9 @@ class TrackingEngine(BaseEngine):
         frame_time_s: float,
         frame_width: int,
         frame_height: int,
-    ) -> None:
+    ) -> list[dict[str, Any]]:
 
+        live_tracks = []
         # Walk the tracks the tracker believes are present on this frame.
         for track in tracked:
             x1, y1, x2, y2 = (float(value) for value in track.tlbr)
@@ -420,6 +440,21 @@ class TrackingEngine(BaseEngine):
                 ),
                 confidence=confidence,
             )
+
+            live_tracks.append(
+                {
+                    "track_id": int(track.track_id),
+                    "class_name": class_name,
+                    "bbox_normalized": [
+                        (x1 + x2) / 2 / frame_width,
+                        (y1 + y2) / 2 / frame_height,
+                        (x2 - x1) / frame_width,
+                        (y2 - y1) / frame_height,
+                    ],
+                }
+            )
+
+        return live_tracks
 
     # _write_observation()
     # Reduces one finished track and writes its observation to the results file.

@@ -133,6 +133,7 @@ class JobRunner:
         state_dir: Path,
         worker_state: Any,
         slot_count: int | None = None,
+        screen_mode: str = "off",
     ) -> None:
 
         # The only channel to MARP.
@@ -145,6 +146,7 @@ class JobRunner:
 
         # The object the FastAPI app reads for /status and writes for pause.
         self._state = worker_state
+        self._screen_mode = screen_mode
 
         # One job per GPU slot. A machine with no GPU still gets one slot, so
         # it can run a CPU job that explicitly asked for CPU.
@@ -511,6 +513,8 @@ class JobRunner:
         # still learns nothing about MARP or the coordinator.
         spec = envelope.spec.model_dump(mode="json")
         spec["params"] = prepared_params
+        if self._screen_mode != "off" and prepared_params.get("watch") is True:
+            spec["params"]["_watch_screen_mode"] = self._screen_mode
 
         # Create and launch the child.
         job = JobProcess(

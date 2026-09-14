@@ -32,6 +32,9 @@ if (-not (Get-Command nvidia-smi.exe -ErrorAction SilentlyContinue)) {
     throw 'No NVIDIA driver was found. Install a supported NVIDIA driver, then run MARP setup again.'
 }
 
+if (Test-Path -LiteralPath $VersionRoot) {
+    Remove-Item -LiteralPath $VersionRoot -Recurse -Force
+}
 New-Item -ItemType Directory -Force -Path $VersionRoot, $StateRoot, $DownloadRoot | Out-Null
 $UvLock = Read-Lock 'uv-windows-x64.lock.json'
 $UvArchive = Join-Path $DownloadRoot 'uv.zip'
@@ -44,9 +47,15 @@ $Uv = Join-Path $UvRoot 'uv.exe'
 $env:UV_PYTHON_INSTALL_DIR = Join-Path $InstallRoot 'python'
 $env:UV_CACHE_DIR = Join-Path $StateRoot 'uv-cache'
 & $Uv python install 3.12
-if ($LASTEXITCODE -ne 0) { throw 'Python 3.12 installation failed.' }
+$ManagedPython = Get-ChildItem -LiteralPath $env:UV_PYTHON_INSTALL_DIR -Directory |
+    Where-Object { $_.Name -match '^cpython-3\.12\.\d+-windows-x86_64-none$' } |
+    Sort-Object Name -Descending |
+    ForEach-Object { Join-Path $_.FullName 'python.exe' } |
+    Where-Object { Test-Path -LiteralPath $_ } |
+    Select-Object -First 1
+if (-not $ManagedPython) { throw 'Python 3.12 installation failed.' }
 $Runtime = Join-Path $VersionRoot 'runtime'
-& $Uv venv $Runtime --python 3.12 --python-preference only-managed
+& $Uv venv $Runtime --python $ManagedPython
 if ($LASTEXITCODE -ne 0) { throw 'Worker runtime creation failed.' }
 $Python = Join-Path $Runtime 'Scripts\python.exe'
 

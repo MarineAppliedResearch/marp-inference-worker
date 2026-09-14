@@ -97,6 +97,9 @@ class FakeCoordinator:
         # wire, which is the same class of drift as the missing `name` was.
         return {"worker_id": 65}
 
+    def resolve_artifact_url(self, locator: str) -> tuple[str, dict[str, str] | None]:
+        return locator, None
+
     # poll()
     # Hands out the next offer, or None once they are exhausted.
     def poll(self, worker_id: str, free_slot_indexes: list[int], capabilities=None, wait_seconds: int = 0):
@@ -1163,6 +1166,7 @@ def test_the_fake_coordinator_matches_the_real_client() -> None:
         "upload_artifact",
         "report_result",
         "close",
+        "resolve_artifact_url",
     ]
 
     fake = FakeCoordinator()

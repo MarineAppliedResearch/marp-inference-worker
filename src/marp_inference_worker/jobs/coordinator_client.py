@@ -11,6 +11,7 @@
 
 # httpx makes the outbound calls and is already a project dependency.
 import httpx
+from urllib.parse import urljoin, urlparse
 
 # datetime turns the child's epoch timestamps into the ISO-8601 the coordinator
 # stores events against.
@@ -175,6 +176,27 @@ class CoordinatorClient:
 
         # Idempotent in httpx, so shutdown paths may call it twice.
         self._client.close()
+
+    def resolve_artifact_url(self, locator: str) -> tuple[str, dict[str, str] | None]:
+        """Resolve coordinator-relative model URLs and authorize only that origin."""
+        parsed = urlparse(locator)
+        if parsed.scheme in {"http", "https"}:
+            coordinator = urlparse(self._base_url)
+            same_origin = (parsed.scheme, parsed.hostname, parsed.port) == (
+                coordinator.scheme,
+                coordinator.hostname,
+                coordinator.port,
+            )
+            headers = {"Authorization": f"Bearer {self._service_token}"} if same_origin else None
+            return locator, headers
+
+        if not locator.startswith("/"):
+            return locator, None
+
+        return (
+            urljoin(f"{self._base_url}/", locator.lstrip("/")),
+            {"Authorization": f"Bearer {self._service_token}"},
+        )
 
     # _post()
     # Posts one JSON body and returns the decoded response.

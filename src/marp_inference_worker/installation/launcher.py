@@ -11,7 +11,9 @@ import httpx
 
 
 def _read_json(path: Path) -> dict:
-    return json.loads(path.read_text(encoding="utf-8"))
+    # Windows PowerShell 5.1 writes `-Encoding utf8` with a BOM. Setup JSON is
+    # read here before the worker can start, so accept both Windows and plain UTF-8.
+    return json.loads(path.read_text(encoding="utf-8-sig"))
 
 
 def _write_json(path: Path, value: dict) -> None:

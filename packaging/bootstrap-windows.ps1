@@ -126,22 +126,34 @@ Copy-Item -LiteralPath (Join-Path $PayloadRoot 'launcher-windows.ps1') -Destinat
 $env:MARP_COORDINATOR_URL = $CoordinatorUrl
 $env:MARP_WORKER_STATE_DIR = $StateRoot
 Write-Stage 7 'Connecting this computer to MARP...'
-& $Python -m marp_inference_worker.worker_main --activate-code-file $ActivationCodeFile `
-    --coordinator-url $CoordinatorUrl --state-dir $StateRoot
-if ($LASTEXITCODE -ne 0) { throw 'Worker activation failed.' }
+$CredentialPath = Join-Path $StateRoot 'worker-credential.dpapi'
+$IdentityPath = Join-Path $StateRoot 'worker-identity.json'
+if ((Test-Path -LiteralPath $CredentialPath) -and (Test-Path -LiteralPath $IdentityPath)) {
+    Write-Host 'This computer is already enrolled; reusing its protected worker credential.'
+    Remove-Item -LiteralPath $ActivationCodeFile -Force -ErrorAction SilentlyContinue
+} else {
+    & $Python -m marp_inference_worker.worker_main --activate-code-file $ActivationCodeFile `
+        --coordinator-url $CoordinatorUrl --state-dir $StateRoot
+    if ($LASTEXITCODE -ne 0) { throw 'Worker activation failed.' }
+}
 
 $Launcher = Join-Path $InstallRoot 'launcher.ps1'
 $LauncherArguments = "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$Launcher`" -Screen window"
+$StartupOut = Join-Path $StateRoot 'worker-startup.stdout.log'
+$StartupError = Join-Path $StateRoot 'worker-startup.stderr.log'
 $WorkerProcess = Start-Process -FilePath "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" `
     -ArgumentList $LauncherArguments `
     -PassThru `
+    -RedirectStandardOutput $StartupOut `
+    -RedirectStandardError $StartupError `
     -WindowStyle Hidden
 $Healthy = $false
 Write-Stage 8 'Starting the worker and checking its GPU...'
 for ($Attempt = 0; $Attempt -lt 60; $Attempt += 1) {
+    if ($WorkerProcess.HasExited) { break }
     try {
-        $Health = Invoke-RestMethod -Uri 'http://127.0.0.1:8010/health' -TimeoutSec 2
-        $Status = Invoke-RestMethod -Uri 'http://127.0.0.1:8010/status' -TimeoutSec 2
+        $Health = Invoke-RestMethod -Uri 'http://127.0.0.1:8010/health' -TimeoutSec 2 -ErrorAction SilentlyContinue
+        $Status = Invoke-RestMethod -Uri 'http://127.0.0.1:8010/status' -TimeoutSec 2 -ErrorAction SilentlyContinue
         if ($Health.status -eq 'ok' -and $Status.capabilities -and $Status.enrolled) {
             $Healthy = $true
             break
@@ -150,7 +162,13 @@ for ($Attempt = 0; $Attempt -lt 60; $Attempt += 1) {
     Start-Sleep -Seconds 1
 }
 if (-not $Healthy) {
-    & taskkill.exe /PID $WorkerProcess.Id /T /F 2>$null | Out-Null
+    if (Test-Path -LiteralPath $StartupError) {
+        Write-Host 'Worker startup error:' -ForegroundColor Red
+        Get-Content -LiteralPath $StartupError | Write-Host
+    }
+    if (Get-Process -Id $WorkerProcess.Id -ErrorAction SilentlyContinue) {
+        Stop-Process -Id $WorkerProcess.Id -Force -ErrorAction SilentlyContinue
+    }
     throw 'The worker installed but did not report healthy enrollment and GPU discovery.'
 }
 

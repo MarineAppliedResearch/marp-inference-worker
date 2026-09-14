@@ -7,6 +7,7 @@ import httpx
 import pytest
 
 from marp_inference_worker.installation import credential_store
+from marp_inference_worker.installation import launcher
 from marp_inference_worker.installation.updater import UpdateInstaller
 
 
@@ -53,6 +54,13 @@ def test_dpapi_credential_round_trip_is_not_plaintext(tmp_path) -> None:
 
     assert credential_store.load(path) == secret
     assert secret.encode("utf-8") not in path.read_bytes()
+
+
+def test_launcher_reads_windows_powershell_utf8_json(tmp_path) -> None:
+    path = tmp_path / "config.json"
+    path.write_bytes(b"\xef\xbb\xbf" + b'{"coordinator_url":"http://marp.test"}')
+
+    assert launcher._read_json(path) == {"coordinator_url": "http://marp.test"}
 
 
 def test_update_is_verified_and_staged_beside_the_active_release(monkeypatch, tmp_path) -> None:

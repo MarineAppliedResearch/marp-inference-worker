@@ -193,6 +193,7 @@ class FakeCoordinator:
         outcome,
         artifacts=None,
         failure_reason=None,
+        completed_through_frame=None,
     ) -> dict[str, Any]:
 
         self.results.append(
@@ -203,6 +204,7 @@ class FakeCoordinator:
                 "outcome": outcome,
                 "artifacts": list(artifacts or []),
                 "failure_reason": failure_reason,
+                "completed_through_frame": completed_through_frame,
             }
         )
         return {"accepted": True, "idempotent": False}

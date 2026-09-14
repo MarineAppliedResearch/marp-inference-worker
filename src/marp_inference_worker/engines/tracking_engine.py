@@ -225,6 +225,7 @@ class TrackingEngine(BaseEngine):
         observations_written = 0
         detections_seen = 0
         stopped_early = False
+        live_track_metadata: dict[int, dict[str, Any]] = {}
 
         try:
             # One line per observation, written as tracks finish, so a long job
@@ -269,6 +270,7 @@ class TrackingEngine(BaseEngine):
                         frame_time_s=frame.time_s,
                         frame_width=geometry.width,
                         frame_height=geometry.height,
+                        live_track_metadata=live_track_metadata,
                     )
 
                     if watch is not None and not watch.present(frame, frame.index, live_tracks):
@@ -390,8 +392,11 @@ class TrackingEngine(BaseEngine):
         frame_time_s: float,
         frame_width: int,
         frame_height: int,
+        live_track_metadata: dict[int, dict[str, Any]] | None = None,
     ) -> list[dict[str, Any]]:
 
+        if live_track_metadata is None:
+            live_track_metadata = {}
         live_tracks = []
         # Walk the tracks the tracker believes are present on this frame.
         for track in tracked:
@@ -425,10 +430,20 @@ class TrackingEngine(BaseEngine):
             if class_id != -1:
                 class_name = yolo_model.names.get(class_id, str(class_id))
 
+            track_id = int(track.track_id)
+            if class_id != -1:
+                live_track_metadata[track_id] = {
+                    "class_name": class_name,
+                }
+            display_metadata = live_track_metadata.get(
+                track_id,
+                {"class_name": class_name},
+            )
+
             # Normalize to centre form in 0..1, which is what the keyframe
             # reduction's thresholds are calibrated against.
             accumulator.observe(
-                track_id=int(track.track_id),
+                track_id=track_id,
                 class_name=class_name,
                 frame_index=frame_index,
                 frame_time_s=frame_time_s,
@@ -443,8 +458,11 @@ class TrackingEngine(BaseEngine):
 
             live_tracks.append(
                 {
-                    "track_id": int(track.track_id),
-                    "class_name": class_name,
+                    "track_id": track_id,
+                    "class_name": display_metadata["class_name"],
+                    # ByteTrack carries its score on every returned track,
+                    # including frames propagated by the tracker.
+                    "confidence": float(track.score),
                     "bbox_normalized": [
                         (x1 + x2) / 2 / frame_width,
                         (y1 + y2) / 2 / frame_height,

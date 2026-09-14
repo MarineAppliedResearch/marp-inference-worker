@@ -18,8 +18,9 @@ being processed, with the model's detections and tracks drawn as they happen.
   inference rather than decoding the source again.
 - **R3** — Every produced frame is presented in order, without sampling, dropping, or
   source-rate pacing. Rendering backpressure may slow an opted-in job.
-- **R4** — Each track shows a stable-color box, species, track id, and persistence with
-  legible, frame-scaled labels.
+- **R4** — Each species has one stable box/label colour. The top label is centered over
+  and sized to its box and contains only the species name. A centered bottom label shows
+  confidence while retaining track id and persistence.
 - **R5** — A quiet status area shows frame number, achieved rate, and live-track count.
 - **R6** — The display and frame channel bind only to loopback and expose no credential or
   remote media URL.
@@ -31,8 +32,10 @@ being processed, with the model's detections and tracks drawn as they happen.
 - **R10** — The job option is an additive boolean engine parameter and requires no API or
   database change.
 - **R11** — Existing marp-video-player APIs and offline host behavior remain compatible.
-- **R12** — Window/fullscreen and Escape/close are supported; pause and scrubbing are not.
-- **R13** — Concurrent watched jobs open independent windows; audio is muted.
+- **R12** — Escape leaves fullscreen for the normal app window; the window close control
+  closes the display and continues inference headless. Pause and scrubbing are unsupported.
+- **R13** — Concurrent watched jobs open visibly distinct, independent windows; audio is
+  muted.
 - **R14** — Installer, dependency distribution, self-update, activation, volunteer compute
   controls, and remote viewing are separate work.
 
@@ -58,6 +61,8 @@ being processed, with the model's detections and tracks drawn as they happen.
 - **2026-09-14** — Keep machine and job display gates independent.
 - **2026-09-14** — Keep release packaging outside #11 after the first CUDA bundle measured
   3,058,143,651 bytes and demonstrated that bundling the full ML runtime is unacceptable.
+- **2026-09-14** — Use species identity for annotation colour, split the label above and
+  below its box, cascade concurrent windows, and let Chromium return Escape to windowed mode.
 
 ## Plan
 

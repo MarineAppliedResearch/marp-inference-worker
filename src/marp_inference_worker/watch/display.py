@@ -37,7 +37,12 @@ class _FrameChannel:
             self.condition.wait_for(lambda: self.packet is not None or self.closed)
             return self.packet
 
-    def publish(self, packet: dict[str, Any], timeout_s: float = 15.0) -> bool:
+    def publish(
+        self,
+        packet: dict[str, Any],
+        timeout_s: float = 15.0,
+        connect_timeout_s: float = 60.0,
+    ) -> bool:
         with self.condition:
             if not self.condition.wait_for(
                 lambda: self.packet is None or self.closed,
@@ -47,11 +52,12 @@ class _FrameChannel:
                 return False
             if self.closed:
                 return False
+            waiting_for_browser = not self.browser_connected
             self.packet = packet
             self.condition.notify_all()
             if not self.condition.wait_for(
                 lambda: self.acknowledged == packet["frame_number"] or self.closed,
-                timeout=timeout_s,
+                timeout=connect_timeout_s if waiting_for_browser else timeout_s,
             ):
                 self.close()
                 return False
@@ -172,7 +178,12 @@ class WatchDisplay:
                 "--disable-sync",
                 "--mute-audio",
             ]
-            args.append("--start-fullscreen" if self._mode == "fullscreen" else "--start-maximized")
+            if self._mode == "fullscreen":
+                args.append("--start-fullscreen")
+            else:
+                # Let Windows cascade independent job windows instead of
+                # stacking maximized surfaces directly on top of each other.
+                args.append("--window-size=1100,700")
             self._process = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             threading.Thread(target=self._watch_process, daemon=True).start()
             return True
@@ -195,13 +206,19 @@ class WatchDisplay:
     def present(self, frame: Any, frame_number: int, tracks: list[dict[str, Any]]) -> bool:
         if self._channel.closed:
             return False
-        encoded, bytes_buffer = cv2.imencode(".png", frame.image)
+        # The display is observational, while the scientific result is produced
+        # from the original frame. JPEG keeps 1080p loopback transfers fast.
+        encoded, bytes_buffer = cv2.imencode(
+            ".jpg",
+            frame.image,
+            [cv2.IMWRITE_JPEG_QUALITY, 85],
+        )
         if not encoded:
             self._detach("watch display could not encode a frame; inference is continuing headless")
             return False
         packet = {
             "frame_number": int(frame_number),
-            "content_type": "image/png",
+            "content_type": "image/jpeg",
             "image": base64.b64encode(bytes_buffer.tobytes()).decode("ascii"),
             "tracks": tracks,
         }

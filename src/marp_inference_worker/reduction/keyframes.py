@@ -12,12 +12,14 @@
 # that made it (R10b). That is why these are registry entries and not one inline
 # function: adding a v4 must not silently reinterpret rows made by v3.
 #
-# The v3_dirpad body below is a verbatim port of `reduce_to_keyframes_v3_dirpad`
-# and `_apply_directional_pad` as defined at lines 814 and 930 of
+# The v3_dirpad selection and padding below are a verbatim port of
+# `reduce_to_keyframes_v3_dirpad` and `_apply_directional_pad` as defined at
+# lines 814 and 930 of
 # src/old_scripts/object_tracking_live.py -- the later of the two definitions in
 # that file, which is the one Python keeps and the live path therefore used. The
 # earlier definitions differ (vel_window 3 vs 2, speed_gain 0.25 vs 0.35) and are
-# deliberately not merged in. Do not tidy the maths here; it is the reference.
+# deliberately not merged in. The output also retains the raw frame's detection
+# confidence for MARP. Do not tidy the maths here; it is the reference.
 
 # bisect_left finds a keyframe's position in the dense frame list.
 from bisect import bisect_left
@@ -145,6 +147,9 @@ def reduce_to_keyframes_v3_dirpad(endedObs,
             "comname": comname,
             "type": "start" if i == 0 else ("end" if i == len(reduced) - 1 else "middle"),
             "framenum": kf["frame"],
+            # Confidence describes the raw detection on this frame. Directional
+            # padding changes presentation geometry, not the model's score.
+            "confidence": kf.get("confidence"),
             "x": x, "y": y, "width": w, "height": h
         })
 

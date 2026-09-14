@@ -1,7 +1,7 @@
 ---
 task: MarineAppliedResearch/marp-inference-worker#9
 repos: [marp-inference-worker]
-status: implementing
+status: verifying
 needs: []
 ---
 
@@ -69,14 +69,16 @@ back to box area.
 
 ## Test plan
 
-To be written at G3 after A1 and A2 are answered. The focused tests belong in
+Written in `.marp/verification.md`. The focused tests belong in
 `tests/test_tracking_pipeline.py`, where the real tracker, accumulator, reducer, and
-observation shaper can observe whether a score stayed attached to its frame.
+observation shaper can observe whether a score stayed attached to its frame. Awaiting human
+review before anything is run.
 
 ## Status
 
-- **Gate:** implementing
+- **Gate:** verifying
 - **Notes:** Branch `9-keyframe-confidence` is based on current `origin/develop`. Local code
   inspection confirms `TrackAccumulator` already stores per-frame confidence and
   `reduce_to_keyframes_v3_dirpad` drops it only when constructing each output dictionary.
-  A1 and A2 were answered by Isaac on 2026-09-13; implementation may begin.
+  A1 and A2 were answered by Isaac on 2026-09-13. The implementation and focused tests are
+  written; the G3 verification plan awaits human approval before it is run.

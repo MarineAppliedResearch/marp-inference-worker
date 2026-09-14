@@ -43,31 +43,34 @@ total and guessing whether the job is slow or stuck.
 
 ## Open assumptions
 
-- [ ] **A1 · api contract/behavioural · blocking** — Which exact phase vocabulary should be
+- [x] **A1 · api contract/behavioural · blocking** — answered 2026-09-13: the inference
+  worker publishes
   published? The implementation needs stable strings that tests, stored rows, and the
   dashboard can share. The code's real stages support `starting`, `opening_video`,
   `loading_model`, `seeking`, `inferring`, `reducing`, and `publishing`. A proposed
   `finishing` phase would require one extra heartbeat after artifact upload just before the
   terminal result, and may be too brief to be useful. **Recommendation:** use the seven real
   stages above, omit `finishing`, and preserve the engine's actual order instead of
-  rearranging work to match a label list.
-- [ ] **A2 · database/schema · blocking** — Should MARP_API persist the worker's existing
+  rearranging work to match a label list. Training will define its own phase names later.
+- [x] **A2 · database/schema · blocking** — answered 2026-09-13: MARP_API persists the worker's existing
   `elapsed_s` alongside phase? The worker already sends it and MARP_API currently discards
   it. Persisting it as `progress_elapsed_s` would let a dashboard show average throughput
   after reload; phase plus `last_heartbeat_at` alone says what is alive but not how long the
   attempt has spent getting there. **Recommendation:** add it in the same additive migration
   as `progress_phase`, because this issue's purpose is distinguishing slow from stuck and
   the data already crosses the wire.
-- [ ] **A3 · api contract/audit · blocking** — Should every phase transition also be durable
+- [x] **A3 · api contract/audit · blocking** — answered 2026-09-13: every phase transition is durable
   in `gpu_job_events`, or only the latest phase be kept on the attempt? **Recommendation:**
   emit one ordinary structured `log` event per transition, using the existing event kind and
   table. Seven small events per attempt preserve the history without adding an event kind or
   schema.
-- [ ] **A4 · api contract · blocking** — Should MARP_API enforce the worker's phase
+- [x] **A4 · api contract · blocking** — answered 2026-09-13: MARP_API does not enforce the worker's phase
   vocabulary? A closed enum makes typographical errors fail but forces worker and
   coordinator releases to move together when training adds new phases.
   **Recommendation:** validate a non-empty string with a short length limit, store it as
-  `varchar`, and let the dashboard display an unknown future phase as text.
+  `varchar`, and lets the dashboard display an unknown future phase as text. This is the
+  generic contract that future training phases will use with their own phase names and
+  progress units.
 - [x] **A5 · cross-repository · blocking** — settled by inspection 2026-09-13: this is one
   cross-repository change. The worker produces the phase; MARP_API owns the heartbeat
   contract, migration, persistence, and query shapes. Neither half alone satisfies #10.
@@ -87,6 +90,8 @@ total and guessing whether the job is slow or stuck.
   the existing append-only event stream.
 - **2026-09-13** — The worker issue is the coordinating issue for both repositories; API
   commits and the pull request reference it in full.
+- **2026-09-13** — Phase reporting is generic across job kinds. Issue #10 names inference
+  phases only; the training implementation will define its actual phases and units later.
 
 ## Plan
 
@@ -119,7 +124,7 @@ against the isolated API and its disposable PostgreSQL database.
 
 ## Status
 
-- **Gate:** design. G1 is blocked on A1–A4.
+- **Gate:** implementing. All G1 assumptions are settled.
 - **Notes:** The worker already sends frame progress and `elapsed_s`, but initializes total
   to null and carries no phase. MARP_API accepts only `done`, `total`, and `unit`,
   discarding other progress keys. The existing event stream already stores structured

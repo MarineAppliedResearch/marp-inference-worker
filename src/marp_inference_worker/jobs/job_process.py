@@ -75,7 +75,16 @@ class JobProcess:
         self._reader: threading.Thread | None = None
 
         # The latest progress the child reported, sent up on each heartbeat.
-        self.progress: dict[str, Any] = {"done": 0, "total": None, "unit": "frames"}
+        # Initialize it from the range so even the first heartbeat is useful.
+        frame_range = self.spec.get("range") or {}
+        start_frame = int(frame_range.get("start_frame", 0))
+        end_frame = int(frame_range.get("end_frame", start_frame))
+        self.progress: dict[str, Any] = {
+            "done": 0,
+            "total": max(0, end_frame - start_frame),
+            "unit": "frames",
+            "phase": "starting",
+        }
 
         # Events not yet forwarded to the coordinator, drained in batches.
         self._pending_events: list[dict[str, Any]] = []
@@ -207,6 +216,7 @@ class JobProcess:
                     "done": event.get("done", 0),
                     "total": event.get("total"),
                     "unit": event.get("unit", "frames"),
+                    "phase": event.get("phase", self.progress.get("phase")),
                 }
                 return
 

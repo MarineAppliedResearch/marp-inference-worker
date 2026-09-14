@@ -9,7 +9,7 @@
 # Decoding belongs here; detection, tracking and reduction do not.
 
 # Iterator types the generator this module exists to produce.
-from typing import Any, Iterator, NamedTuple
+from typing import Any, Callable, Iterator, NamedTuple
 
 
 # DecodedFrame
@@ -87,6 +87,7 @@ def iter_frame_range(
     geometry: VideoGeometry,
     start_frame: int,
     end_frame: int,
+    on_seek_complete: Callable[[], None] | None = None,
 ) -> Iterator[DecodedFrame]:
 
     # Imported lazily for the same reason open_video() does.
@@ -95,6 +96,11 @@ def iter_frame_range(
     # Seeking to 0 is a no-op that some backends still mishandle, so skip it.
     if start_frame > 0:
         capture.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+
+    # Let callers distinguish positioning from frame processing without moving
+    # the seek or changing which frames this generator yields.
+    if on_seek_complete is not None:
+        on_seek_complete()
 
     # Track position ourselves. CAP_PROP_POS_FRAMES is not reliable on every
     # backend after a seek, and the absolute index is what observations record.

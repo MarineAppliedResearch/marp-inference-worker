@@ -884,6 +884,8 @@ def test_progress_reaches_the_coordinator_and_advances(tmp_path: Path) -> None:
     # And each heartbeat says which slot the job is on and how long it has run.
     assert coordinator.heartbeats[0]["progress"]["slot_index"] == 0
     assert coordinator.heartbeats[0]["progress"]["elapsed_s"] >= 0
+    assert all(beat["progress"]["total"] == 600 for beat in coordinator.heartbeats)
+    assert all(beat["progress"]["phase"] for beat in coordinator.heartbeats)
 
     # Clean up the still-running job so it does not outlive the test.
     runner._jobs_by_slot[0].request_stop()
@@ -1249,10 +1251,20 @@ def test_a_finished_attempt_reports_the_progress_it_finished_on(tmp_path: Path) 
     last = coordinator.heartbeats[-1]
     assert last["progress"]["done"] == 40
     assert last["progress"]["total"] == 40
+    assert last["progress"]["phase"] == "publishing"
 
     # And says the work is done and the bytes are moving, which is the only
     # thing that ever puts an attempt into `uploading`.
     assert last["state"] == "uploading"
+
+    # Transitions remain as structured log events after the latest snapshot has
+    # been overwritten, so the attempt retains its phase history.
+    phase_events = [
+        event["payload"]["phase"]
+        for event in coordinator.events
+        if event["kind"] == "log" and "phase" in event["payload"]
+    ]
+    assert phase_events == ["starting", "inferring", "publishing"]
 
 
 # test_the_in_flight_record_carries_live_progress(tmp_path)

@@ -153,6 +153,34 @@ def test_log_progress_and_metrics_each_produce_a_readable_event(tmp_path: Path) 
     assert [event["seq"] for event in events] == [0, 1, 2]
 
 
+# test_progress_phase_is_retained_and_each_transition_is_logged_once()
+# Verifies phase is both current heartbeat state and durable transition history.
+def test_progress_phase_is_retained_and_each_transition_is_logged_once(tmp_path: Path) -> None:
+
+    ctx, stream = _make_context(tmp_path)
+
+    ctx.report_progress(0, 100, "frames", phase="loading_model")
+    ctx.report_progress(1, 100, "frames")
+    ctx.report_progress(2, 100, "frames", phase="loading_model")
+    ctx.report_progress(2, 100, "frames", phase="inferring")
+
+    events = _events(stream)
+    progress = [event for event in events if event["kind"] == "progress"]
+    transitions = [event for event in events if event["kind"] == "log"]
+
+    assert [event["phase"] for event in progress] == [
+        "loading_model",
+        "loading_model",
+        "loading_model",
+        "inferring",
+    ]
+    assert [event["phase"] for event in transitions] == ["loading_model", "inferring"]
+    assert [event["message"] for event in transitions] == [
+        "entered phase: loading_model",
+        "entered phase: inferring",
+    ]
+
+
 # test_metrics_mapping_is_not_schemad(tmp_path)
 # Verifies that arbitrary metric names pass through.
 # Inputs: pytest temporary directory.

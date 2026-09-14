@@ -43,8 +43,7 @@ total and guessing whether the job is slow or stuck.
 
 ## Open assumptions
 
-- [x] **A1 · api contract/behavioural · blocking** — answered 2026-09-13: the inference
-  worker publishes
+- [x] **A1 · api contract/behavioural · blocking** — answered 2026-09-13: which phases are
   published? The implementation needs stable strings that tests, stored rows, and the
   dashboard can share. The code's real stages support `starting`, `opening_video`,
   `loading_model`, `seeking`, `inferring`, `reducing`, and `publishing`. A proposed

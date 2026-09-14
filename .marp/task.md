@@ -19,7 +19,9 @@ understand developer tools, runtimes, browsers, or packages.
   setup, with visible aggregate progress. It does not bundle PyTorch, Chromium, models, or
   the completed runtime inside its initial executable.
 - **R3** — Setup detects a supported NVIDIA driver and GPU and installs the approved runtime
-  variant. CUDA 12.6 is first, while release metadata can name other variants later.
+  variant. CUDA 12.6 serves compatible GPUs; compute capability 12.x receives CUDA 12.8,
+  and release metadata can name additional variants later. Setup proves compatibility by
+  executing a CUDA kernel before it declares the worker ready.
 - **R4** — Every downloaded component has an approved URL, byte size, and SHA-256. Setup
   rejects incomplete, altered, wrong-platform, and path-traversing content before use.
 - **R5** — The installer accepts a one-time activation code, creates a durable machine
@@ -63,6 +65,9 @@ understand developer tools, runtimes, browsers, or packages.
   `backup-11-installer-scope`; remove its monolithic bundled-runtime approach.
 - **2026-09-14** — Treat bootstrap size and installed/downloaded size as separate facts. The
   setup experience is one click even though GPU inference dependencies are necessarily large.
+- **2026-09-14** — Select the runtime from NVIDIA compute capability. A real RTX 5060 laptop
+  exposed that CUDA visibility alone is insufficient: cu126 could enumerate its 12.0 device
+  but had no executable kernel for it. The final setup check therefore runs a CUDA kernel.
 
 ## Plan
 

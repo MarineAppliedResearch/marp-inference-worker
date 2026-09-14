@@ -56,15 +56,17 @@ try {
     Assert-LastExit 'Exporting committed worker source'
     Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'bootstrap-windows.ps1') -Destination $Payload
     Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'launcher-windows.ps1') -Destination $Payload
-    Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'requirements-windows-cu126.lock.txt') -Destination $Payload
-    if (Select-String -LiteralPath (Join-Path $Payload 'requirements-windows-cu126.lock.txt') -Pattern '^\.\s*$' -Quiet) {
-        throw 'The runtime lock must not install the worker project from the current directory.'
+    foreach ($RuntimeLock in @('requirements-windows-cu126.lock.txt', 'requirements-windows-cu128.lock.txt')) {
+        Copy-Item -LiteralPath (Join-Path $PSScriptRoot $RuntimeLock) -Destination $Payload
+        if (Select-String -LiteralPath (Join-Path $Payload $RuntimeLock) -Pattern '^\.\s*$' -Quiet) {
+            throw "$RuntimeLock must not install the worker project from the current directory."
+        }
     }
     Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'uv-windows-x64.lock.json') -Destination $Payload
     Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'chromium-windows-x64.lock.json') -Destination $Payload
     [ordered]@{
         version = $Version
-        compute_runtime = 'cuda12.6'
+        compute_runtimes = @('cuda12.6', 'cuda12.8')
         worker_commit = $WorkerCommit
     } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $Payload 'bootstrap-manifest.json') -Encoding utf8
 
@@ -115,7 +117,7 @@ try {
         worker_commit = $WorkerCommit
         bootstrap_size_bytes = $File.Length
         bootstrap_sha256 = (Get-FileHash -LiteralPath $File.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
-        runtime = 'cuda12.6'
+        runtimes = @('cuda12.6', 'cuda12.8')
         runtime_delivery = 'downloaded during setup'
     } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $InstallerDir 'build-manifest.json') -Encoding utf8
     Write-Host "Built $($File.FullName) ($($File.Length) bytes)"

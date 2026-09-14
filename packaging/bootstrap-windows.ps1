@@ -44,13 +44,38 @@ function Get-VerifiedArchive($Lock, [string]$Destination) {
 }
 
 $BootstrapManifest = Read-Lock 'bootstrap-manifest.json'
-$ReleaseKey = "$($BootstrapManifest.version)-$($BootstrapManifest.compute_runtime)"
-$VersionRoot = Join-Path $InstallRoot "versions\$ReleaseKey"
 
 Write-Stage 1 'Checking the NVIDIA graphics driver...'
 if (-not (Get-Command nvidia-smi.exe -ErrorAction SilentlyContinue)) {
     throw 'No NVIDIA driver was found. Install a supported NVIDIA driver, then run MARP setup again.'
 }
+$ComputeCapabilityText = (& nvidia-smi.exe --query-gpu=compute_cap --format=csv,noheader,nounits |
+    Select-Object -First 1).Trim()
+$ComputeCapability = 0.0
+if (-not [double]::TryParse(
+    $ComputeCapabilityText,
+    [Globalization.NumberStyles]::Number,
+    [Globalization.CultureInfo]::InvariantCulture,
+    [ref]$ComputeCapability
+)) {
+    throw "The NVIDIA GPU compute capability could not be read (received '$ComputeCapabilityText')."
+}
+
+# Consumer Blackwell GPUs report compute capability 12.x and require kernels
+# built with CUDA 12.8 or newer. Older supported GPUs keep the smaller cu126
+# runtime that was approved for the first installer milestone.
+if ($ComputeCapability -ge 12.0) {
+    $ComputeRuntime = 'cuda12.8'
+    $TorchBackend = 'cu128'
+    $RequirementsLock = 'requirements-windows-cu128.lock.txt'
+} else {
+    $ComputeRuntime = 'cuda12.6'
+    $TorchBackend = 'cu126'
+    $RequirementsLock = 'requirements-windows-cu126.lock.txt'
+}
+Write-Host "Detected compute capability $ComputeCapabilityText; selecting $ComputeRuntime."
+$ReleaseKey = "$($BootstrapManifest.version)-$ComputeRuntime"
+$VersionRoot = Join-Path $InstallRoot "versions\$ReleaseKey"
 
 if (Test-Path -LiteralPath $VersionRoot) {
     Remove-Item -LiteralPath $VersionRoot -Recurse -Force
@@ -85,12 +110,12 @@ Write-Stage 4 'Creating an isolated MARP worker environment...'
 if ($LASTEXITCODE -ne 0) { throw 'Worker runtime creation failed.' }
 $Python = Join-Path $Runtime 'Scripts\python.exe'
 
-Write-Stage 5 'Installing CUDA 12.6 inference requirements. This is the longest step...'
+Write-Stage 5 "Installing $ComputeRuntime inference requirements. This is the longest step..."
 $Wheel = Get-ChildItem -LiteralPath (Join-Path $PayloadRoot 'wheels') -Filter 'cython_bbox-*.whl' | Select-Object -First 1
 if (-not $Wheel) { throw 'The prebuilt ByteTrack dependency is missing.' }
 & $Uv pip install --python $Python --no-deps $Wheel.FullName
 if ($LASTEXITCODE -ne 0) { throw 'ByteTrack dependency installation failed.' }
-& $Uv pip sync --python $Python (Join-Path $PayloadRoot 'requirements-windows-cu126.lock.txt') --torch-backend cu126
+& $Uv pip sync --python $Python (Join-Path $PayloadRoot $RequirementsLock) --torch-backend $TorchBackend
 if ($LASTEXITCODE -ne 0) { throw 'Worker dependency installation failed.' }
 
 $SourceRoot = Join-Path $VersionRoot 'source'
@@ -113,7 +138,7 @@ Move-Item -LiteralPath (Join-Path $ChromeExtract 'chrome-win') -Destination (Joi
     version = $BootstrapManifest.version
     platform = 'windows'
     architecture = 'x86_64'
-    compute_runtime = $BootstrapManifest.compute_runtime
+    compute_runtime = $ComputeRuntime
     entrypoint = 'runtime/Scripts/marp-worker.exe'
 } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $VersionRoot 'manifest.json') -Encoding utf8
 
@@ -170,6 +195,14 @@ if (-not $Healthy) {
         Stop-Process -Id $WorkerProcess.Id -Force -ErrorAction SilentlyContinue
     }
     throw 'The worker installed but did not report healthy enrollment and GPU discovery.'
+}
+
+# CUDA being visible is weaker than CUDA being usable. A wheel compiled without
+# this GPU's kernels reports a healthy device but fails on the first job, so setup
+# launches and synchronizes one real kernel before declaring the machine ready.
+& $Python -c "import torch; x = torch.ones(1, device='cuda'); assert x.item() == 1; torch.cuda.synchronize()"
+if ($LASTEXITCODE -ne 0) {
+    throw "$ComputeRuntime installed, but it cannot execute CUDA work on compute capability $ComputeCapabilityText."
 }
 
 Remove-Item -LiteralPath $UvArchive, $ChromeArchive -Force -ErrorAction SilentlyContinue

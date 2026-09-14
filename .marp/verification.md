@@ -1,72 +1,57 @@
-# Verification — inference watch mode
+---
+task: MarineAppliedResearch/marp-inference-worker#18
+status: awaiting-plan-review
+---
 
-## Approved scope
+## What this verifies
 
-The human approved the watch-mode portions of this plan on 2026-09-14. Packaging,
-installation, activation, updates, and volunteer compute controls are excluded.
+This is the installer and worker half of the second-computer pilot. It verifies a person can
+open one small setup application on a supported Windows NVIDIA computer and reach a running,
+separately enrolled worker without installing Python, Node, Git, a browser, CUDA toolkit, or
+a compiler themselves.
 
-## Automated checks
+## Focused automated checks
 
-- **R1, R7-R9** — Run the focused worker watch/channel and runner gate tests.
-- **R2, R4-R5, R11-R12** — Run the player's live presenter unit test and production build.
-- **R6** — Confirm the server binds loopback and the page payload contains no remote URL or
-  credentials through the focused worker test and code inspection.
+1. Run `pytest tests/test_installed_worker.py tests/test_coordinator_contract.py
+   tests/test_job_runner.py`. These checks prove DPAPI protection, verified side-by-side
+   update staging, path-traversal rejection, worker-bound artifact requests, and that the
+   installer integration did not break job execution.
+2. Parse both PowerShell scripts and compile the Inno Setup definition. Inspect the resulting
+   build manifest and require the setup executable to remain below 20 MiB. Inspect its file
+   table to confirm it does not contain Python, PyTorch, Chromium, model weights, or a completed
+   worker runtime.
+3. Corrupt one downloaded-component hash in an isolated copied payload and run only the
+   download verifier. Setup must stop before extracting or executing those bytes. Restore the
+   committed lock afterward.
 
-## System checks
+## Real clean-machine installation
 
-- **R1-R8, R12-R13** — Run one real API job with `params.watch: true` and the worker in
-  window mode. Confirm the local window, labels, stable colors, persistence, status, close,
-  and headless continuation.
-- **R3, R9** — Run the same real model, media, and frame range with watch off and on; compare
-  observation artifacts byte-for-byte and record both throughputs.
-- Confirm `params.watch` absent and false remain headless.
+1. Uninstall any earlier MARP worker from the second Windows computer and ensure no worker,
+   Python, Node, Git, Chrome/Chromium, CUDA toolkit, or C++ build tool from this workspace is
+   available to the installer.
+2. Create a one-time activation code through the issue #189 API, open the unsigned development
+   setup application once, enter the API address and code, and make no other installation
+   action. Record setup's component progress and any failure verbatim.
+3. Confirm setup does not finish until local `/health` is OK, `/status` says enrolled, and the
+   reported capabilities name the real NVIDIA GPU. Confirm the machine has its own worker row,
+   its protected credential file does not contain the bearer text, and the sign-in startup
+   shortcut launches visible watch mode by default.
+4. Restart the installed worker through its stable launcher. It must reuse the same machine
+   identity and credential and must update the existing worker row rather than create another.
+5. Assign one real inference job through the API. The second computer must download and verify
+   the registered model through MARP_API, reuse it from cache on a second request, run on CUDA,
+   report progress/results, and open the existing player watch window with live boxes.
+6. Revoke only this machine's token. Its next request must fail while the first computer's
+   worker remains able to poll. Then issue a fresh activation code before further pilot use.
 
 ## Not covered
 
-- Installer size or behavior, clean-machine setup, activation, self-update, volunteer
-  controls, remote viewing, and production deployment.
+- The development setup is unsigned. A public volunteer build remains blocked on purchasing
+  and configuring a Windows code-signing certificate.
+- Automatic fleet rollout and rollback are not exercised here; the stable layout and release
+  metadata are prepared for that later milestone.
+- No production `mare_v1` mutation is performed.
 
 ## Results
 
-- **Worker focused tests — PASS.** `33 passed in 18.24s` across the runner gate and ordered
-  watch-channel tests.
-- **Player presenter/build/host pack — PASS.** The presenter passed `2/2`; all three
-  production bundles built; the offline host ZIP contains `live.html` and its standalone
-  player bundle. The build retains one pre-existing duplicate `onUnitReady` warning in
-  `src/audio-output.js`.
-- **Real API/database/Jellyfin/GPU comparison — PASS.** The isolated API resolved the live
-  Jellyfin item, a real worker leased both jobs, and PyTorch ran the CAMPA model on the RTX
-  4080 SUPER. Watch off processed 300 frames in 8.75 s (34.29 fps); watch on processed the
-  same range in 24.20 s (12.39 fps). Both produced the same 20,992-byte observation artifact
-  with SHA-256 `78a42ec94592689391e2e92e8cc1db2004a841bc35da88b3714fd10dc4cee1e1`.
-- **Display isolation — PASS.** The visible run's substantially lower measured rate and
-  matching artifact confirm browser acknowledgements applied backpressure without changing
-  scientific output. The loopback and close-to-headless paths are covered by the focused
-  channel tests and source review.
-
-The first real submissions exposed three environment/harness problems before the passing
-run: the API required the seeder-reported model identity; the local environment had a CPU
-PyTorch wheel despite a healthy GPU; and a retried earlier job was ahead of the newly
-submitted job. The local CUDA 12.6 wheel was restored and verified with a real CUDA kernel,
-and the disposable queue was cleared before the recorded comparison.
-
-An attempted installer build measured 3,058,143,651 bytes. The human rejected that delivery
-approach and corrected #11 back to watch mode only. All installer, activation, update, API
-migration, and volunteer-control changes were removed from the active branches.
-
-- **Concurrent display regression — PASS after correction.** A display-only run opened two
-  independent Chrome app windows, presented and acknowledged 900 annotated 1280×720 frames
-  in each at 30 fps, and closed both process trees at completion.
-- **Two-model full-system runs — PASS.** Two concurrent full Dive 14 jobs with `rockfish5`
-  completed 29,062 and 24,820 frames. The same two full ranges with `Star4` completed as jobs
-  106 and 107 with 29,062 and 24,820 frames. Both models came through the authenticated API
-  model route and used separate Fish and Inverts sessions respectively.
-- **Window lifecycle defects found and corrected.** Installed Chrome originally left renderer
-  children visible after its parent was terminated; Windows cancellation now terminates the
-  owned process tree. Chrome software rendering caused one concurrent surface to stop
-  repainting and was removed. Native occlusion throttling is disabled, canvas acknowledgement
-  no longer depends on animation callbacks, and the page redraws its latest frame after focus,
-  visibility restoration, or `pageshow`.
-- **Final focused checks — PASS.** `tests/test_watch_display.py`: `6 passed`; full
-  `tests/test_job_runner.py`: `31 passed`; player presenter: `2 passed`. The final player build
-  produced all three bundles with the same pre-existing duplicate `onUnitReady` warning.
+Not run. Awaiting human review of this plan.

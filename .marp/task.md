@@ -1,7 +1,7 @@
 ---
 task: MarineAppliedResearch/marp-inference-worker#18
 repos: [marp-inference-worker, marp-api]
-status: implementing
+status: awaiting-verification-plan-review
 needs: []
 ---
 
@@ -85,12 +85,11 @@ understand developer tools, runtimes, browsers, or packages.
 
 ## Test plan
 
-Written at G3 after the pilot implementation is assembled. It will name focused manifest,
-download, activation, credential, launcher, and clean-machine installation checks.
+See `.marp/verification.md`; awaiting human review before execution.
 
 ## Status
 
-- **Gate:** implementing
+- **Gate:** awaiting verification plan review
 - **Notes:** All material product, distribution, security, and first-platform decisions were
   answered during issue #11 and carried here. The old branch is source material, not a base:
   issue #18 starts from current `develop` and deliberately excludes its monolithic payload.

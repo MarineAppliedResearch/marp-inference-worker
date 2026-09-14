@@ -24,6 +24,8 @@ back to box area.
   remains JSON serializable for the existing MARP_API ingest consumer.
 - **R5** — Keyframe selection, start/middle/end labels, frame numbers, and directional box
   padding remain unchanged.
+- **R6** — Numeric and null keyframe confidence survive the real MARP_API coordinator result
+  flow and are stored unchanged in a disposable PostgreSQL database.
 
 ## Open assumptions
 
@@ -56,7 +58,9 @@ back to box area.
    keyframes and that an undetected selected frame remains null.
 3. Confirm the complete observation payload serializes those values in the shape consumed by
    MARP_API.
-4. Write the G3 verification plan for human review before running it.
+4. Submit an observations artifact through MARP_API's real job-result HTTP flow and compare
+   every persisted keyframe confidence with the artifact.
+5. Write the G3 verification plan for human review before running it.
 
 ## Acceptance criteria
 
@@ -66,6 +70,8 @@ back to box area.
 - A selected predicted frame produces `"confidence": null` after JSON serialization.
 - Existing keyframe selection, labels, frame numbers, and padded coordinates are unchanged.
 - No MARP_API code or database migration is required.
+- MARP_API's real result-ingest path stores both numeric and null keyframe confidence in its
+  disposable PostgreSQL database.
 
 ## Test plan
 
@@ -83,4 +89,6 @@ review before anything is run.
   A1 and A2 were answered by Isaac on 2026-09-13. The implementation and focused tests are
   written. The approved focused verification passed all three selected pipeline tests. Ruff
   found five pre-existing issues also present on `origin/develop`; none points to an issue #9
-  addition. The G4 evidence awaits human review.
+  addition. The full worker tracking file passed 16/16. A fresh MARP_API workspace from the
+  merged #157 `develop` persisted numeric and null confidence through the real HTTP result
+  flow; its complete GPU subsystem passed 96/96. The G4 evidence awaits human review.

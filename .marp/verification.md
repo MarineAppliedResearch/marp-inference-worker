@@ -17,6 +17,7 @@
 | R3 | `test_a_predicted_keyframe_keeps_an_explicit_null_confidence` | pipeline | A keyframe selected from ByteTrack's prediction-only tail retains an explicit null instead of borrowing a nearby detection's score. |
 | R4 | Both new tests | pipeline/serialization | `build_observation` preserves the reduced keyframes and JSON serialization retains numeric confidence and null in the payload sent toward MARP_API. |
 | R5 | `test_full_pipeline_produces_one_observation_for_one_animal` | pipeline regression | The existing registered `v3_dirpad/1` path still reduces a real accumulated track, labels its first and last keyframes, and preserves the reduction identity through observation shaping. |
+| R6 | MARP_API `gpu-observation-ingest.test.js` › `persists numeric and null keyframe confidence from a worker result` | HTTP + PostgreSQL | A submitted and leased job accepts an uploaded observations artifact, publishes it, automatically ingests it, and stores every numeric or null keyframe confidence unchanged. |
 
 **Choosing the tier is the decision that matters.** A rendering defect passes every
 store-level check. A rule defect passes every browser test that never exercises it. A fix
@@ -62,8 +63,10 @@ Then lint only the changed Python files:
 
 - No GPU or real model run is planned. Confidence is already present before reduction, and
   this defect is entirely in the pure-Python output shaping after tracking.
-- No MARP_API or database suite is planned. Its existing ingest maps numeric
-  `keyframe.confidence` and stores null otherwise; issue #9 requires no API or schema change.
+- MARP_API verification uses its real application, HTTP routes, and disposable PostgreSQL
+  database. Its historical job-1256 artifact predates this field, so the persistence check
+  attaches explicit numeric and null contract sentinels to real observation/keyframe geometry;
+  the worker pipeline tests prove how the producer obtains each value.
 - The tests do not freeze exact padded coordinates. The source diff is additive at the output
   dictionary, while the existing pipeline regression keeps the padding path active.
 
@@ -171,3 +174,41 @@ Found 5 errors.
 
 No Ruff finding points to an issue #9 addition. The unrelated baseline findings were left
 unchanged under the task's scope rule.
+
+### Complete worker tracking file — PASS
+
+```powershell
+.\.venv312\Scripts\python -m pytest -p no:cacheprovider --basetemp .marp\local\pytest-9-full tests/test_tracking_pipeline.py
+```
+
+```text
+collected 16 items
+tests\test_tracking_pipeline.py ................                         [100%]
+============================= 16 passed in 2.31s ==============================
+```
+
+### Real MARP_API and PostgreSQL persistence — PASS
+
+The API-side regression ran in a fresh isolated MARP_API workspace created from merged
+`origin/develop` after #157. It submitted and leased a job, uploaded an observations artifact,
+reported success, let the result route trigger automatic ingest, and queried the resulting
+`keyframes` rows from that workspace's disposable database.
+
+Focused result:
+
+```text
+Test: [gpu-observation-ingest.test.js] Ingesting a real result file > persists numeric and null keyframe confidence …... PASS
+Test Suites : 1 passed, 0 failed, 1 total
+Tests       : 1 passed, 0 failed, 37 skipped, 38 total
+Duration    : 1.4s
+Result: ALL TESTS PASSED
+```
+
+Complete API GPU subsystem:
+
+```text
+Test Suites : 5 passed, 0 failed, 5 total
+Tests       : 96 passed, 0 failed, 0 skipped, 96 total
+Duration    : 12.4s
+Result: ALL TESTS PASSED
+```

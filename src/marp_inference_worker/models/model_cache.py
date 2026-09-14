@@ -119,7 +119,14 @@ def get_artifact_cache_path(model_spec: ModelSpec) -> Path:
     # Derive the output filename from the artifact locator.
     artifact_name = Path(urlparse(model_spec.artifact.url).path).name
     if not artifact_name:
-        artifact_name = f"{cache_key}.bin"
+        artifact_name = cache_key
+
+    # API resource routes end in `/artifact`, not the host filename. Engines
+    # such as Ultralytics select their loader from the local suffix, so retain
+    # the format declared in the model spec when the route has no extension.
+    if not Path(artifact_name).suffix:
+        suffix = ".pt" if model_spec.artifact.format in {"pt", "ultralytics_pt"} else ".bin"
+        artifact_name = f"{artifact_name}{suffix}"
 
     # Return models/cache/<key>/<artifact_name>.
     return _CACHE_ROOT / cache_key / artifact_name
@@ -144,7 +151,11 @@ def is_remote_url(locator: str) -> bool:
 # Use this rather than urlretrieve, which takes no timeout. The download lands
 # on a temporary name and is renamed on completion, so an interrupted fetch
 # cannot leave a partial file that the next run would find and trust.
-def download_artifact(url: str, destination: Path) -> None:
+def download_artifact(
+    url: str,
+    destination: Path,
+    request_headers: dict[str, str] | None = None,
+) -> None:
 
     # Imported here because the API process may never fetch anything.
     import httpx
@@ -154,7 +165,13 @@ def download_artifact(url: str, destination: Path) -> None:
 
     # Stream to disk; a model file is far too large to hold in memory.
     try:
-        with httpx.stream("GET", url, timeout=_FETCH_TIMEOUT_S, follow_redirects=True) as response:
+        with httpx.stream(
+            "GET",
+            url,
+            headers=request_headers,
+            timeout=_FETCH_TIMEOUT_S,
+            follow_redirects=True,
+        ) as response:
             response.raise_for_status()
             with partial_path.open("wb") as file_handle:
                 for chunk in response.iter_bytes(_CHUNK_BYTES):
@@ -175,7 +192,10 @@ def download_artifact(url: str, destination: Path) -> None:
 # Output: cache state dictionary for API responses and manager state.
 # Use this before engine load, so engines always receive a local path to an
 # artifact whose hash has been checked.
-def ensure_artifact_cached(model_spec: ModelSpec) -> dict[str, object]:
+def ensure_artifact_cached(
+    model_spec: ModelSpec,
+    request_headers: dict[str, str] | None = None,
+) -> dict[str, object]:
 
     # Compute deterministic cache key and artifact target path.
     cache_key = get_cache_key(model_spec)
@@ -201,7 +221,7 @@ def ensure_artifact_cached(model_spec: ModelSpec) -> dict[str, object]:
 
     # Fetch or copy the artifact into the cache path.
     if is_remote_url(model_spec.artifact.url):
-        download_artifact(model_spec.artifact.url, artifact_path)
+        download_artifact(model_spec.artifact.url, artifact_path, request_headers=request_headers)
         cache_action = "downloaded"
     else:
         # Copy local artifacts into cache for local development workflows.

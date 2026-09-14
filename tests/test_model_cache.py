@@ -17,6 +17,9 @@ from pathlib import Path
 
 # UUID creates unique model IDs so cache tests do not reuse prior artifacts.
 from uuid import uuid4
+import hashlib
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from threading import Thread
 
 
 # test_cache_key_uses_model_id_without_hash()
@@ -151,3 +154,49 @@ def test_local_artifact_is_copied_into_cache(tmp_path: Path) -> None:
 
     # Confirm the cached file contains the expected bytes.
     assert Path(cache_state["artifact_path"]).read_bytes() == b"fake model bytes"
+
+
+def test_authenticated_download_is_verified_then_reused(tmp_path: Path, monkeypatch) -> None:
+    payload = b"served model bytes"
+    requests = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            requests.append(self.headers.get("Authorization"))
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, _format, *args) -> None:
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    monkeypatch.setattr(model_cache, "_CACHE_ROOT", tmp_path / "cache")
+
+    try:
+        spec = ModelSpec(
+            model_id=f"served-{uuid4().hex}",
+            engine="mock",
+            model_arch="mock",
+            task="detect",
+            artifact={
+                "url": f"http://127.0.0.1:{server.server_port}/model.pt",
+                "format": "pt",
+                "sha256": hashlib.sha256(payload).hexdigest(),
+            },
+        )
+        headers = {"Authorization": "Bearer worker-test-token"}
+        first = model_cache.ensure_artifact_cached(spec, request_headers=headers)
+        second = model_cache.ensure_artifact_cached(spec, request_headers=headers)
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+    assert requests == ["Bearer worker-test-token"]
+    assert first["cache_action"] == "downloaded"
+    assert second["cache_action"] == "cached"
+    assert Path(second["artifact_path"]).read_bytes() == payload

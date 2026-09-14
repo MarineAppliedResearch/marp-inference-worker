@@ -557,6 +557,7 @@ class JobRunner:
         if not model.sha256:
             raise ValueError("job spec's model carried no sha256")
 
+        artifact_url, artifact_headers = self._client.resolve_artifact_url(model.url or model.name)
         cache_state = model_cache.ensure_artifact_cached(
             ModelSpec(
                 model_id=model.name,
@@ -564,11 +565,12 @@ class JobRunner:
                 model_arch="unknown",
                 task="detect",
                 artifact=ArtifactSpec(
-                    url=model.url or model.name,
+                    url=artifact_url,
                     format="pt",
                     sha256=model.sha256,
                 ),
-            )
+            ),
+            request_headers=artifact_headers,
         )
         params["model_path"] = cache_state["artifact_path"]
         params["model_sha256"] = cache_state["sha256"]

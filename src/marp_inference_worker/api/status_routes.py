@@ -16,9 +16,11 @@ from fastapi import APIRouter
 
 # Pydantic validates the pause request body.
 from pydantic import BaseModel
+from typing import Literal
 
 # The shared worker state, written by the runner and read here.
 from marp_inference_worker.jobs.worker_state import WORKER_STATE
+from marp_inference_worker.installation.operator_control import write_action
 
 # The engine registry reports what this worker can run.
 from marp_inference_worker.engines import engine_registry
@@ -39,6 +41,14 @@ class PauseRequest(BaseModel):
 
     # Optional free-text note shown in /status while paused.
     reason: str | None = None
+
+
+class ControlRequest(BaseModel):
+    action: Literal["finish", "stop", "resume"]
+
+
+class ScreenRequest(BaseModel):
+    mode: Literal["off", "window", "fullscreen"]
 
 
 # get_worker_status()
@@ -75,10 +85,31 @@ async def get_worker_status() -> dict[str, object]:
 @router.post("/pause")
 async def set_paused(request: PauseRequest) -> dict[str, object]:
 
-    # Record the flag and the reason; the runner reads it on its next pass and
-    # reports zero free slots, which is how it stops being offered work.
-    WORKER_STATE.set_paused(request.paused, reason=request.reason)
+    # Keep the original endpoint as an alias for Finish up and Resume. If it
+    # changed only the in-memory flag, a restart could unexpectedly take work,
+    # or it could contradict a durable Stop now selection.
+    action = "finish" if request.paused else "running"
+    write_action(action)
+    WORKER_STATE.set_operator_action(action)
+    if request.paused and request.reason:
+        WORKER_STATE.set_paused(True, reason=request.reason)
 
     # Return the new state, so the caller does not have to poll /status to see
     # whether the change took.
+    return WORKER_STATE.describe()
+
+
+@router.post("/control")
+async def control_worker(request: ControlRequest) -> dict[str, object]:
+    action = "running" if request.action == "resume" else request.action
+    write_action(action)
+    WORKER_STATE.set_operator_action(action)
+    return WORKER_STATE.describe()
+
+
+@router.post("/screen")
+async def set_screen_mode(request: ScreenRequest) -> dict[str, object]:
+    # A start-menu launch reaches the already-running sign-in worker here. The
+    # policy applies to later jobs; an existing job keeps the window it owns.
+    WORKER_STATE.set_screen_mode(request.mode)
     return WORKER_STATE.describe()

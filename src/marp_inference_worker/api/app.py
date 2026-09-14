@@ -9,6 +9,7 @@
 
 # FastAPI creates the application object and route registry.
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 
 # Route modules are imported here so the application factory can register them.
 from marp_inference_worker.api.health_routes import router as health_router
@@ -34,6 +35,16 @@ def create_app() -> FastAPI:
         title="MARP Inference Worker",
         version="0.1.0",
         description="Agnostic inference worker for frame and video-range model inference.",
+    )
+
+    # A watched job serves its player from a child-owned random loopback port.
+    # Permit that page to call the worker-local controls without making the
+    # operator API reachable from another machine.
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origin_regex=r"^http://127\.0\.0\.1:\d+$",
+        allow_methods=["GET", "POST"],
+        allow_headers=["content-type"],
     )
 
     # Register health routes so external tools can verify the worker is alive.

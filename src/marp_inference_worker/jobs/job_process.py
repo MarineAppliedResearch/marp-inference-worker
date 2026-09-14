@@ -113,6 +113,8 @@ class JobProcess:
 
         # Set once the parent has asked it to stop, so it is only asked once.
         self.stop_requested = False
+        self.stop_requested_at: float | None = None
+        self.yield_requested = False
 
     # start()
     # Writes the job's envelope and launches the child process.
@@ -307,7 +309,18 @@ class JobProcess:
 
         # Creating the file is the whole signal, and it is idempotent.
         self.stop_file.touch(exist_ok=True)
+        if not self.stop_requested:
+            self.stop_requested_at = time.monotonic()
         self.stop_requested = True
+
+    def stop_elapsed_s(self) -> float:
+        if self.stop_requested_at is None:
+            return 0.0
+        return max(0.0, time.monotonic() - self.stop_requested_at)
+
+    def request_yield(self) -> None:
+        self.yield_requested = True
+        self.request_stop()
 
     # is_running()
     # Whether the child process is still alive.

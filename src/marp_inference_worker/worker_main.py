@@ -57,19 +57,25 @@ def build_runner(screen_mode: str = "window"):
     from marp_inference_worker.jobs.coordinator_client import CoordinatorClient
     from marp_inference_worker.jobs.runner import JobRunner
     from marp_inference_worker.jobs.worker_state import WORKER_STATE
+    from marp_inference_worker.installation.operator_control import read_action
+
+    # State and its protected credential survive versions and restarts.
+    state_dir = Path(os.environ.get(_STATE_DIR_ENV) or (Path("data") / "worker"))
 
     # One token configures the worker.
     service_token = os.environ.get(_TOKEN_ENV)
     if not service_token:
-        raise RuntimeError(f"{_TOKEN_ENV} is not set; a worker is configured by one token")
+        from marp_inference_worker.installation.activation import credential_path
+        from marp_inference_worker.installation.credential_store import load
+
+        service_token = load(credential_path(state_dir))
+    if not service_token:
+        raise RuntimeError("this worker is not activated")
 
     # And one address to reach MARP at.
     coordinator_url = os.environ.get(_COORDINATOR_ENV)
     if not coordinator_url:
         raise RuntimeError(f"{_COORDINATOR_ENV} is not set")
-
-    # State lives on local disk and has to survive a restart.
-    state_dir = Path(os.environ.get(_STATE_DIR_ENV) or (Path("data") / "worker"))
 
     # Build the client and the runner.
     client = CoordinatorClient(base_url=coordinator_url, service_token=service_token)
@@ -84,6 +90,8 @@ def build_runner(screen_mode: str = "window"):
     # poll, and so an operator can see what the machine reported.
     capabilities = runner.capabilities()
     WORKER_STATE.set_capabilities(capabilities, slot_count=int(capabilities["slots"]))
+    WORKER_STATE.set_operator_action(read_action())
+    WORKER_STATE.set_screen_mode(screen_mode)
 
     return runner
 
@@ -121,7 +129,24 @@ def main() -> None:
         default="window",
         help="permit watched jobs to open a local display",
     )
+    parser.add_argument("--activate-code-file", help=argparse.SUPPRESS)
+    parser.add_argument("--coordinator-url", help=argparse.SUPPRESS)
+    parser.add_argument("--state-dir", help=argparse.SUPPRESS)
     args = parser.parse_args()
+
+    if args.activate_code_file:
+        from marp_inference_worker.installation.activation import activate
+
+        code_path = Path(args.activate_code_file)
+        try:
+            coordinator = args.coordinator_url or os.environ.get(_COORDINATOR_ENV)
+            if not coordinator:
+                raise RuntimeError("coordinator URL is required for activation")
+            state_dir = Path(args.state_dir or os.environ.get(_STATE_DIR_ENV) or (Path("data") / "worker"))
+            activate(coordinator, code_path.read_text(encoding="utf-8").strip(), state_dir)
+        finally:
+            code_path.unlink(missing_ok=True)
+        return
 
     # uvicorn serves the operator API.
     import uvicorn

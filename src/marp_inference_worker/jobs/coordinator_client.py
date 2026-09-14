@@ -286,6 +286,29 @@ class CoordinatorClient:
             raise CoordinatorError("enrol returned 204 with no worker record")
         return result
 
+    def check_in(
+        self,
+        worker_id: str,
+        installed_version: str,
+        platform: str,
+        architecture: str,
+        compute_runtime: str,
+        update_state: str | None = None,
+        update_message: str | None = None,
+    ) -> dict[str, Any]:
+        body: dict[str, Any] = {
+            "installed_version": installed_version,
+            "platform": platform,
+            "architecture": architecture,
+            "compute_runtime": compute_runtime,
+        }
+        if update_state:
+            body["update_state"] = update_state
+        if update_message:
+            body["update_message"] = update_message
+        result = self._post(f"/workers/{coordinator_id(worker_id, 'worker_id')}/check-in", body)
+        return result if result is not None else {}
+
     # poll()
     # Long-polls for one job.
     # Inputs: worker id, how many slots are free, and the engines available here.
@@ -482,6 +505,7 @@ class CoordinatorClient:
         outcome: str,
         artifacts: list[dict[str, Any]] | None = None,
         failure_reason: str | None = None,
+        completed_through_frame: int | None = None,
     ) -> dict[str, Any]:
 
         # Outcome is the worker's verdict: succeeded, failed or cancelled.
@@ -503,6 +527,8 @@ class CoordinatorClient:
         # Only for a failure or a cancellation; a success has nothing to explain.
         if failure_reason:
             body["failure_reason"] = failure_reason
+        if completed_through_frame is not None:
+            body["completed_through_frame"] = completed_through_frame
 
         result = self._post(f"/attempts/{attempt_id}/result", body)
         return result if result is not None else {}

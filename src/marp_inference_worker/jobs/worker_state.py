@@ -63,7 +63,9 @@ class WorkerState:
 
         # Whether this worker is taking new work.
         self._paused = False
+        self._operator_action = "running"
         self._pause_reason: str | None = None
+        self._screen_mode = "off"
 
         # The jobs currently running, as the runner described them.
         self._jobs: list[dict[str, Any]] = []
@@ -136,6 +138,26 @@ class WorkerState:
         with self._lock:
             return self._paused
 
+    def set_operator_action(self, action: str) -> None:
+        with self._lock:
+            self._operator_action = action
+            self._paused = action != "running"
+            self._pause_reason = None if action == "running" else f"operator selected {action}"
+
+    def operator_action(self) -> str:
+        with self._lock:
+            return self._operator_action
+
+    def set_screen_mode(self, mode: str) -> None:
+        if mode not in {"off", "window", "fullscreen"}:
+            raise ValueError(f"unknown screen mode: {mode}")
+        with self._lock:
+            self._screen_mode = mode
+
+    def screen_mode(self) -> str:
+        with self._lock:
+            return self._screen_mode
+
     # note_error()
     # Records something that went wrong, for the operator to see.
     # Inputs: the message.
@@ -175,6 +197,8 @@ class WorkerState:
                 "status": status,
                 "paused": self._paused,
                 "pause_reason": self._pause_reason,
+                "operator_action": self._operator_action,
+                "screen_mode": self._screen_mode,
                 "version": worker_version(),
                 "uptime_s": round(time.time() - self._started_at, 1),
                 "slots": {

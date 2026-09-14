@@ -39,11 +39,22 @@ dev = [
     "httpx",
     "ruff",
 ]
+build = [
+    "pyinstaller==6.22.2",
+]
+windows-cu126 = [
+    # Runtime wheels come from PyTorch's CUDA 12.6 index. The Windows build
+    # script supplies that index explicitly and installs the compiled lock.
+    "torch==2.14.0+cu126",
+    "torchvision==0.29.0+cu126",
+]
 
 [project.scripts]
 # The process a GPU machine actually runs: the outbound job loop plus the
 # operator's loopback API.
 marp-worker = "marp_inference_worker.worker_main:main"
+marp-worker-activate = "marp_inference_worker.installation.activation:main"
+marp-worker-launcher = "marp_inference_worker.installation.launcher:main"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -16,6 +16,7 @@
 
 # json reads and writes the in-flight record used to report a lost job.
 import json
+import os
 import socket
 
 # time paces the loop and the heartbeat interval.
@@ -47,6 +48,7 @@ from marp_inference_worker.jobs.job_process import JobProcess
 
 # The job spec schema, and how a heartbeat action is read.
 from marp_inference_worker.jobs.job_spec import AttemptEnvelope, is_stop_action
+from marp_inference_worker.installation.platform_info import current_platform, installed_compute_runtime
 
 # Model caching, which verifies the artifact hash before use.
 from marp_inference_worker.models import model_cache
@@ -88,6 +90,8 @@ _ERROR_BACKOFF_S = 30.0
 # A cooperative stop lands within one should_stop() check, so this is generous;
 # a child still running after it is wedged, not slow.
 _STOP_GRACE_S = 60.0
+
+_UPDATE_CHECK_INTERVAL_S = 60.0
 
 
 # _failure_reason()
@@ -146,7 +150,7 @@ class JobRunner:
 
         # The object the FastAPI app reads for /status and writes for pause.
         self._state = worker_state
-        self._screen_mode = screen_mode
+        self._state.set_screen_mode(screen_mode)
 
         # One job per GPU slot. A machine with no GPU still gets one slot, so
         # it can run a CPU job that explicitly asked for CPU.
@@ -162,6 +166,9 @@ class JobRunner:
 
         # This worker's durable identity.
         self.identity: WorkerIdentity | None = None
+        self._draining_for_update = False
+        self._desired_release: dict[str, Any] | None = None
+        self._last_update_check = 0.0
 
     # capabilities()
     # Describes this machine, for enrolment and for /status.
@@ -380,6 +387,7 @@ class JobRunner:
         # Report a job that did not survive the last restart, before taking new
         # work, so MARP can re-queue it promptly.
         self.report_lost_job()
+        self._check_for_update(force=True)
 
         # The loop. Each pass services what is running and then, if there is
         # room, asks for one more job.
@@ -387,8 +395,13 @@ class JobRunner:
             try:
                 self._service_running_jobs()
 
+                self._check_for_update()
+                if self._draining_for_update and not self._jobs_by_slot:
+                    self._stage_requested_update()
+                    return
+
                 # Only ask for work when there is somewhere to put it.
-                if self.free_slots() > 0:
+                if not self._draining_for_update and self.free_slots() > 0:
                     took_work = self._poll_once()
 
                     # Nothing offered: wait before asking again. This is the
@@ -407,17 +420,78 @@ class JobRunner:
                 time.sleep(_ERROR_BACKOFF_S)
 
             except Exception as error:
-                # Anything else, recorded and survived rather than allowed to
-                # end the loop.
-                #
-                # This thread *is* the worker, and an exception out of it leaves
-                # a process that serves /status, says it is idle, and will never
-                # take work again -- which is exactly what happened when a
-                # transport error escaped the clause above. A worker that keeps
-                # failing loudly can be diagnosed; one that quietly stops
-                # cannot.
+                # This thread is the worker. Keep unexpected failures loud and
+                # recoverable instead of leaving an idle-looking dead loop.
                 self._state.note_error(f"{type(error).__name__}: {error}")
                 time.sleep(_ERROR_BACKOFF_S)
+
+    def _check_for_update(self, force: bool = False) -> None:
+        if self.identity is None or self.identity.worker_id is None:
+            return
+        now = time.monotonic()
+        if not force and now - self._last_update_check < _UPDATE_CHECK_INTERVAL_S:
+            return
+        self._last_update_check = now
+        system, architecture = current_platform()
+        report_path = self._state_dir / "switch-result.json"
+        report = json.loads(report_path.read_text(encoding="utf-8")) if report_path.is_file() else {}
+        response = self._client.check_in(
+            self.identity.worker_id,
+            worker_version(),
+            system,
+            architecture,
+            installed_compute_runtime(),
+            update_state=report.get("update_state"),
+            update_message=report.get("message"),
+        )
+        if report:
+            report_path.unlink(missing_ok=True)
+        desired = response.get("desired_release")
+        if desired and (
+            str(desired.get("version")) != worker_version()
+            or str(desired.get("compute_runtime")) != installed_compute_runtime()
+        ):
+            self._desired_release = desired
+            self._draining_for_update = True
+            self._state.set_paused(True, "draining for requested update")
+
+    def _stage_requested_update(self) -> None:
+        if not self._desired_release or self.identity is None or self.identity.worker_id is None:
+            return
+        from marp_inference_worker.installation.updater import UpdateInstaller
+
+        system, architecture = current_platform()
+        self._client.check_in(
+            self.identity.worker_id,
+            worker_version(),
+            system,
+            architecture,
+            installed_compute_runtime(),
+            update_state="updating",
+        )
+        try:
+            installer = UpdateInstaller(self._state_dir)
+            installer.stage(self._desired_release)
+        except Exception as error:
+            self._client.check_in(
+                self.identity.worker_id,
+                worker_version(),
+                system,
+                architecture,
+                installed_compute_runtime(),
+                update_state="failed",
+                update_message=f"{type(error).__name__}: {error}",
+            )
+            self._state.note_error(f"update failed: {type(error).__name__}: {error}")
+            self._draining_for_update = False
+            self._desired_release = None
+            if self._state.operator_action() == "running":
+                self._state.set_paused(False)
+            return
+
+        # The stable launcher owns switching versions and rollback. Exit 75 is
+        # its explicit instruction to consume pending-update.json.
+        os._exit(75)
 
     # _poll_once()
     # Long-polls for one job and starts it if one was offered.
@@ -513,8 +587,9 @@ class JobRunner:
         # still learns nothing about MARP or the coordinator.
         spec = envelope.spec.model_dump(mode="json")
         spec["params"] = prepared_params
-        if self._screen_mode != "off" and prepared_params.get("watch") is True:
-            spec["params"]["_watch_screen_mode"] = self._screen_mode
+        screen_mode = self._state.screen_mode()
+        if screen_mode != "off" and prepared_params.get("watch") is True:
+            spec["params"]["_watch_screen_mode"] = screen_mode
 
         # Create and launch the child.
         job = JobProcess(
@@ -590,6 +665,11 @@ class JobRunner:
     # received and acted on, and where a finished job is reported (R5).
     def _service_running_jobs(self) -> None:
 
+        if self._state.operator_action() == "stop":
+            for job in self._jobs_by_slot.values():
+                if not job.stop_requested:
+                    job.request_yield()
+
         # Iterate over a copy: finishing a job mutates the mapping.
         for slot_index, job in list(self._jobs_by_slot.items()):
 
@@ -639,7 +719,7 @@ class JobRunner:
             # A job that was asked to stop and has not is killed once the grace
             # period is up. It then reports nothing about itself, so _finish_job
             # decides the outcome on its behalf.
-            if job.stop_requested and job.current_progress()["elapsed_s"] > _STOP_GRACE_S:
+            if job.stop_requested and job.stop_elapsed_s() > _STOP_GRACE_S:
                 if not job.wait(timeout_s=0.1):
                     job.kill()
 
@@ -715,6 +795,13 @@ class JobRunner:
                 "stderr": job.collect_stderr(),
             }
 
+        completed_through_frame = None
+        if job.yield_requested:
+            outcome = "yielded"
+            summary = payload.get("summary") or {}
+            start_frame = int((job.spec.get("range") or {}).get("start_frame", 0))
+            completed_through_frame = start_frame + int(summary.get("frames_processed", 0))
+
         # Offer the results file by hash before reporting the outcome. The
         # coordinator answers `already_have` or names somewhere to put it, so
         # the bytes only move when they are actually wanted (R11).
@@ -760,6 +847,7 @@ class JobRunner:
                 outcome=outcome,
                 artifacts=delivered,
                 failure_reason=_failure_reason(outcome, payload),
+                completed_through_frame=completed_through_frame,
             )
         except CoordinatorError as error:
             self._state.note_error(f"could not report result for {job.attempt_id}: {error}")
@@ -867,6 +955,7 @@ class JobRunner:
                 "video_source": (job.spec.get("video") or {}).get("source_name"),
                 "progress": job.current_progress(),
                 "stop_requested": job.stop_requested,
+                "yield_requested": job.yield_requested,
             }
             for job in self._jobs_by_slot.values()
         ]

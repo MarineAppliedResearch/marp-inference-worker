@@ -1,0 +1,9 @@
+{
+  "name": "Chrome for Testing",
+  "version": "153.0.8010.36",
+  "platform": "windows",
+  "architecture": "x86_64",
+  "url": "https://storage.googleapis.com/chrome-for-testing-public/153.0.8010.36/win64/chrome-win64.zip",
+  "size_bytes": 205134000,
+  "sha256": "8edfaa0923c11a30a9315a5e7e5794c5efb60146edea7e3f749f7fdc2aa026cb"
+}

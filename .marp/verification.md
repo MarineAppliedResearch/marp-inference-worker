@@ -1,48 +1,55 @@
-# Verification — MarineAppliedResearch/MARP_API#187 worker
+# Verification — inference watch mode
 
-## What each test proves
+## Approved scope
 
-| Requirement | Test | Tier | Proves |
-| --- | --- | --- | --- |
-| R1, R2 | `pytest tests/test_model_artifact_auth.py` | unit | Relative URLs use the coordinator origin and bearer token; another origin never receives that token. |
-| R2, R3, R4 | `pytest tests/test_model_cache.py tests/test_model_cache_hashing.py` | loopback HTTP + filesystem | The download carries authorization, verifies bytes, removes mismatches, and makes only one request across repeated cache use. |
-| R1, R2, R5 | `pytest tests/test_job_runner.py tests/test_coordinator_contract.py` | process + HTTP contract | The runner passes the resolved locator and headers without breaking its coordinator contract. |
-| R1-R5 | Short real job sequence in the API verification plan | full system | The shipped runner interoperates with the real route, database, Jellyfin stream, and CUDA engine. |
+The human approved the watch-mode portions of this plan on 2026-09-14. Packaging,
+installation, activation, updates, and volunteer compute controls are excluded.
 
-## Requirements with no test
+## Automated checks
 
-None.
+- **R1, R7-R9** — Run the focused worker watch/channel and runner gate tests.
+- **R2, R4-R5, R11-R12** — Run the player's live presenter unit test and production build.
+- **R6** — Confirm the server binds loopback and the page payload contains no remote URL or
+  credentials through the focused worker test and code inspection.
 
-## Edge cases
+## System checks
 
-- Relative API route, same-origin absolute URL, different-origin URL, local path.
-- Valid cached file, corrupt cached file, failed partial download, and hash mismatch.
+- **R1-R8, R12-R13** — Run one real API job with `params.watch: true` and the worker in
+  window mode. Confirm the local window, labels, stable colors, persistence, status, close,
+  and headless continuation.
+- **R3, R9** — Run the same real model, media, and frame range with watch off and on; compare
+  observation artifacts byte-for-byte and record both throughputs.
+- Confirm `params.watch` absent and false remain headless.
 
-## Regression coverage
+## Not covered
 
-- Existing local-file model loading remains supported for direct development callers.
-- Existing unauthenticated public HTTP model sources do not receive the MARP token.
-
-## Known gaps
-
-- Network resume after a worker process restart is outside this focused repair.
-- Cache eviction and worker software update delivery remain separate work.
-
-## Manual steps
-
-Covered by the API repository's full-system sequence.
-
----
+- Installer size or behavior, clean-machine setup, activation, self-update, volunteer
+  controls, remote viewing, and production deployment.
 
 ## Results
 
-Run 2026-09-14 with Python 3.12.
+- **Worker focused tests — PASS.** `33 passed in 18.24s` across the runner gate and ordered
+  watch-channel tests.
+- **Player presenter/build/host pack — PASS.** The presenter passed `2/2`; all three
+  production bundles built; the offline host ZIP contains `live.html` and its standalone
+  player bundle. The build retains one pre-existing duplicate `onUnitReady` warning in
+  `src/audio-output.js`.
+- **Real API/database/Jellyfin/GPU comparison — PASS.** The isolated API resolved the live
+  Jellyfin item, a real worker leased both jobs, and PyTorch ran the CAMPA model on the RTX
+  4080 SUPER. Watch off processed 300 frames in 8.75 s (34.29 fps); watch on processed the
+  same range in 24.20 s (12.39 fps). Both produced the same 20,992-byte observation artifact
+  with SHA-256 `78a42ec94592689391e2e92e8cc1db2004a841bc35da88b3714fd10dc4cee1e1`.
+- **Display isolation — PASS.** The visible run's substantially lower measured rate and
+  matching artifact confirm browser acknowledgements applied backpressure without changing
+  scientific output. The loopback and close-to-headless paths are covered by the focused
+  channel tests and source review.
 
-- The first sandboxed invocation reported verbatim:
-  `PermissionError: [WinError 5] Access is denied: 'C:\\Users\\isaac\\AppData\\Local\\Temp\\pytest-of-isaac'`.
-  It was rerun outside that filesystem restriction.
-- Approved focused set: `72 passed in 36.15s`.
-- Post-integration suffix regression set: `19 passed in 1.24s`.
-- The first real attempt downloaded and verified the API artifact but failed because its
-  cache filename had no `.pt` suffix. After the fix, its coordinator retry succeeded.
-- Second real API/Jellyfin/CUDA job: `job=89 state=succeeded seconds=7.22 cache=True`.
+The first real submissions exposed three environment/harness problems before the passing
+run: the API required the seeder-reported model identity; the local environment had a CPU
+PyTorch wheel despite a healthy GPU; and a retried earlier job was ahead of the newly
+submitted job. The local CUDA 12.6 wheel was restored and verified with a real CUDA kernel,
+and the disposable queue was cleared before the recorded comparison.
+
+An attempted installer build measured 3,058,143,651 bytes. The human rejected that delivery
+approach and corrected #11 back to watch mode only. All installer, activation, update, API
+migration, and volunteer-control changes were removed from the active branches.

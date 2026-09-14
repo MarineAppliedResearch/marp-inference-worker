@@ -1,4 +1,4 @@
-"""Child-owned loopback server and packaged Chromium window for watch mode."""
+"""Child-owned loopback server and local Chromium window for watch mode."""
 
 import base64
 import json
@@ -156,7 +156,7 @@ class WatchDisplay:
             if not (player_root / "live.html").is_file():
                 raise FileNotFoundError(f"live player is missing from {player_root}")
             if not chromium.is_file():
-                raise FileNotFoundError(f"packaged Chromium is missing at {chromium}")
+                raise FileNotFoundError(f"Chromium is missing at {chromium}")
 
             self._server = _WatchServer(("127.0.0.1", 0), _Handler)
             self._server.channel = self._channel

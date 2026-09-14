@@ -324,7 +324,12 @@ def _job_for(
 # Builds a runner against a fake coordinator.
 # Inputs: the fake coordinator, the temporary state directory, and slot count.
 # Output: the runner and its worker state.
-def _runner(coordinator: FakeCoordinator, tmp_path: Path, slots: int = 1):
+def _runner(
+    coordinator: FakeCoordinator,
+    tmp_path: Path,
+    slots: int = 1,
+    screen_mode: str = "off",
+):
 
     state = WorkerState()
     runner = JobRunner(
@@ -332,6 +337,7 @@ def _runner(coordinator: FakeCoordinator, tmp_path: Path, slots: int = 1):
         state_dir=tmp_path / "state",
         worker_state=state,
         slot_count=slots,
+        screen_mode=screen_mode,
     )
     return runner, state
 
@@ -672,6 +678,33 @@ def test_paused_worker_reports_no_free_slots(tmp_path: Path) -> None:
 
     state.set_paused(False)
     assert runner.free_slots() == 2
+
+
+def test_watch_display_requires_both_the_machine_policy_and_job_request(tmp_path: Path) -> None:
+    cases = [
+        ("off", True, None),
+        ("fullscreen", False, None),
+        ("fullscreen", True, "fullscreen"),
+    ]
+
+    for index, (screen_mode, requested, expected) in enumerate(cases):
+        offer = _job_for(
+            tmp_path,
+            f"attempt-watch-gate-{index}",
+            frames=100,
+            frame_delay_s=0.1,
+        )
+        offer["spec"]["params"]["watch"] = requested
+        coordinator = FakeCoordinator(offers=[offer])
+        runner, _state = _runner(coordinator, tmp_path / f"case-{index}", screen_mode=screen_mode)
+        runner.ensure_enrolled()
+
+        assert runner._poll_once() is True
+        job = runner._jobs_by_slot[0]
+        assert job.spec["params"].get("_watch_screen_mode") == expected
+
+        job.kill(grace_s=1)
+        runner._service_running_jobs()
 
 
 # test_unknown_heartbeat_action_is_treated_as_continue(tmp_path)

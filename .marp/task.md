@@ -1,53 +1,85 @@
 ---
-task: MarineAppliedResearch/MARP_API#187
-repos: [MARP_API, marp-inference-worker]
-status: implementing
+task: MarineAppliedResearch/marp-inference-worker#11
+repos: [marp-inference-worker, marp-video-player]
+status: verifying
 needs: []
 ---
 
 ## Goal
 
-The worker downloads model weights from MARP API with its service credential, verifies
-them, and reuses the verified local cache when the same model version is requested again.
+An inference job may open a local screensaver-style MARP window showing the exact frames
+being processed, with the model's detections and tracks drawn as they happen.
 
 ## Requirements
 
-- **R1** — Relative API artifact URLs are resolved against the configured coordinator.
-- **R2** — Model downloads present the worker's existing bearer service credential.
-- **R3** — Downloaded and cached model bytes must match the job's SHA-256 before loading.
-- **R4** — A verified cached model is reused without another request.
-- **R5** — Existing public HTTP and local-file model cache callers remain compatible.
+- **R1** — Display requires both `--screen window|fullscreen` on the worker and
+  `params.watch: true` on the job; both default off.
+- **R2** — The local display uses marp-video-player and accepts frames already decoded by
+  inference rather than decoding the source again.
+- **R3** — Every produced frame is presented in order, without sampling, dropping, or
+  source-rate pacing. Rendering backpressure may slow an opted-in job.
+- **R4** — Each track shows a stable-color box, species, track id, and persistence with
+  legible, frame-scaled labels.
+- **R5** — A quiet status area shows frame number, achieved rate, and live-track count.
+- **R6** — The display and frame channel bind only to loopback and expose no credential or
+  remote media URL.
+- **R7** — Closing or failing the window records one warning and continues inference
+  headless.
+- **R8** — The job child owns and closes its display resources.
+- **R9** — Watch mode changes no scientific output. With display disabled it performs no
+  encoding, browser, or frame-channel work.
+- **R10** — The job option is an additive boolean engine parameter and requires no API or
+  database change.
+- **R11** — Existing marp-video-player APIs and offline host behavior remain compatible.
+- **R12** — Window/fullscreen and Escape/close are supported; pause and scrubbing are not.
+- **R13** — Concurrent watched jobs open independent windows; audio is muted.
+- **R14** — Installer, dependency distribution, self-update, activation, volunteer compute
+  controls, and remote viewing are separate work.
 
 ## Open assumptions
 
-- [x] **A1 · cross-repository · blocking** — answered 2026-09-14: MARP API serves the
-  local artifact; workers never depend on its filesystem path.
-- [x] **A2 · security/permissions · blocking** — answered 2026-09-14: reuse the worker's
-  existing MARP API bearer credential.
+- [x] **A1 · product/UI · blocking** — answered 2026-09-14: machine policy is
+  `--screen off|window|fullscreen`, default off, and the job independently requests watch.
+- [x] **A2 · performance · blocking** — answered 2026-09-14: draw every frame in order as
+  fast as inference produces it; accepted display cost is measured rather than hidden.
+- [x] **A3 · environment · blocking** — corrected 2026-09-14: issue #11 uses a browser and
+  player build supplied by the development checkout. Packaging them is later work with an
+  explicit small-download design.
+- [x] **A4 · product/UI · blocking** — answered 2026-09-14: fullscreen, Escape, and close;
+  no pause or scrubbing, and closing never stops inference.
+- [x] **A5 · behavioural · blocking** — answered 2026-09-14: one independent window per
+  concurrently watched job, with no audio.
+- [x] **A6 · architectural · blocking** — settled 2026-09-14: the job child owns a local
+  loopback channel and receives already-decoded frames inline.
 
 ## Decisions
 
-- **2026-09-14** — Keep transport in the existing model cache and pass authorization only
-  for coordinator-hosted artifact locators.
+- **2026-09-14** — Use marp-video-player's presentation surface.
+- **2026-09-14** — Keep machine and job display gates independent.
+- **2026-09-14** — Keep release packaging outside #11 after the first CUDA bundle measured
+  3,058,143,651 bytes and demonstrated that bundling the full ML runtime is unacceptable.
 
 ## Plan
 
-1. Resolve API-relative artifact URLs through the coordinator client.
-2. Allow streamed model downloads to carry request headers.
-3. Cover authenticated download and cache reuse with focused tests.
+1. Add the player's external live-frame surface without changing existing media playback.
+2. Add worker launch and job gates.
+3. Feed ordered annotated frames from the tracking loop to a child-owned loopback display.
+4. Verify rendering, failure-to-headless behavior, scientific-output equivalence, and cost.
 
 ## Acceptance criteria
 
-- A relative model locator downloads from the coordinator with its bearer credential.
-- A repeat run uses verified cached bytes without reaching the server.
-- A hash mismatch is removed and refused as before.
+- A watched job shows every processed frame with readable species and track information.
+- Either gate being off produces no display work.
+- Closing or breaking the display leaves the job and its output intact.
+- The same range produces identical observations with display on and off, with throughput
+  recorded for both.
 
 ## Test plan
 
-See `.marp/verification.md`; awaiting human review before execution.
+See `.marp/verification.md`.
 
 ## Status
 
-- **Gate:** ready-for-pr
-- **Notes:** 72 focused tests pass, the suffix regression set passes 19/19, and two real
-  API/Jellyfin/CUDA attempts succeeded with the verified model cache.
+- **Gate:** verifying.
+- **Notes:** Watch implementation exists in both repositories. Packaging work was removed
+  from this issue and retained only on local backup branches.

@@ -53,3 +53,20 @@ and the disposable queue was cleared before the recorded comparison.
 An attempted installer build measured 3,058,143,651 bytes. The human rejected that delivery
 approach and corrected #11 back to watch mode only. All installer, activation, update, API
 migration, and volunteer-control changes were removed from the active branches.
+
+- **Concurrent display regression — PASS after correction.** A display-only run opened two
+  independent Chrome app windows, presented and acknowledged 900 annotated 1280×720 frames
+  in each at 30 fps, and closed both process trees at completion.
+- **Two-model full-system runs — PASS.** Two concurrent full Dive 14 jobs with `rockfish5`
+  completed 29,062 and 24,820 frames. The same two full ranges with `Star4` completed as jobs
+  106 and 107 with 29,062 and 24,820 frames. Both models came through the authenticated API
+  model route and used separate Fish and Inverts sessions respectively.
+- **Window lifecycle defects found and corrected.** Installed Chrome originally left renderer
+  children visible after its parent was terminated; Windows cancellation now terminates the
+  owned process tree. Chrome software rendering caused one concurrent surface to stop
+  repainting and was removed. Native occlusion throttling is disabled, canvas acknowledgement
+  no longer depends on animation callbacks, and the page redraws its latest frame after focus,
+  visibility restoration, or `pageshow`.
+- **Final focused checks — PASS.** `tests/test_watch_display.py`: `6 passed`; full
+  `tests/test_job_runner.py`: `31 passed`; player presenter: `2 passed`. The final player build
+  produced all three bundles with the same pre-existing duplicate `onUnitReady` warning.

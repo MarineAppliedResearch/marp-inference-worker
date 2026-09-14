@@ -12,16 +12,19 @@ being processed, with the model's detections and tracks drawn as they happen.
 
 ## Requirements
 
-- **R1** — Display requires both `--screen window|fullscreen` on the worker and
-  `params.watch: true` on the job; both default off.
+- **R1** — A job with `params.watch: true` opens a local window by default. The worker may
+  explicitly use `--screen off` to suppress it or `--screen fullscreen` to start fullscreen.
 - **R2** — The local display uses marp-video-player and accepts frames already decoded by
   inference rather than decoding the source again.
 - **R3** — Every produced frame is presented in order, without sampling, dropping, or
-  source-rate pacing. Rendering backpressure may slow an opted-in job.
+  source-rate pacing. The browser acknowledges the synchronous canvas draw rather than a
+  visibility-dependent animation callback, so covered fullscreen windows keep consuming frames.
 - **R4** — Each species has one stable box/label colour. The top label is centered over
   and sized to its box and contains only the species name. A centered bottom label shows
   confidence while retaining track id and persistence.
-- **R5** — A quiet status area shows frame number, achieved rate, and live-track count.
+- **R5** — A quiet status area shows frame number, achieved rate, and live-track count. A
+  read-only timeline shows progress through the assigned frame range without pause or scrub input.
+  A translucent context strip shows the model name, MARP job number, and model class list.
 - **R6** — The display and frame channel bind only to loopback and expose no credential or
   remote media URL.
 - **R7** — Closing or failing the window records one warning and continues inference
@@ -35,14 +38,15 @@ being processed, with the model's detections and tracks drawn as they happen.
 - **R12** — Escape leaves fullscreen for the normal app window; the window close control
   closes the display and continues inference headless. Pause and scrubbing are unsupported.
 - **R13** — Concurrent watched jobs open visibly distinct, independent windows; audio is
-  muted.
+  muted, and an occluded window or a window returning from display sleep continues
+  presenting while another is in front.
 - **R14** — Installer, dependency distribution, self-update, activation, volunteer compute
   controls, and remote viewing are separate work.
 
 ## Open assumptions
 
 - [x] **A1 · product/UI · blocking** — answered 2026-09-14: machine policy is
-  `--screen off|window|fullscreen`, default off, and the job independently requests watch.
+  `--screen off|window|fullscreen`, default window, and the job independently requests watch.
 - [x] **A2 · performance · blocking** — answered 2026-09-14: draw every frame in order as
   fast as inference produces it; accepted display cost is measured rather than hidden.
 - [x] **A3 · environment · blocking** — corrected 2026-09-14: issue #11 uses a browser and

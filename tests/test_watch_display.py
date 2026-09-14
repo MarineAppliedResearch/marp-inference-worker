@@ -12,7 +12,31 @@ import numpy as np
 from marp_inference_worker.watch.display import (
     WatchDisplay,
     _FrameChannel,
+    _chromium_args,
 )
+
+
+def test_display_resolves_a_relative_worker_workspace() -> None:
+    display = WatchDisplay("window", Path("data/worker/jobs/1"), lambda _message: None)
+
+    assert display._workspace.is_absolute()
+    assert display._workspace.name == "1"
+
+
+def test_chromium_keeps_occluded_watch_windows_rendering() -> None:
+    args = _chromium_args(
+        Path("chrome.exe"),
+        "http://127.0.0.1:1234/",
+        Path("C:/worker/jobs/1/chromium-profile"),
+        "fullscreen",
+    )
+
+    assert "--disable-background-timer-throttling" in args
+    assert "--disable-backgrounding-occluded-windows" in args
+    assert "--disable-renderer-backgrounding" in args
+    assert "--disable-features=CalculateNativeWinOcclusion" in args
+    assert "--disable-gpu" not in args
+    assert "--start-fullscreen" in args
 
 
 def test_frame_channel_waits_for_browser_ack_before_accepting_the_next_frame() -> None:
@@ -87,13 +111,25 @@ def test_first_frame_allows_a_slow_initial_browser_start() -> None:
 
 
 def test_display_sends_a_browser_decodable_jpeg_frame() -> None:
-    display = WatchDisplay("window", Path("."), lambda _message: None)
+    display = WatchDisplay(
+        "window",
+        Path("."),
+        lambda _message: None,
+        job_id="98",
+        model_name="rockfish5",
+        species_names=["Blue/Deacon Rockfish", "Lingcod"],
+    )
     packets = []
     display._channel.publish = lambda packet: packets.append(packet) or True
 
     frame = SimpleNamespace(image=np.zeros((24, 32, 3), dtype=np.uint8))
-    assert display.present(frame, 19, []) is True
+    assert display.present(frame, 19, [], range_start=10, range_end=30) is True
 
     assert packets[0]["content_type"] == "image/jpeg"
+    assert packets[0]["range_start"] == 10
+    assert packets[0]["range_end"] == 30
+    assert packets[0]["job_id"] == "98"
+    assert packets[0]["model_name"] == "rockfish5"
+    assert packets[0]["species_names"] == ["Blue/Deacon Rockfish", "Lingcod"]
     encoded = np.frombuffer(base64.b64decode(packets[0]["image"]), dtype=np.uint8)
     assert cv2.imdecode(encoded, cv2.IMREAD_COLOR).shape == (24, 32, 3)

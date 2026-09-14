@@ -50,7 +50,7 @@ _STATE_DIR_ENV = "MARP_WORKER_STATE_DIR"
 # Use this from start_worker(). Raises when the token or address is missing,
 # because a worker with neither cannot do anything and should say so at start
 # rather than failing silently on its first poll.
-def build_runner(screen_mode: str = "off"):
+def build_runner(screen_mode: str = "window"):
 
     # Imported here so importing this module does not pull the runner's
     # dependency tree into a test that only wanted the API.
@@ -95,7 +95,7 @@ def build_runner(screen_mode: str = "off"):
 # Use this from the service entry point. A thread rather than a second process:
 # the loop and the API have to share one WorkerState, and a job's real isolation
 # is its own child process, which the runner already gives it.
-def start_worker(screen_mode: str = "off"):
+def start_worker(screen_mode: str = "window"):
 
     runner = build_runner(screen_mode)
 
@@ -118,7 +118,7 @@ def main() -> None:
     parser.add_argument(
         "--screen",
         choices=("off", "window", "fullscreen"),
-        default="off",
+        default="window",
         help="permit watched jobs to open a local display",
     )
     args = parser.parse_args()

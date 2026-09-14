@@ -163,6 +163,9 @@ class JobSpec(BaseModel):
 # learns its lease was taken away while it was busy (A1).
 class AttemptEnvelope(BaseModel):
 
+    # Coordinator job identifier shown in the local viewer and ML dashboard.
+    job_id: str | None = None
+
     # Coordinator's identifier for this attempt at this job.
     attempt_id: str
 
@@ -184,7 +187,7 @@ class AttemptEnvelope(BaseModel):
     # coordinator's everywhere and the local type is the worker's everywhere.
     # Without this the lease itself failed to validate and every offered job was
     # reported back as an invalid spec.
-    @field_validator("attempt_id", "worker_id", mode="before")
+    @field_validator("job_id", "attempt_id", "worker_id", mode="before")
     @classmethod
     def _identifier_as_text(cls, value: object) -> object:
 

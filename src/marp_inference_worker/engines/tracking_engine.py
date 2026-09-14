@@ -191,16 +191,7 @@ class TrackingEngine(BaseEngine):
 
         watch = None
         screen_mode = str(params.get("_watch_screen_mode", "off"))
-        if params.get("watch") is True and screen_mode in {"window", "fullscreen"}:
-            from marp_inference_worker.watch import WatchDisplay
-
-            watch = WatchDisplay(
-                screen_mode=screen_mode,
-                workspace=ctx.checkpoint_dir.parent,
-                warn=lambda message: ctx.log(message, level="warning"),
-            )
-            if not watch.start():
-                watch = None
+        wants_watch = params.get("watch") is True and screen_mode in {"window", "fullscreen"}
 
         # Open the video and read its geometry once.
         ctx.report_progress(0, expected_frames, "frames", phase="opening_video")
@@ -214,6 +205,21 @@ class TrackingEngine(BaseEngine):
         # A fresh tracker per range is what makes the boundary a seam (R10a).
         ctx.report_progress(0, expected_frames, "frames", phase="loading_model")
         yolo_model = self._detector.load_weights(model_path, device)
+        if wants_watch:
+            from marp_inference_worker.watch import WatchDisplay
+
+            model_names = yolo_model.names
+            species_names = [str(model_names[key]) for key in sorted(model_names)]
+            watch = WatchDisplay(
+                screen_mode=screen_mode,
+                workspace=ctx.checkpoint_dir.parent,
+                warn=lambda message: ctx.log(message, level="warning"),
+                job_id=str(params.get("_job_id") or "") or None,
+                model_name=str((spec.get("model") or {}).get("name") or "") or None,
+                species_names=species_names,
+            )
+            if not watch.start():
+                watch = None
         tracker, tracker_args = create_tracker(params)
         accumulator = TrackAccumulator(track_buffer=tracker_args.as_dict["track_buffer"])
 
@@ -273,7 +279,13 @@ class TrackingEngine(BaseEngine):
                         live_track_metadata=live_track_metadata,
                     )
 
-                    if watch is not None and not watch.present(frame, frame.index, live_tracks):
+                    if watch is not None and not watch.present(
+                        frame,
+                        frame.index,
+                        live_tracks,
+                        range_start=start_frame,
+                        range_end=end_frame,
+                    ):
                         watch.close()
                         watch = None
 

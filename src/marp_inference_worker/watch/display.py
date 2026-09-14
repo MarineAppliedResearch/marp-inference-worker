@@ -16,6 +16,26 @@ from urllib.parse import urlsplit
 import cv2
 
 
+_FRAME_ACK_TIMEOUT_S = 60.0
+
+
+def _chromium_args(chromium: Path, url: str, profile: Path, mode: str) -> list[str]:
+    args = [
+        str(chromium),
+        f"--app={url}",
+        f"--user-data-dir={profile}",
+        "--no-first-run",
+        "--disable-sync",
+        "--disable-background-timer-throttling",
+        "--disable-backgrounding-occluded-windows",
+        "--disable-renderer-backgrounding",
+        "--disable-features=CalculateNativeWinOcclusion",
+        "--mute-audio",
+    ]
+    args.append("--start-fullscreen" if mode == "fullscreen" else "--window-size=1100,700")
+    return args
+
+
 class _FrameChannel:
     """One-slot ordered channel whose consumer explicitly acknowledges a draw."""
 
@@ -40,7 +60,7 @@ class _FrameChannel:
     def publish(
         self,
         packet: dict[str, Any],
-        timeout_s: float = 15.0,
+        timeout_s: float = _FRAME_ACK_TIMEOUT_S,
         connect_timeout_s: float = 60.0,
     ) -> bool:
         with self.condition:
@@ -135,10 +155,19 @@ class WatchDisplay:
         screen_mode: str,
         workspace: Path,
         warn: Callable[[str], None],
+        job_id: str | None = None,
+        model_name: str | None = None,
+        species_names: list[str] | None = None,
     ) -> None:
         self._mode = screen_mode
-        self._workspace = workspace
+        # The job child may run with its workspace as the current directory.
+        # Chromium must receive an absolute profile path or a relative worker
+        # state directory is applied twice and the viewer never connects.
+        self._workspace = workspace.resolve()
         self._warn = warn
+        self._job_id = job_id
+        self._model_name = model_name
+        self._species_names = list(species_names or [])
         self._channel = _FrameChannel()
         self._server: _WatchServer | None = None
         self._process: subprocess.Popen[bytes] | None = None
@@ -170,21 +199,19 @@ class WatchDisplay:
             threading.Thread(target=self._server.serve_forever, daemon=True).start()
             port = self._server.server_address[1]
             profile = self._workspace / "chromium-profile"
-            args = [
-                str(chromium),
-                f"--app=http://127.0.0.1:{port}/",
-                f"--user-data-dir={profile}",
-                "--no-first-run",
-                "--disable-sync",
-                "--mute-audio",
-            ]
-            if self._mode == "fullscreen":
-                args.append("--start-fullscreen")
-            else:
-                # Let Windows cascade independent job windows instead of
-                # stacking maximized surfaces directly on top of each other.
-                args.append("--window-size=1100,700")
-            self._process = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            args = _chromium_args(
+                chromium,
+                f"http://127.0.0.1:{port}/",
+                profile,
+                self._mode,
+            )
+            creationflags = subprocess.CREATE_NEW_PROCESS_GROUP if sys.platform == "win32" else 0
+            self._process = subprocess.Popen(
+                args,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=creationflags,
+            )
             threading.Thread(target=self._watch_process, daemon=True).start()
             return True
         except Exception as error:
@@ -203,7 +230,14 @@ class WatchDisplay:
             self._warned = True
         self._channel.close()
 
-    def present(self, frame: Any, frame_number: int, tracks: list[dict[str, Any]]) -> bool:
+    def present(
+        self,
+        frame: Any,
+        frame_number: int,
+        tracks: list[dict[str, Any]],
+        range_start: int | None = None,
+        range_end: int | None = None,
+    ) -> bool:
         if self._channel.closed:
             return False
         # The display is observational, while the scientific result is produced
@@ -218,6 +252,11 @@ class WatchDisplay:
             return False
         packet = {
             "frame_number": int(frame_number),
+            "range_start": int(range_start) if range_start is not None else None,
+            "range_end": int(range_end) if range_end is not None else None,
+            "job_id": self._job_id,
+            "model_name": self._model_name,
+            "species_names": self._species_names,
             "content_type": "image/jpeg",
             "image": base64.b64encode(bytes_buffer.tobytes()).decode("ascii"),
             "tracks": tracks,
@@ -234,7 +273,17 @@ class WatchDisplay:
             self._server.shutdown()
             self._server.server_close()
         if self._process is not None and self._process.poll() is None:
-            self._process.terminate()
+            if sys.platform == "win32":
+                # Installed Chrome owns a renderer tree. Terminating only its
+                # first process leaves the visible app window orphaned.
+                subprocess.run(
+                    ["taskkill", "/PID", str(self._process.pid), "/T", "/F"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    check=False,
+                )
+            else:
+                self._process.terminate()
             try:
                 self._process.wait(timeout=5)
             except subprocess.TimeoutExpired:

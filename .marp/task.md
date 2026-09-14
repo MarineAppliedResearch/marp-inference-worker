@@ -1,7 +1,7 @@
 ---
 task: MarineAppliedResearch/marp-inference-worker#9
 repos: [marp-inference-worker]
-status: design
+status: implementing
 needs: []
 ---
 
@@ -27,14 +27,16 @@ back to box area.
 
 ## Open assumptions
 
-- [ ] **A1 · scientific/data-meaning · blocking** — May the confidence measured on the raw
-  detection box deliberately accompany the directionally padded keyframe box? Proposed:
-  yes. The confidence describes the model result on the named frame; padding is presentation
-  geometry added afterward and must not cause the score to be recomputed.
-- [ ] **A2 · api contract · blocking** — Is adding the missing `confidence` field a repair
-  to `v3_dirpad` version `1`, or must the reduction be registered under a new version?
-  Proposed: keep version `1`, because frame selection and box geometry do not change and the
-  existing API consumer already treats `confidence` as part of the keyframe shape.
+- [x] **A1 · scientific/data-meaning · blocking** — answered 2026-09-13: yes, the confidence
+  measured on the raw detection box deliberately accompanies the directionally padded
+  keyframe box. The confidence describes the model result on the named frame; padding is
+  geometry added afterward and must not cause the score to be recomputed. Directional
+  padding may be replaced by a different detection representation in future work, but that
+  is outside this additive repair.
+- [x] **A2 · api contract · blocking** — answered 2026-09-13: keep `v3_dirpad` version `1`.
+  Adding the missing `confidence` field repairs its output contract; frame selection and box
+  geometry remain unchanged. A future change to padding, selection, or other reduction
+  behavior should use a new reducer name or version so stored results remain attributable.
 
 ## Decisions
 
@@ -42,6 +44,9 @@ back to box area.
   stores null otherwise; issue #9 requires no API-side contract or schema change.
 - **2026-09-13** — Predicted frames use the same established semantics as observation
   confidence: no matched detection means an explicit null, never a nearby detection's score.
+- **2026-09-13** — Confidence continues to describe the raw model detection while the
+  keyframe box remains directionally padded. The existing reducer stays at version `1` for
+  this additive repair.
 
 ## Plan
 
@@ -70,8 +75,8 @@ observation shaper can observe whether a score stayed attached to its frame.
 
 ## Status
 
-- **Gate:** design
+- **Gate:** implementing
 - **Notes:** Branch `9-keyframe-confidence` is based on current `origin/develop`. Local code
   inspection confirms `TrackAccumulator` already stores per-frame confidence and
   `reduce_to_keyframes_v3_dirpad` drops it only when constructing each output dictionary.
-  Implementation is blocked on A1 and A2.
+  A1 and A2 were answered by Isaac on 2026-09-13; implementation may begin.

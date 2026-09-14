@@ -45,7 +45,7 @@ None.
 Run:
 
 ```powershell
-.venv312\Scripts\python -m pytest tests/test_tracking_pipeline.py -k "keyframe_confidence or predicted_keyframe or full_pipeline"
+.\.venv312\Scripts\python -m pytest tests/test_tracking_pipeline.py -k "keyframe_confidence or predicted_keyframe or full_pipeline"
 ```
 
 The two new tests reproduce issue #9 at the pipeline tier: before the repair, every reduced
@@ -55,7 +55,7 @@ start/end labels, and observation handoff while this output field changes.
 Then lint only the changed Python files:
 
 ```powershell
-.venv312\Scripts\python -m ruff check src/marp_inference_worker/reduction/keyframes.py tests/test_tracking_pipeline.py
+.\.venv312\Scripts\python -m ruff check src/marp_inference_worker/reduction/keyframes.py tests/test_tracking_pipeline.py
 ```
 
 ## Known gaps
@@ -82,4 +82,92 @@ None. The defect and its null edge case are observable without hardware, media, 
 
 ## Results
 
-<!-- Appended by `marp verify run`. Real output, including failures, verbatim. -->
+Run 2026-09-13 on Windows with CPython 3.12.11.
+
+### Environment setup and command corrections
+
+The repository had no `.venv312`, and the first approved PowerShell command omitted the
+required `.\` executable prefix. These attempts failed before Python or pytest started:
+
+```text
+The module '.venv312' could not be loaded. For more information, run 'Import-Module .venv312'.
+```
+
+After correcting the prefix, the missing environment was explicit:
+
+```text
+The term '.\.venv312\Scripts\python' is not recognized as a name of a cmdlet, function, script file, or executable program.
+```
+
+The documented environment was then created with Python 3.12.11 and the repository's
+declared `[dev]` dependencies. A sandboxed pytest attempt collected all three selected tests;
+the two new tests passed, while the existing `tmp_path` regression could not set up because
+the command sandbox denied access to pytest's temp directory:
+
+```text
+tests\test_tracking_pipeline.py E..                                      [100%]
+E       PermissionError: [WinError 5] Access is denied: 'C:\\Users\\isaac\\AppData\\Local\\Temp\\pytest-of-isaac'
+============ 2 passed, 13 deselected, 2 warnings, 1 error in 7.70s ============
+```
+
+Giving the same approved pytest command access to a workspace-local temp directory resolved
+that environmental failure.
+
+### Focused pipeline verification — PASS
+
+Command:
+
+```powershell
+.\.venv312\Scripts\python -m pytest -p no:cacheprovider --basetemp .marp\local\pytest-9 tests/test_tracking_pipeline.py -k "keyframe_confidence or predicted_keyframe or full_pipeline"
+```
+
+Output:
+
+```text
+============================= test session starts =============================
+platform win32 -- Python 3.12.11, pytest-9.1.1, pluggy-1.6.0
+rootdir: C:\Users\isaac\Documents\Workspace\MARP\marp-inference-worker
+configfile: pyproject.toml
+plugins: anyio-4.15.1
+collected 16 items / 13 deselected / 3 selected
+
+tests\test_tracking_pipeline.py ...                                      [100%]
+
+====================== 3 passed, 13 deselected in 2.25s =======================
+```
+
+### Changed-file lint — FAIL, pre-existing findings only
+
+Command:
+
+```powershell
+.\.venv312\Scripts\python -m ruff check src/marp_inference_worker/reduction/keyframes.py tests/test_tracking_pipeline.py
+```
+
+Ruff exited 1 with these exact findings:
+
+```text
+I001  src\marp_inference_worker\reduction\keyframes.py:25:1  Import block is un-sorted or un-formatted
+UP035 src\marp_inference_worker\reduction\keyframes.py:31:1  Import from `collections.abc` instead: `Callable`
+I001  tests\test_tracking_pipeline.py:19:1                  Import block is un-sorted or un-formatted
+RUF046 tests\test_tracking_pipeline.py:289:13               Value being cast to `int` is already an integer
+RUF012 tests\test_tracking_pipeline.py:547:13               Mutable default value for class attribute
+Found 5 errors.
+[*] 4 fixable with the `--fix` option.
+```
+
+The same Ruff command was run against copies of both files from `origin/develop`. It returned
+the same five codes on the same source statements:
+
+```text
+I001  baseline/keyframes.py:23:1               Import block is un-sorted or un-formatted
+UP035 baseline/keyframes.py:29:1                Import from `collections.abc` instead: `Callable`
+I001  baseline/test_tracking_pipeline.py:19:1   Import block is un-sorted or un-formatted
+RUF046 baseline/test_tracking_pipeline.py:289:13 Value being cast to `int` is already an integer
+RUF012 baseline/test_tracking_pipeline.py:547:13 Mutable default value for class attribute
+Found 5 errors.
+[*] 4 fixable with the `--fix` option.
+```
+
+No Ruff finding points to an issue #9 addition. The unrelated baseline findings were left
+unchanged under the task's scope rule.

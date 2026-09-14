@@ -81,4 +81,6 @@ review before anything is run.
   inspection confirms `TrackAccumulator` already stores per-frame confidence and
   `reduce_to_keyframes_v3_dirpad` drops it only when constructing each output dictionary.
   A1 and A2 were answered by Isaac on 2026-09-13. The implementation and focused tests are
-  written; the G3 verification plan awaits human approval before it is run.
+  written. The approved focused verification passed all three selected pipeline tests. Ruff
+  found five pre-existing issues also present on `origin/develop`; none points to an issue #9
+  addition. The G4 evidence awaits human review.

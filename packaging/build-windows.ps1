@@ -65,7 +65,8 @@ try {
 
     # The destination computer must not need Visual Studio. This tiny compiled
     # dependency is built once here and carried by the small bootstrap.
-    & $BuildPython -3.12 -m pip wheel cython-bbox==0.1.5 --no-deps --wheel-dir $Wheels
+    $BuildPythonArguments = if ([IO.Path]::GetFileName($BuildPython) -in @('py', 'py.exe')) { @('-3.12') } else { @() }
+    & $BuildPython @BuildPythonArguments -m pip wheel cython-bbox==0.1.5 --no-deps --wheel-dir $Wheels
     Assert-LastExit 'Building the cython-bbox Windows wheel'
 
     $PlayerLock = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'player.lock.json') -Raw | ConvertFrom-Json

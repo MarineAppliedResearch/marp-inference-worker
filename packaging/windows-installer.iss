@@ -1,11 +1,11 @@
-#ifndef StageDir
-  #error StageDir is required
+#ifndef PayloadDir
+  #error PayloadDir is required
+#endif
+#ifndef OutputDir
+  #error OutputDir is required
 #endif
 #ifndef WorkerVersion
   #error WorkerVersion is required
-#endif
-#ifndef ReleaseKey
-  #error ReleaseKey is required
 #endif
 
 [Setup]
@@ -17,31 +17,29 @@ DefaultGroupName=MARP Inference Worker
 PrivilegesRequired=lowest
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
-OutputDir={#StageDir}\installer
+OutputDir={#OutputDir}
 OutputBaseFilename=marp-inference-worker-{#WorkerVersion}-windows-x64-setup
 Compression=lzma2/ultra64
 SolidCompression=yes
 Uninstallable=yes
 
-[Dirs]
-Name: "{app}\state"; Flags: uninsneveruninstall
-
 [Files]
-Source: "{#StageDir}\launcher\marp-worker-launcher.exe"; DestDir: "{app}"; Flags: ignoreversion
-Source: "{#StageDir}\versions\{#ReleaseKey}\*"; DestDir: "{app}\versions\{#ReleaseKey}"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "{#PayloadDir}\*"; DestDir: "{tmp}\marp-worker-payload"; Flags: deleteafterinstall recursesubdirs createallsubdirs
 
 [Icons]
-Name: "{group}\MARP Worker (background)"; Filename: "{app}\marp-worker-launcher.exe"; Parameters: "--screen off"
-Name: "{group}\MARP Worker (window)"; Filename: "{app}\marp-worker-launcher.exe"; Parameters: "--screen window"
-Name: "{group}\MARP Worker (fullscreen)"; Filename: "{app}\marp-worker-launcher.exe"; Parameters: "--screen fullscreen"
-Name: "{group}\Finish current MARP work, then pause"; Filename: "{app}\marp-worker-launcher.exe"; Parameters: "--control finish"
-Name: "{group}\Stop MARP work now, then pause"; Filename: "{app}\marp-worker-launcher.exe"; Parameters: "--control stop"
-Name: "{group}\Resume MARP work"; Filename: "{app}\marp-worker-launcher.exe"; Parameters: "--control resume"
-Name: "{userstartup}\MARP Inference Worker"; Filename: "{app}\marp-worker-launcher.exe"; Parameters: "--screen off"
+Name: "{group}\MARP Worker"; Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File &quot;{app}\launcher.ps1&quot; -Screen window"
+Name: "{group}\MARP Worker (fullscreen)"; Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File &quot;{app}\launcher.ps1&quot; -Screen fullscreen"
+Name: "{group}\Finish current MARP work, then pause"; Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File &quot;{app}\launcher.ps1&quot; -Control finish"
+Name: "{group}\Stop MARP work now, then pause"; Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File &quot;{app}\launcher.ps1&quot; -Control stop"
+Name: "{group}\Resume MARP work"; Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File &quot;{app}\launcher.ps1&quot; -Control resume"
+Name: "{userstartup}\MARP Inference Worker"; Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File &quot;{app}\launcher.ps1&quot; -Screen window"
 
 [Run]
-Filename: "{app}\versions\{#ReleaseKey}\marp-worker.exe"; Parameters: "--activate-code-file &quot;{tmp}\marp-worker-activation.txt&quot; --coordinator-url &quot;{code:GetCoordinatorUrl}&quot; --state-dir &quot;{app}\state&quot;"; StatusMsg: "Activating this worker..."; Flags: runhidden waituntilterminated
-Filename: "{app}\marp-worker-launcher.exe"; Parameters: "--screen off"; Description: "Start the MARP worker"; Flags: nowait postinstall skipifsilent
+Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File &quot;{tmp}\marp-worker-payload\bootstrap-windows.ps1&quot; -PayloadRoot &quot;{tmp}\marp-worker-payload&quot; -InstallRoot &quot;{app}&quot; -CoordinatorUrl &quot;{code:GetCoordinatorUrl}&quot; -ActivationCodeFile &quot;{tmp}\marp-worker-activation.txt&quot;"; StatusMsg: "Downloading and preparing the MARP worker. This can take several minutes..."; Flags: waituntilterminated
+Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File &quot;{app}\launcher.ps1&quot; -Screen window"; Description: "Start the MARP worker"; Flags: nowait postinstall skipifsilent
+
+[UninstallDelete]
+Type: filesandordirs; Name: "{app}"
 
 [Code]
 var
@@ -52,7 +50,7 @@ begin
   ConnectPage := CreateInputQueryPage(wpSelectDir,
     'Connect this worker to MARP',
     'Enter the MARP API address and the one-time activation code.',
-    'The activation code is exchanged once for a credential protected for this Windows user.');
+    'Setup downloads and installs every required component automatically.');
   ConnectPage.Add('MARP API URL:', False);
   ConnectPage.Add('Activation code:', True);
 end;
@@ -75,22 +73,8 @@ begin
   Result := Trim(ConnectPage.Values[0]);
 end;
 
-function JsonEscape(Value: String): String;
+function PrepareToInstall(var NeedsRestart: Boolean): String;
 begin
-  Result := Value;
-  StringChangeEx(Result, '\', '\\', True);
-  StringChangeEx(Result, '"', '\"', True);
-end;
-
-procedure CurStepChanged(CurStep: TSetupStep);
-var
-  Config: String;
-begin
-  if CurStep = ssPostInstall then
-  begin
-    Config := '{"coordinator_url":"' + JsonEscape(Trim(ConnectPage.Values[0])) + '","screen":"off","api_port":8010}';
-    SaveStringToFile(ExpandConstant('{app}\config.json'), Config, False);
-    SaveStringToFile(ExpandConstant('{app}\active.json'), '{"release":"{#ReleaseKey}"}', False);
-    SaveStringToFile(ExpandConstant('{tmp}\marp-worker-activation.txt'), Trim(ConnectPage.Values[1]), False);
-  end;
+  SaveStringToFile(ExpandConstant('{tmp}\marp-worker-activation.txt'), Trim(ConnectPage.Values[1]), False);
+  Result := '';
 end;

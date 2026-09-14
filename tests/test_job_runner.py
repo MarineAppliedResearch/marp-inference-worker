@@ -156,9 +156,13 @@ class FakeCoordinator:
 
     # check_artifact()
     # Answers whether the artifact is already held.
-    def check_artifact(self, sha256, size_bytes):
+    def check_artifact(self, worker_id, sha256, size_bytes):
 
-        self.artifact_checks.append({"sha256": sha256, "size_bytes": size_bytes})
+        self.artifact_checks.append({
+            "worker_id": worker_id,
+            "sha256": sha256,
+            "size_bytes": size_bytes,
+        })
         if self.already_have_artifact:
             return {"already_have": True}
 
@@ -486,6 +490,7 @@ def test_job_runs_in_a_child_process_and_reports_success(tmp_path: Path) -> None
     # The results file was offered by hash, and no detections travelled inline.
     assert len(coordinator.artifact_checks) == 1
     check = coordinator.artifact_checks[0]
+    assert check["worker_id"] == "worker-for-test"
     assert len(check["sha256"]) == 64
     assert check["size_bytes"] > 0
     assert "detections" not in str(result)

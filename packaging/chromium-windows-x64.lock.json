@@ -1,9 +1,9 @@
 {
-  "name": "Chrome for Testing",
-  "version": "153.0.8010.36",
+  "name": "Chromium",
+  "version": "snapshot-1697351",
   "platform": "windows",
   "architecture": "x86_64",
-  "url": "https://storage.googleapis.com/chrome-for-testing-public/153.0.8010.36/win64/chrome-win64.zip",
-  "size_bytes": 205134000,
-  "sha256": "8edfaa0923c11a30a9315a5e7e5794c5efb60146edea7e3f749f7fdc2aa026cb"
+  "url": "https://storage.googleapis.com/chromium-browser-snapshots/Win_x64/1697351/chrome-win.zip",
+  "size_bytes": 355978824,
+  "sha256": "6bdfa087ffddf87816e46ff98b6b2b735e97c8a8ec410c57fd34b0a2f29ab08e"
 }

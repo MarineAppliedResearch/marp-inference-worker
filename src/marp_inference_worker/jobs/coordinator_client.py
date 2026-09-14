@@ -426,6 +426,7 @@ class CoordinatorClient:
     # coordinator is handed a hash and asks for the bytes only if it wants them (R11).
     def check_artifact(
         self,
+        worker_id: str,
         sha256: str,
         size_bytes: int,
     ) -> dict[str, Any]:
@@ -436,7 +437,11 @@ class CoordinatorClient:
         # size unknown until the upload itself measured it.
         result = self._post(
             "/artifacts/check",
-            {"sha256": sha256, "bytes": size_bytes},
+            {
+                "worker_id": coordinator_id(worker_id, "worker_id"),
+                "sha256": sha256,
+                "bytes": size_bytes,
+            },
         )
         return result if result is not None else {}
 

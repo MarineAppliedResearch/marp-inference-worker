@@ -869,6 +869,7 @@ class JobRunner:
 
         # Offer it.
         answer = self._client.check_artifact(
+            worker_id=job.worker_id,
             sha256=sha256,
             size_bytes=int(artifact.get("size_bytes", 0)),
         )

@@ -496,10 +496,9 @@ def test_tracking_engine_reports_phases_in_actual_work_order(tmp_path: Path, mon
     from marp_inference_worker.media.frame_range_reader import DecodedFrame, VideoGeometry
 
     class Context:
-        params = {"model_path": str(tmp_path / "model.pt"), "device": "cpu"}
-        checkpoint_dir = tmp_path
-
         def __init__(self):
+            self.params = {"model_path": str(tmp_path / "model.pt"), "device": "cpu"}
+            self.checkpoint_dir = tmp_path
             self.phases = []
 
         def log(self, _message, level="info"):

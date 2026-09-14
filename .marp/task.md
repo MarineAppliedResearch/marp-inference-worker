@@ -1,7 +1,7 @@
 ---
 task: MarineAppliedResearch/marp-inference-worker#10
 repos: [marp-inference-worker, marp-api]
-status: design
+status: verifying
 needs: []
 ---
 
@@ -123,10 +123,10 @@ against the isolated API and its disposable PostgreSQL database.
 
 ## Status
 
-- **Gate:** implementing. All G1 assumptions are settled.
-- **Notes:** The worker already sends frame progress and `elapsed_s`, but initializes total
-  to null and carries no phase. MARP_API accepts only `done`, `total`, and `unit`,
-  discarding other progress keys. The existing event stream already stores structured
-  metrics, while worker-pool and job-detail queries already expose the current attempt row.
-  The API workspace is isolated because this change requires a migration and another
-  checkout has unrelated work in progress.
+- **Gate:** verifying. The approved G4 plan has passed and its recorded evidence awaits
+  human review.
+- **Notes:** The worker now initializes the range total and reports the seven agreed phases
+  through the existing event and heartbeat path. MARP_API persists phase and elapsed time,
+  exposes both live and terminal snapshots, and remains compatible with partial progress
+  payloads. Targeted worker, API, migration, generated-contract, and real cross-repository
+  checks passed against the isolated disposable database.

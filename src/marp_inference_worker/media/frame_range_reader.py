@@ -9,7 +9,8 @@
 # Decoding belongs here; detection, tracking and reduction do not.
 
 # Iterator types the generator this module exists to produce.
-from typing import Any, Callable, Iterator, NamedTuple
+from collections.abc import Callable, Iterator
+from typing import Any, NamedTuple
 
 
 # DecodedFrame

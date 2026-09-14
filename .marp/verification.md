@@ -75,5 +75,33 @@ None. Every requirement is observable through automated worker, HTTP, and dispos
 
 ## Results
 
-<!-- Appended after the human approves this plan and the commands are run. -->
+- **Worker focused suite — PASS.** `59 passed in 19.58s` across
+  `test_job_context.py`, `test_job_runner.py`, and `test_tracking_pipeline.py`.
+- **Boundary regression after lint cleanup — PASS.** The seek-boundary and real phase-order
+  tests passed again: `2 passed, 16 deselected in 0.15s`.
+- **Worker lint delta — PASS.** Ruff reports 13 findings in the changed-file set; the same
+  files on `origin/develop` report 14. Every remaining finding is present on the base and
+  this branch introduces none.
+- **API migration — PASS.** Additive migration up, down, and up again all completed. Each
+  integrity guard reported `gpu_job_attempts=0 | 5 foreign key(s) watched`, with no deleted,
+  dereferenced, or orphaned rows.
+- **API GPU subsystem — PASS.** `6 passed, 0 failed` suites and
+  `109 passed, 0 failed, 0 skipped` assertions in 15.0 seconds.
+- **Generated contract — PASS.** `npm run docs:api:build` completed and a second generation
+  left `docs/openapi.generated.json` unchanged.
+- **Cross-repository round trip — PASS.** A real CoordinatorClient, JobRunner, child
+  process, MARP_API server, and disposable PostgreSQL database agreed on the live pre-frame
+  snapshot and retained the terminal snapshot: `PASS: real worker client -> MARP_API ->
+  PostgreSQL retained live and terminal progress for job 99`.
+- **Scope review — PASS.** The implementation changes neither dashboard code nor
+  `job_pressure` behavior.
 
+Two first attempts to start pytest failed before collection with `PermissionError:
+[WinError 5] Access is denied` while pytest created its base temporary directory under the
+sandbox. The identical approved command passed after granting filesystem access; this was
+an execution-environment failure, not a test failure.
+
+The broad developer-doc generator also printed pre-existing JSDoc parse errors in unrelated
+database and Mosaic source files. It exits successfully, but those diagnostics are not
+treated as evidence for this change; the issue-specific OpenAPI generator passed and was
+stable.

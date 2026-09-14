@@ -57,6 +57,9 @@ try {
     Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'bootstrap-windows.ps1') -Destination $Payload
     Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'launcher-windows.ps1') -Destination $Payload
     Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'requirements-windows-cu126.lock.txt') -Destination $Payload
+    if (Select-String -LiteralPath (Join-Path $Payload 'requirements-windows-cu126.lock.txt') -Pattern '^\.\s*$' -Quiet) {
+        throw 'The runtime lock must not install the worker project from the current directory.'
+    }
     Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'uv-windows-x64.lock.json') -Destination $Payload
     Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'chromium-windows-x64.lock.json') -Destination $Payload
     [ordered]@{

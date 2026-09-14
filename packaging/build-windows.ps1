@@ -5,6 +5,8 @@ param(
     [string]$OutputRoot = (Join-Path $PSScriptRoot '..\.marp\local\windows-build'),
     [string]$BuildPython = 'py',
     [string]$IsccPath,
+    [Parameter(Mandatory)][string]$CoordinatorUrl,
+    [Parameter(Mandatory)][string]$EnrollmentCode,
     [string]$SigningCertificateThumbprint,
     [switch]$Development
 )
@@ -96,6 +98,7 @@ try {
     }
     if (-not $IsccPath) { throw 'Inno Setup 6 was not found. Pass -IsccPath.' }
     & $IsccPath "/DPayloadDir=$Payload" "/DOutputDir=$InstallerDir" "/DWorkerVersion=$Version" `
+        "/DCoordinatorUrl=$CoordinatorUrl" "/DEnrollmentCode=$EnrollmentCode" `
         (Join-Path $PSScriptRoot 'windows-installer.iss')
     Assert-LastExit 'Building the one-click installer'
     $Installers = @(Get-ChildItem -LiteralPath $InstallerDir -Filter '*.exe')

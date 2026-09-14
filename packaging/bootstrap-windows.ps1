@@ -8,6 +8,14 @@ param(
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
+$SetupLog = Join-Path $InstallRoot 'setup.log'
+New-Item -ItemType Directory -Force -Path $InstallRoot | Out-Null
+Start-Transcript -LiteralPath $SetupLog -Force | Out-Null
+trap {
+    Write-Error ($_ | Out-String)
+    try { Stop-Transcript | Out-Null } catch {}
+    exit 1
+}
 $StateRoot = Join-Path $InstallRoot 'state'
 $DownloadRoot = Join-Path $StateRoot 'setup-downloads'
 
@@ -124,3 +132,4 @@ if (-not $Healthy) {
 }
 
 Remove-Item -LiteralPath $UvArchive, $ChromeArchive -Force -ErrorAction SilentlyContinue
+Stop-Transcript | Out-Null

@@ -7,6 +7,12 @@
 #ifndef WorkerVersion
   #error WorkerVersion is required
 #endif
+#ifndef CoordinatorUrl
+  #error CoordinatorUrl is required
+#endif
+#ifndef EnrollmentCode
+  #error EnrollmentCode is required
+#endif
 
 [Setup]
 AppId={{C46A4328-55A7-46B1-A277-5FC4DC63BC91}
@@ -35,46 +41,46 @@ Name: "{group}\Resume MARP work"; Filename: "{sys}\WindowsPowerShell\v1.0\powers
 Name: "{userstartup}\MARP Inference Worker"; Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File &quot;{app}\launcher.ps1&quot; -Screen window"
 
 [Run]
-Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File &quot;{tmp}\marp-worker-payload\bootstrap-windows.ps1&quot; -PayloadRoot &quot;{tmp}\marp-worker-payload&quot; -InstallRoot &quot;{app}&quot; -CoordinatorUrl &quot;{code:GetCoordinatorUrl}&quot; -ActivationCodeFile &quot;{tmp}\marp-worker-activation.txt&quot;"; StatusMsg: "Downloading and preparing the MARP worker. This can take several minutes..."; Flags: waituntilterminated
 Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File &quot;{app}\launcher.ps1&quot; -Screen window"; Description: "Start the MARP worker"; Flags: nowait postinstall skipifsilent
 
 [UninstallDelete]
 Type: filesandordirs; Name: "{app}"
 
 [Code]
-var
-  ConnectPage: TInputQueryWizardPage;
-
-procedure InitializeWizard;
-begin
-  ConnectPage := CreateInputQueryPage(wpSelectDir,
-    'Connect this worker to MARP',
-    'Enter the MARP API address and the one-time activation code.',
-    'Setup downloads and installs every required component automatically.');
-  ConnectPage.Add('MARP API URL:', False);
-  ConnectPage.Add('Activation code:', True);
-end;
-
-function NextButtonClick(CurPageID: Integer): Boolean;
-begin
-  Result := True;
-  if CurPageID = ConnectPage.ID then
-  begin
-    if (Trim(ConnectPage.Values[0]) = '') or (Trim(ConnectPage.Values[1]) = '') then
-    begin
-      MsgBox('Both the MARP API URL and activation code are required.', mbError, MB_OK);
-      Result := False;
-    end;
-  end;
-end;
-
 function GetCoordinatorUrl(Param: String): String;
 begin
-  Result := Trim(ConnectPage.Values[0]);
+  Result := '{#CoordinatorUrl}';
 end;
 
 function PrepareToInstall(var NeedsRestart: Boolean): String;
 begin
-  SaveStringToFile(ExpandConstant('{tmp}\marp-worker-activation.txt'), Trim(ConnectPage.Values[1]), False);
+  SaveStringToFile(ExpandConstant('{tmp}\marp-worker-activation.txt'), '{#EnrollmentCode}', False);
   Result := '';
+end;
+
+procedure CurStepChanged(CurStep: TSetupStep);
+var
+  ResultCode: Integer;
+  Parameters: String;
+begin
+  if CurStep <> ssPostInstall then
+    Exit;
+
+  Parameters := ExpandConstant(
+    '-NoProfile -ExecutionPolicy Bypass -File &quot;{tmp}\marp-worker-payload\bootstrap-windows.ps1&quot; ' +
+    '-PayloadRoot &quot;{tmp}\marp-worker-payload&quot; -InstallRoot &quot;{app}&quot; ' +
+    '-CoordinatorUrl &quot;{code:GetCoordinatorUrl}&quot; ' +
+    '-ActivationCodeFile &quot;{tmp}\marp-worker-activation.txt&quot;');
+  WizardForm.StatusLabel.Caption := 'Downloading and preparing the MARP worker. This can take several minutes...';
+
+  if not Exec(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'), Parameters,
+      '', SW_SHOW, ewWaitUntilTerminated, ResultCode) then
+    RaiseException('Windows could not start the MARP worker setup process.');
+
+  if ResultCode <> 0 then
+  begin
+    MsgBox('MARP worker setup failed. Error details are saved in:' + #13#10 +
+      ExpandConstant('{app}\setup.log'), mbError, MB_OK);
+    RaiseException('MARP worker setup failed.');
+  end;
 end;

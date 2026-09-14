@@ -1,94 +1,96 @@
 ---
-task: MarineAppliedResearch/marp-inference-worker#11
-repos: [marp-inference-worker, marp-video-player]
-status: verifying
+task: MarineAppliedResearch/marp-inference-worker#18
+repos: [marp-inference-worker, marp-api]
+status: implementing
 needs: []
 ---
 
 ## Goal
 
-An inference job may open a local screensaver-style MARP window showing the exact frames
-being processed, with the model's detections and tracks drawn as they happen.
+A person on a supported Windows NVIDIA computer opens one small MARP installer once. It
+prepares, activates, and starts the inference worker without asking them to install or
+understand developer tools, runtimes, browsers, or packages.
 
 ## Requirements
 
-- **R1** — A job with `params.watch: true` opens a local window by default. The worker may
-  explicitly use `--screen off` to suppress it or `--screen fullscreen` to start fullscreen.
-- **R2** — The local display uses marp-video-player and accepts frames already decoded by
-  inference rather than decoding the source again.
-- **R3** — Every produced frame is presented in order, without sampling, dropping, or
-  source-rate pacing. The browser acknowledges the synchronous canvas draw rather than a
-  visibility-dependent animation callback, so covered fullscreen windows keep consuming frames.
-- **R4** — Each species has one stable box/label colour. The top label is centered over
-  and sized to its box and contains only the species name. A centered bottom label shows
-  confidence while retaining track id and persistence.
-- **R5** — A quiet status area shows frame number, achieved rate, and live-track count. A
-  read-only timeline shows progress through the assigned frame range without pause or scrub input.
-  A translucent context strip shows the model name, MARP job number, and model class list.
-- **R6** — The display and frame channel bind only to loopback and expose no credential or
-  remote media URL.
-- **R7** — Closing or failing the window records one warning and continues inference
-  headless.
-- **R8** — The job child owns and closes its display resources.
-- **R9** — Watch mode changes no scientific output. With display disabled it performs no
-  encoding, browser, or frame-channel work.
-- **R10** — The job option is an additive boolean engine parameter and requires no API or
-  database change.
-- **R11** — Existing marp-video-player APIs and offline host behavior remain compatible.
-- **R12** — Escape leaves fullscreen for the normal app window; the window close control
-  closes the display and continues inference headless. Pause and scrubbing are unsupported.
-- **R13** — Concurrent watched jobs open visibly distinct, independent windows; audio is
-  muted, and an occluded window or a window returning from display sleep continues
-  presenting while another is in front.
-- **R14** — Installer, dependency distribution, self-update, activation, volunteer compute
-  controls, and remote viewing are separate work.
+- **R1** — The Windows x64 development installer is one-click and per-user. It requires no
+  preinstalled Python, Node, Git, browser, CUDA toolkit, or C++ compiler.
+- **R2** — The bootstrap remains small by downloading large versioned components during
+  setup, with visible aggregate progress. It does not bundle PyTorch, Chromium, models, or
+  the completed runtime inside its initial executable.
+- **R3** — Setup detects a supported NVIDIA driver and GPU and installs the approved runtime
+  variant. CUDA 12.6 is first, while release metadata can name other variants later.
+- **R4** — Every downloaded component has an approved URL, byte size, and SHA-256. Setup
+  rejects incomplete, altered, wrong-platform, and path-traversing content before use.
+- **R5** — The installer accepts a one-time activation code, creates a durable machine
+  identity, and exchanges the code for a narrowly scoped credential unique to that worker.
+- **R6** — The credential is protected with Windows DPAPI, is never logged or passed on a
+  command line, and remains outside replaceable version directories. MARP can revoke one
+  machine without affecting another.
+- **R7** — Setup installs versions side by side, points a stable launcher at the active
+  version, keeps persistent configuration and caches separately, and can uninstall cleanly.
+- **R8** — The installed worker starts in the interactive user session at Windows sign-in,
+  authenticates automatically, and permits visible watched-job windows by default.
+- **R9** — Models remain outside the installer and are downloaded, verified, and cached from
+  MARP_API when a job requests them.
+- **R10** — Setup reports understandable progress and actionable failures and finishes by
+  verifying worker startup, API enrollment, GPU discovery, and local health.
+- **R11** — The first milestone produces an unsigned development installer usable for a
+  real two-computer API job. Volunteer releases remain blocked on later code signing.
+- **R12** — The installation layout and manifest support later operator-requested atomic
+  updates and rollback without requiring that full update workflow in the first pilot.
 
 ## Open assumptions
 
-- [x] **A1 · product/UI · blocking** — answered 2026-09-14: machine policy is
-  `--screen off|window|fullscreen`, default window, and the job independently requests watch.
-- [x] **A2 · performance · blocking** — answered 2026-09-14: draw every frame in order as
-  fast as inference produces it; accepted display cost is measured rather than hidden.
-- [x] **A3 · environment · blocking** — corrected 2026-09-14: issue #11 uses a browser and
-  player build supplied by the development checkout. Packaging them is later work with an
-  explicit small-download design.
-- [x] **A4 · product/UI · blocking** — answered 2026-09-14: fullscreen, Escape, and close;
-  no pause or scrubbing, and closing never stops inference.
-- [x] **A5 · behavioural · blocking** — answered 2026-09-14: one independent window per
-  concurrently watched job, with no audio.
-- [x] **A6 · architectural · blocking** — settled 2026-09-14: the job child owns a local
-  loopback channel and receives already-decoded frames inline.
+- [x] **A1 · product/UI · blocking** — answered 2026-09-14: the volunteer clicks one setup
+  application; dependency installation is entirely handled by setup.
+- [x] **A2 · distribution · blocking** — answered 2026-09-14: the initial installer should
+  be small; large runtimes are downloaded during setup rather than embedded in it.
+- [x] **A3 · environment · blocking** — answered 2026-09-14: Windows x64 first, per user,
+  start at sign-in, CUDA 12.6 first, with other runtime variants possible later.
+- [x] **A4 · security/API contract · blocking** — answered 2026-09-14: a one-time activation
+  code becomes a unique revocable machine credential protected with DPAPI.
+- [x] **A5 · distribution/API contract · blocking** — answered 2026-09-14: MARP_API approves
+  release metadata; immutable packages may be downloaded from GitHub Releases.
+- [x] **A6 · release · blocking** — answered 2026-09-14: unsigned development installers are
+  acceptable for the pilot; public volunteer releases require code signing.
+- [x] **A7 · scope · blocking** — answered 2026-09-14: prove installation and a real job on a
+  second computer first; production automatic rollout follows as a separate milestone.
 
 ## Decisions
 
-- **2026-09-14** — Use marp-video-player's presentation surface.
-- **2026-09-14** — Keep machine and job display gates independent.
-- **2026-09-14** — Keep release packaging outside #11 after the first CUDA bundle measured
-  3,058,143,651 bytes and demonstrated that bundling the full ML runtime is unacceptable.
-- **2026-09-14** — Use species identity for annotation colour, split the label above and
-  below its box, cascade concurrent windows, and let Chromium return Escape to windowed mode.
+- **2026-09-14** — Reuse installer, launcher, activation, and manifest work preserved on
+  `backup-11-installer-scope`; remove its monolithic bundled-runtime approach.
+- **2026-09-14** — Treat bootstrap size and installed/downloaded size as separate facts. The
+  setup experience is one click even though GPU inference dependencies are necessarily large.
 
 ## Plan
 
-1. Add the player's external live-frame surface without changing existing media playback.
-2. Add worker launch and job gates.
-3. Feed ordered annotated frames from the tracking loop to a child-owned loopback display.
-4. Verify rendering, failure-to-headless behavior, scientific-output equivalence, and cost.
+1. Extract the existing installer, launcher, credential, and manifest code from the backup.
+2. Replace the bundled multi-gigabyte payload with verified component downloads.
+3. Implement the matching one-time activation endpoint and machine-bound credential.
+4. Register per-user start-at-sign-in and retain visible watch mode as the default.
+5. Build an unsigned development installer and write the focused verification plan.
+6. After plan approval, install it on the second computer and run one real API-assigned job.
 
 ## Acceptance criteria
 
-- A watched job shows every processed frame with readable species and track information.
-- Either gate being off produces no display work.
-- Closing or breaking the display leaves the job and its output intact.
-- The same range produces identical observations with display on and off, with throughput
-  recorded for both.
+- Opening the development installer on a clean supported Windows computer is the only manual
+  installation action.
+- The machine appears separately in the MARP worker pool with its real GPU capabilities.
+- Restarting Windows starts the worker without another activation or login.
+- A real assigned inference job downloads its model from MARP_API, runs, reports progress,
+  and displays its viewer when requested.
+- Removing or revoking that worker credential prevents only that machine from taking work.
 
 ## Test plan
 
-See `.marp/verification.md`.
+Written at G3 after the pilot implementation is assembled. It will name focused manifest,
+download, activation, credential, launcher, and clean-machine installation checks.
 
 ## Status
 
-- **Gate:** verifying.
-- **Notes:** Watch implementation exists in both repositories. Packaging work was removed
-  from this issue and retained only on local backup branches.
+- **Gate:** implementing
+- **Notes:** All material product, distribution, security, and first-platform decisions were
+  answered during issue #11 and carried here. The old branch is source material, not a base:
+  issue #18 starts from current `develop` and deliberately excludes its monolithic payload.

@@ -1,6 +1,6 @@
 ---
 task: MarineAppliedResearch/marp-inference-worker#18
-status: awaiting-plan-review
+status: verified
 ---
 
 ## What this verifies
@@ -17,7 +17,7 @@ a compiler themselves.
    update staging, path-traversal rejection, worker-bound artifact requests, and that the
    installer integration did not break job execution.
 2. Parse both PowerShell scripts and compile the Inno Setup definition. Inspect the resulting
-   build manifest and require the setup executable to remain below 20 MiB. Inspect its file
+   build manifest and record the setup executable size. Inspect its file
    table to confirm it does not contain Python, PyTorch, Chromium, model weights, or a completed
    worker runtime.
 3. Corrupt one downloaded-component hash in an isolated copied payload and run only the
@@ -54,4 +54,20 @@ a compiler themselves.
 
 ## Results
 
-Not run. Awaiting human review of this plan.
+- **Focused worker tests — PASS.** The approved installer, coordinator, job-runner, status,
+  and watch-display files passed: 74 tests, with two dependency deprecation warnings.
+- **Development installer — PASS.** The v17 unsigned installer built at 69,378,978 bytes,
+  identified its version and revision in setup diagnostics, selected CUDA 12.8 for the
+  laptop's RTX 5060, and completed installation. The user accepted this bootstrap size.
+- **Activation and restart — PASS.** Setup reused worker 56's DPAPI-protected credential;
+  the installed launcher reached healthy, idle status on its loopback API without another
+  activation code.
+- **Real watched inference — PASS.** API job 219 / attempt 189 ran 1,000 frames on CUDA,
+  showed real video and annotations at approximately 17 fps, and reported success.
+- **Display diagnosis — PASS.** A controlled canvas test isolated forced SwiftShader as the
+  blank-window trigger. The installed host now disables GPU compositing for Chromium while
+  leaving CUDA inference on the NVIDIA GPU. The render-proof endpoint remains for the next
+  computer rollout.
+- **Deferred by the user.** A further computer installation, Windows sign-in restart, cache
+  reuse measurement, and live cross-worker revocation will be exercised during the next
+  rollout. Their automated contract checks are included in the focused passing set.

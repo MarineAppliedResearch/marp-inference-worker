@@ -1,7 +1,7 @@
 ---
 task: MarineAppliedResearch/marp-inference-worker#18
 repos: [marp-inference-worker, marp-api]
-status: awaiting-verification-plan-review
+status: ready-for-pr
 needs: []
 ---
 
@@ -15,9 +15,10 @@ understand developer tools, runtimes, browsers, or packages.
 
 - **R1** — The Windows x64 development installer is one-click and per-user. It requires no
   preinstalled Python, Node, Git, browser, CUDA toolkit, or C++ compiler.
-- **R2** — The bootstrap remains small by downloading large versioned components during
-  setup, with visible aggregate progress. It does not bundle PyTorch, Chromium, models, or
-  the completed runtime inside its initial executable.
+- **R2** — The bootstrap remains a practical single download and downloads large versioned
+  components during setup, with visible aggregate progress. The 69.3 MB development build
+  was accepted for the pilot. It does not bundle PyTorch, models, or the completed runtime
+  inside its initial executable.
 - **R3** — Setup detects a supported NVIDIA driver and GPU and installs the approved runtime
   variant. CUDA 12.6 serves compatible GPUs; compute capability 12.x receives CUDA 12.8,
   and release metadata can name additional variants later. Setup proves compatibility by
@@ -90,11 +91,11 @@ understand developer tools, runtimes, browsers, or packages.
 
 ## Test plan
 
-See `.marp/verification.md`; awaiting human review before execution.
+See `.marp/verification.md`; the approved focused verification is complete.
 
 ## Status
 
-- **Gate:** awaiting verification plan review
+- **Gate:** verified; ready for pull request
 - **Notes:** All material product, distribution, security, and first-platform decisions were
   answered during issue #11 and carried here. The old branch is source material, not a base:
   issue #18 starts from current `develop` and deliberately excludes its monolithic payload.

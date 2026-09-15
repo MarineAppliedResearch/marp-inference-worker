@@ -41,6 +41,7 @@ try {
     }
     $WorkerCommit = (git rev-parse HEAD).Trim()
     Assert-LastExit 'Reading the worker revision'
+    $WorkerRevision = $WorkerCommit.Substring(0, 8)
     if (-not $Version) {
         $ProjectText = Get-Content -LiteralPath (Join-Path $Repository 'pyproject.toml') -Raw
         $Version = [regex]::Match($ProjectText, '(?m)^version = "([^"]+)"\r?$').Groups[1].Value
@@ -103,6 +104,7 @@ try {
     }
     if (-not $IsccPath) { throw 'Inno Setup 6 was not found. Pass -IsccPath.' }
     & $IsccPath "/DPayloadDir=$Payload" "/DOutputDir=$InstallerDir" "/DWorkerVersion=$Version" `
+        "/DWorkerRevision=$WorkerRevision" `
         "/DCoordinatorUrl=$CoordinatorUrl" "/DEnrollmentCode=$EnrollmentCode" `
         (Join-Path $PSScriptRoot 'windows-installer.iss')
     Assert-LastExit 'Building the one-click installer'

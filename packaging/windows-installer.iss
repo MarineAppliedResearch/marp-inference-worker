@@ -7,6 +7,9 @@
 #ifndef WorkerVersion
   #error WorkerVersion is required
 #endif
+#ifndef WorkerRevision
+  #error WorkerRevision is required
+#endif
 #ifndef CoordinatorUrl
   #error CoordinatorUrl is required
 #endif
@@ -77,14 +80,15 @@ begin
 
   if not Exec(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'), Parameters,
       '', SW_SHOW, ewWaitUntilTerminated, ResultCode) then
-    RaiseException('Windows could not start the MARP worker setup process.');
+    RaiseException('MARP Worker Setup {#WorkerVersion} ({#WorkerRevision}) could not start its setup process.');
 
   if ResultCode <> 0 then
   begin
     SaveStringToFile(ExpandConstant('{app}\setup.log'),
       'Bootstrap process exited with code ' + IntToStr(ResultCode) + '.' + #13#10, True);
-    MsgBox('MARP worker setup failed. Error details are saved in:' + #13#10 +
+    MsgBox('MARP Worker Setup {#WorkerVersion} ({#WorkerRevision}) failed.' + #13#10 +
+      'Error details are saved in:' + #13#10 +
       ExpandConstant('{app}\setup.log'), mbError, MB_OK);
-    RaiseException('MARP worker setup failed.');
+    RaiseException('MARP Worker Setup {#WorkerVersion} ({#WorkerRevision}) failed.');
   end;
 end;

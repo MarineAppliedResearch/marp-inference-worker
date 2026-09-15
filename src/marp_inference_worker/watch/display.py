@@ -26,10 +26,21 @@ def _chromium_args(chromium: Path, url: str, profile: Path, mode: str) -> list[s
         f"--user-data-dir={profile}",
         "--no-first-run",
         "--disable-sync",
+        # The display server is loopback-only. Corporate/system proxy settings can
+        # otherwise leave the app window stuck on its raw 127.0.0.1 URL.
+        "--no-proxy-server",
+        "--proxy-bypass-list=<-loopback>",
+        # New per-job profiles have no saved bounds. Pin the initial window to
+        # the primary display so disconnected monitors cannot hide it.
+        "--window-position=50,50",
         "--disable-background-timer-throttling",
         "--disable-backgrounding-occluded-windows",
         "--disable-renderer-backgrounding",
         "--disable-features=CalculateNativeWinOcclusion",
+        # Keep Chromium off the inference GPU. This laptop class renders the
+        # canvas through Chromium's CPU paint path when GPU compositing is off.
+        "--disable-gpu",
+        "--disable-gpu-compositing",
         "--mute-audio",
     ]
     args.append("--start-fullscreen" if mode == "fullscreen" else "--window-size=1100,700")
@@ -92,6 +103,8 @@ class _FrameChannel:
 class _WatchServer(ThreadingHTTPServer):
     channel: _FrameChannel
     player_root: Path
+    render_proof_path: Path
+    requests_seen: list[str]
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -102,6 +115,7 @@ class _Handler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler contract
         request_path = urlsplit(self.path).path
+        self.server.requests_seen.append(f"GET {request_path}")
         relative = "live.html" if request_path == "/" else request_path.lstrip("/")
         candidate = (self.server.player_root / relative).resolve()
         root = self.server.player_root.resolve()
@@ -121,7 +135,20 @@ class _Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler contract
-        if urlsplit(self.path).path != "/next":
+        request_path = urlsplit(self.path).path
+        self.server.requests_seen.append(f"POST {request_path}")
+        if request_path == "/render-proof":
+            size = int(self.headers.get("Content-Length", "0"))
+            if size <= 0 or size > 10 * 1024 * 1024:
+                self.send_error(HTTPStatus.BAD_REQUEST)
+                return
+            body = self.rfile.read(size)
+            if not self.server.render_proof_path.exists():
+                self.server.render_proof_path.write_bytes(body)
+            self.send_response(HTTPStatus.NO_CONTENT)
+            self.end_headers()
+            return
+        if request_path != "/next":
             self.send_error(HTTPStatus.NOT_FOUND)
             return
         try:
@@ -171,6 +198,7 @@ class WatchDisplay:
         self._channel = _FrameChannel()
         self._server: _WatchServer | None = None
         self._process: subprocess.Popen[bytes] | None = None
+        self._stderr_path = self._workspace / "chromium.stderr.log"
         self._warned = False
         self._closing = False
 
@@ -196,6 +224,8 @@ class WatchDisplay:
             self._server = _WatchServer(("127.0.0.1", 0), _Handler)
             self._server.channel = self._channel
             self._server.player_root = player_root
+            self._server.render_proof_path = self._workspace / "browser-render-proof.jpg"
+            self._server.requests_seen = []
             threading.Thread(target=self._server.serve_forever, daemon=True).start()
             port = self._server.server_address[1]
             profile = self._workspace / "chromium-profile"
@@ -206,12 +236,15 @@ class WatchDisplay:
                 self._mode,
             )
             creationflags = subprocess.CREATE_NEW_PROCESS_GROUP if sys.platform == "win32" else 0
-            self._process = subprocess.Popen(
-                args,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                creationflags=creationflags,
-            )
+            # Keep Chromium diagnostics with the attempt. A blank app window used
+            # to leave no evidence about navigation or page initialization.
+            with self._stderr_path.open("wb") as chromium_stderr:
+                self._process = subprocess.Popen(
+                    args,
+                    stdout=subprocess.DEVNULL,
+                    stderr=chromium_stderr,
+                    creationflags=creationflags,
+                )
             threading.Thread(target=self._watch_process, daemon=True).start()
             return True
         except Exception as error:
@@ -220,13 +253,25 @@ class WatchDisplay:
 
     def _watch_process(self) -> None:
         assert self._process is not None
-        self._process.wait()
+        exit_code = self._process.wait()
         if not self._closing:
-            self._detach("watch window closed; inference is continuing headless")
+            self._detach(
+                f"watch window closed with exit code {exit_code}; inference is continuing headless"
+            )
+
+    def _diagnostics(self) -> str:
+        requests_seen = list(self._server.requests_seen) if self._server is not None else []
+        request_summary = ", ".join(requests_seen[-8:]) or "none"
+        stderr_tail = ""
+        try:
+            stderr_tail = self._stderr_path.read_text(encoding="utf-8", errors="replace")[-2000:].strip()
+        except OSError:
+            pass
+        return f"requests=[{request_summary}]; chromium_stderr={stderr_tail or 'empty'}"
 
     def _detach(self, message: str) -> None:
         if not self._warned:
-            self._warn(message)
+            self._warn(f"{message}; {self._diagnostics()}")
             self._warned = True
         self._channel.close()
 

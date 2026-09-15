@@ -34,12 +34,40 @@ function Read-Lock([string]$Name) {
     Get-Content -LiteralPath (Join-Path $PayloadRoot $Name) -Raw | ConvertFrom-Json
 }
 
+function Get-Sha256([string]$Path) {
+    $Stream = [System.IO.File]::OpenRead($Path)
+    try {
+        $Algorithm = [System.Security.Cryptography.SHA256]::Create()
+        try {
+            return ([System.BitConverter]::ToString($Algorithm.ComputeHash($Stream))).Replace('-', '').ToLowerInvariant()
+        } finally {
+            $Algorithm.Dispose()
+        }
+    } finally {
+        $Stream.Dispose()
+    }
+}
+
+function Stop-InstalledProcesses {
+    $InstallPrefix = [System.IO.Path]::GetFullPath($InstallRoot).TrimEnd('\') + '\'
+    $Processes = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
+        $_.ExecutablePath -and $_.ExecutablePath.StartsWith($InstallPrefix, [System.StringComparison]::OrdinalIgnoreCase)
+    }
+    foreach ($Process in $Processes) {
+        Stop-Process -Id $Process.ProcessId -Force -ErrorAction SilentlyContinue
+    }
+    if ($Processes) {
+        Write-Host 'Stopped the installed MARP worker so it can be updated.'
+        Start-Sleep -Milliseconds 500
+    }
+}
+
 function Get-VerifiedArchive($Lock, [string]$Destination) {
     New-Item -ItemType Directory -Force -Path (Split-Path -Parent $Destination) | Out-Null
     Invoke-WebRequest -Uri $Lock.url -OutFile $Destination -UseBasicParsing
     $File = Get-Item -LiteralPath $Destination
     if ($File.Length -ne [int64]$Lock.size_bytes) { throw "$($Lock.name) download has the wrong size." }
-    $Hash = (Get-FileHash -LiteralPath $Destination -Algorithm SHA256).Hash.ToLowerInvariant()
+    $Hash = Get-Sha256 $Destination
     if ($Hash -ne $Lock.sha256) { throw "$($Lock.name) download failed SHA-256 verification." }
 }
 
@@ -77,6 +105,7 @@ Write-Host "Detected compute capability $ComputeCapabilityText; selecting $Compu
 $ReleaseKey = "$($BootstrapManifest.version)-$ComputeRuntime"
 $VersionRoot = Join-Path $InstallRoot "versions\$ReleaseKey"
 
+Stop-InstalledProcesses
 if (Test-Path -LiteralPath $VersionRoot) {
     Remove-Item -LiteralPath $VersionRoot -Recurse -Force
 }
@@ -132,7 +161,18 @@ Get-VerifiedArchive $ChromeLock $ChromeArchive
 $ChromeExtract = Join-Path $DownloadRoot 'chromium'
 if (Test-Path -LiteralPath $ChromeExtract) { Remove-Item -LiteralPath $ChromeExtract -Recurse -Force }
 Expand-Archive -LiteralPath $ChromeArchive -DestinationPath $ChromeExtract
-Move-Item -LiteralPath (Join-Path $ChromeExtract 'chrome-win') -Destination (Join-Path $VersionRoot 'chromium')
+$ChromeDestination = New-Item -ItemType Directory -Force -Path (Join-Path $VersionRoot 'chromium')
+Copy-Item -Path (Join-Path $ChromeExtract 'chrome-win\*') -Destination $ChromeDestination -Recurse -Force
+Remove-Item -LiteralPath $ChromeExtract -Recurse -Force
+
+# Chromium's subprocesses use Windows AppContainers. Grant those built-in
+# identities read/execute access only to the packaged browser directory.
+foreach ($Sid in @('*S-1-15-2-1', '*S-1-15-2-2')) {
+    & icacls.exe $ChromeDestination /grant:r "${Sid}:(OI)(CI)RX" /T /C | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        throw 'Failed to grant the Chromium sandbox access to the video display.'
+    }
+}
 
 @{
     version = $BootstrapManifest.version

@@ -23,7 +23,7 @@ def test_display_resolves_a_relative_worker_workspace() -> None:
     assert display._workspace.name == "1"
 
 
-def test_chromium_keeps_occluded_watch_windows_rendering() -> None:
+def test_chromium_keeps_occluded_watch_windows_rendering_without_the_cuda_gpu() -> None:
     args = _chromium_args(
         Path("chrome.exe"),
         "http://127.0.0.1:1234/",
@@ -35,7 +35,13 @@ def test_chromium_keeps_occluded_watch_windows_rendering() -> None:
     assert "--disable-backgrounding-occluded-windows" in args
     assert "--disable-renderer-backgrounding" in args
     assert "--disable-features=CalculateNativeWinOcclusion" in args
-    assert "--disable-gpu" not in args
+    assert "--no-proxy-server" in args
+    assert "--proxy-bypass-list=<-loopback>" in args
+    assert "--new-window" not in args
+    assert "--window-position=50,50" in args
+    assert "--disable-gpu" in args
+    assert "--disable-gpu-compositing" in args
+    assert "--use-angle=swiftshader" not in args
     assert "--start-fullscreen" in args
 
 

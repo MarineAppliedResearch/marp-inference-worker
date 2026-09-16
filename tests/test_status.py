@@ -136,8 +136,9 @@ def test_status_version_is_not_a_literal() -> None:
 # Output: pytest pass/fail result.
 # Proves R1's operator half: the loopback API can stop this worker taking new
 # work, and the reason is recorded.
-def test_pause_and_resume_change_what_status_reports() -> None:
+def test_pause_and_resume_change_what_status_reports(monkeypatch, tmp_path) -> None:
 
+    monkeypatch.setenv("MARP_WORKER_STATE_DIR", str(tmp_path))
     client = TestClient(app)
 
     # Pause with a reason.
@@ -155,3 +156,48 @@ def test_pause_and_resume_change_what_status_reports() -> None:
     assert resumed.json()["paused"] is False
     assert resumed.json()["pause_reason"] is None
     assert resumed.json()["status"] == "idle"
+
+
+def test_compute_controls_persist_and_resume(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("MARP_WORKER_STATE_DIR", str(tmp_path))
+    client = TestClient(app)
+
+    finishing = client.post("/status/control", json={"action": "finish"})
+    assert finishing.status_code == 200
+    assert finishing.json()["operator_action"] == "finish"
+    assert finishing.json()["paused"] is True
+
+    persisted = (tmp_path / "operator-control.json").read_text(encoding="utf-8")
+    assert '"action": "finish"' in persisted
+
+    stopping = client.post("/status/control", json={"action": "stop"})
+    assert stopping.json()["operator_action"] == "stop"
+
+    resumed = client.post("/status/control", json={"action": "resume"})
+    assert resumed.json()["operator_action"] == "running"
+    assert resumed.json()["paused"] is False
+
+
+def test_screen_shortcut_changes_future_job_display_policy() -> None:
+    client = TestClient(app)
+    response = client.post("/status/screen", json={"mode": "fullscreen"})
+
+    assert response.status_code == 200
+    assert response.json()["screen_mode"] == "fullscreen"
+    assert client.get("/status").json()["screen_mode"] == "fullscreen"
+
+    client.post("/status/screen", json={"mode": "off"})
+
+
+def test_watch_page_origin_can_call_loopback_controls() -> None:
+    client = TestClient(app)
+    response = client.options(
+        "/status/control",
+        headers={
+            "Origin": "http://127.0.0.1:54321",
+            "Access-Control-Request-Method": "POST",
+            "Access-Control-Request-Headers": "content-type",
+        },
+    )
+    assert response.status_code == 200
+    assert response.headers["access-control-allow-origin"] == "http://127.0.0.1:54321"

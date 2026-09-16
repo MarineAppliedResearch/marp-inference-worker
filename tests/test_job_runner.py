@@ -156,9 +156,13 @@ class FakeCoordinator:
 
     # check_artifact()
     # Answers whether the artifact is already held.
-    def check_artifact(self, sha256, size_bytes):
+    def check_artifact(self, worker_id, sha256, size_bytes):
 
-        self.artifact_checks.append({"sha256": sha256, "size_bytes": size_bytes})
+        self.artifact_checks.append({
+            "worker_id": worker_id,
+            "sha256": sha256,
+            "size_bytes": size_bytes,
+        })
         if self.already_have_artifact:
             return {"already_have": True}
 
@@ -189,6 +193,7 @@ class FakeCoordinator:
         outcome,
         artifacts=None,
         failure_reason=None,
+        completed_through_frame=None,
     ) -> dict[str, Any]:
 
         self.results.append(
@@ -199,6 +204,7 @@ class FakeCoordinator:
                 "outcome": outcome,
                 "artifacts": list(artifacts or []),
                 "failure_reason": failure_reason,
+                "completed_through_frame": completed_through_frame,
             }
         )
         return {"accepted": True, "idempotent": False}
@@ -324,7 +330,12 @@ def _job_for(
 # Builds a runner against a fake coordinator.
 # Inputs: the fake coordinator, the temporary state directory, and slot count.
 # Output: the runner and its worker state.
-def _runner(coordinator: FakeCoordinator, tmp_path: Path, slots: int = 1):
+def _runner(
+    coordinator: FakeCoordinator,
+    tmp_path: Path,
+    slots: int = 1,
+    screen_mode: str = "off",
+):
 
     state = WorkerState()
     runner = JobRunner(
@@ -332,6 +343,7 @@ def _runner(coordinator: FakeCoordinator, tmp_path: Path, slots: int = 1):
         state_dir=tmp_path / "state",
         worker_state=state,
         slot_count=slots,
+        screen_mode=screen_mode,
     )
     return runner, state
 
@@ -480,6 +492,7 @@ def test_job_runs_in_a_child_process_and_reports_success(tmp_path: Path) -> None
     # The results file was offered by hash, and no detections travelled inline.
     assert len(coordinator.artifact_checks) == 1
     check = coordinator.artifact_checks[0]
+    assert check["worker_id"] == "worker-for-test"
     assert len(check["sha256"]) == 64
     assert check["size_bytes"] > 0
     assert "detections" not in str(result)
@@ -672,6 +685,33 @@ def test_paused_worker_reports_no_free_slots(tmp_path: Path) -> None:
 
     state.set_paused(False)
     assert runner.free_slots() == 2
+
+
+def test_watch_display_requires_both_the_machine_policy_and_job_request(tmp_path: Path) -> None:
+    cases = [
+        ("off", True, None),
+        ("fullscreen", False, None),
+        ("fullscreen", True, "fullscreen"),
+    ]
+
+    for index, (screen_mode, requested, expected) in enumerate(cases):
+        offer = _job_for(
+            tmp_path,
+            f"attempt-watch-gate-{index}",
+            frames=100,
+            frame_delay_s=0.1,
+        )
+        offer["spec"]["params"]["watch"] = requested
+        coordinator = FakeCoordinator(offers=[offer])
+        runner, _state = _runner(coordinator, tmp_path / f"case-{index}", screen_mode=screen_mode)
+        runner.ensure_enrolled()
+
+        assert runner._poll_once() is True
+        job = runner._jobs_by_slot[0]
+        assert job.spec["params"].get("_watch_screen_mode") == expected
+
+        job.kill(grace_s=1)
+        runner._service_running_jobs()
 
 
 # test_unknown_heartbeat_action_is_treated_as_continue(tmp_path)

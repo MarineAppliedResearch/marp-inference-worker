@@ -640,11 +640,11 @@ def test_artifact_check_reports_the_size_under_the_field_the_coordinator_reads(c
     client, recorder = coordinator
     recorder.answer("/artifacts/check", 200, {"already_have": True})
 
-    client.check_artifact(sha256="c" * 64, size_bytes=10090)
+    client.check_artifact(worker_id="65", sha256="c" * 64, size_bytes=10090)
 
     body = recorder.for_path("/artifacts/check")[0]["body"]
 
-    assert body == {"sha256": "c" * 64, "bytes": 10090}
+    assert body == {"worker_id": 65, "sha256": "c" * 64, "bytes": 10090}
 
 
 # test_artifact_upload_posts_to_the_url_the_check_answered_with()

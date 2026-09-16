@@ -15,6 +15,7 @@
 # count, VRAM, driver, disk and engine list are discovered (R2).
 
 # os reads the two environment variables this worker is configured with.
+import argparse
 import os
 
 # threading runs the job loop beside the API server.
@@ -49,35 +50,48 @@ _STATE_DIR_ENV = "MARP_WORKER_STATE_DIR"
 # Use this from start_worker(). Raises when the token or address is missing,
 # because a worker with neither cannot do anything and should say so at start
 # rather than failing silently on its first poll.
-def build_runner():
+def build_runner(screen_mode: str = "window"):
 
     # Imported here so importing this module does not pull the runner's
     # dependency tree into a test that only wanted the API.
     from marp_inference_worker.jobs.coordinator_client import CoordinatorClient
     from marp_inference_worker.jobs.runner import JobRunner
     from marp_inference_worker.jobs.worker_state import WORKER_STATE
+    from marp_inference_worker.installation.operator_control import read_action
+
+    # State and its protected credential survive versions and restarts.
+    state_dir = Path(os.environ.get(_STATE_DIR_ENV) or (Path("data") / "worker"))
 
     # One token configures the worker.
     service_token = os.environ.get(_TOKEN_ENV)
     if not service_token:
-        raise RuntimeError(f"{_TOKEN_ENV} is not set; a worker is configured by one token")
+        from marp_inference_worker.installation.activation import credential_path
+        from marp_inference_worker.installation.credential_store import load
+
+        service_token = load(credential_path(state_dir))
+    if not service_token:
+        raise RuntimeError("this worker is not activated")
 
     # And one address to reach MARP at.
     coordinator_url = os.environ.get(_COORDINATOR_ENV)
     if not coordinator_url:
         raise RuntimeError(f"{_COORDINATOR_ENV} is not set")
 
-    # State lives on local disk and has to survive a restart.
-    state_dir = Path(os.environ.get(_STATE_DIR_ENV) or (Path("data") / "worker"))
-
     # Build the client and the runner.
     client = CoordinatorClient(base_url=coordinator_url, service_token=service_token)
-    runner = JobRunner(client=client, state_dir=state_dir, worker_state=WORKER_STATE)
+    runner = JobRunner(
+        client=client,
+        state_dir=state_dir,
+        worker_state=WORKER_STATE,
+        screen_mode=screen_mode,
+    )
 
     # Publish the discovered capabilities so /status has them before the first
     # poll, and so an operator can see what the machine reported.
     capabilities = runner.capabilities()
     WORKER_STATE.set_capabilities(capabilities, slot_count=int(capabilities["slots"]))
+    WORKER_STATE.set_operator_action(read_action())
+    WORKER_STATE.set_screen_mode(screen_mode)
 
     return runner
 
@@ -89,9 +103,9 @@ def build_runner():
 # Use this from the service entry point. A thread rather than a second process:
 # the loop and the API have to share one WorkerState, and a job's real isolation
 # is its own child process, which the runner already gives it.
-def start_worker():
+def start_worker(screen_mode: str = "window"):
 
-    runner = build_runner()
+    runner = build_runner(screen_mode)
 
     # Daemon, so a stopped API server does not leave the loop running. The
     # runner's own jobs are separate processes and are stopped through it.
@@ -108,12 +122,38 @@ def start_worker():
 # Use this as the process a GPU machine starts.
 def main() -> None:
 
+    parser = argparse.ArgumentParser(description="Run the MARP inference worker")
+    parser.add_argument(
+        "--screen",
+        choices=("off", "window", "fullscreen"),
+        default="window",
+        help="permit watched jobs to open a local display",
+    )
+    parser.add_argument("--activate-code-file", help=argparse.SUPPRESS)
+    parser.add_argument("--coordinator-url", help=argparse.SUPPRESS)
+    parser.add_argument("--state-dir", help=argparse.SUPPRESS)
+    args = parser.parse_args()
+
+    if args.activate_code_file:
+        from marp_inference_worker.installation.activation import activate
+
+        code_path = Path(args.activate_code_file)
+        try:
+            coordinator = args.coordinator_url or os.environ.get(_COORDINATOR_ENV)
+            if not coordinator:
+                raise RuntimeError("coordinator URL is required for activation")
+            state_dir = Path(args.state_dir or os.environ.get(_STATE_DIR_ENV) or (Path("data") / "worker"))
+            activate(coordinator, code_path.read_text(encoding="utf-8").strip(), state_dir)
+        finally:
+            code_path.unlink(missing_ok=True)
+        return
+
     # uvicorn serves the operator API.
     import uvicorn
 
     # Start taking work first, so a worker is useful even if the API fails to
     # bind -- the API is a window, not the service.
-    runner = start_worker()
+    runner = start_worker(args.screen)
 
     try:
         # Loopback only. Not a default that can be overridden by an environment

@@ -1,0 +1,9 @@
+{
+  "name": "uv",
+  "version": "0.12.13",
+  "platform": "windows",
+  "architecture": "x86_64",
+  "url": "https://releases.astral.sh/github/uv/releases/download/0.12.13/uv-x86_64-pc-windows-msvc.zip",
+  "size_bytes": 17612025,
+  "sha256": "a86c9dc7bad9b03f388583b7187c05fe9951c2e0d392217e8fd43d97787f6ec2"
+}

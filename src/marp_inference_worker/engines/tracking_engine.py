@@ -189,6 +189,10 @@ class TrackingEngine(BaseEngine):
         # Dataset type drives which survey rule picks the observation frame.
         data_type = str(params.get("data_type", "Fish"))
 
+        watch = None
+        screen_mode = str(params.get("_watch_screen_mode", "off"))
+        wants_watch = params.get("watch") is True and screen_mode in {"window", "fullscreen"}
+
         # Open the video and read its geometry once.
         ctx.report_progress(0, expected_frames, "frames", phase="opening_video")
         capture, geometry = open_video(str(video_source))
@@ -201,6 +205,21 @@ class TrackingEngine(BaseEngine):
         # A fresh tracker per range is what makes the boundary a seam (R10a).
         ctx.report_progress(0, expected_frames, "frames", phase="loading_model")
         yolo_model = self._detector.load_weights(model_path, device)
+        if wants_watch:
+            from marp_inference_worker.watch import WatchDisplay
+
+            model_names = yolo_model.names
+            species_names = [str(model_names[key]) for key in sorted(model_names)]
+            watch = WatchDisplay(
+                screen_mode=screen_mode,
+                workspace=ctx.checkpoint_dir.parent,
+                warn=lambda message: ctx.log(message, level="warning"),
+                job_id=str(params.get("_job_id") or "") or None,
+                model_name=str((spec.get("model") or {}).get("name") or "") or None,
+                species_names=species_names,
+            )
+            if not watch.start():
+                watch = None
         tracker, tracker_args = create_tracker(params)
         accumulator = TrackAccumulator(track_buffer=tracker_args.as_dict["track_buffer"])
 
@@ -212,6 +231,7 @@ class TrackingEngine(BaseEngine):
         observations_written = 0
         detections_seen = 0
         stopped_early = False
+        live_track_metadata: dict[int, dict[str, Any]] = {}
 
         try:
             # One line per observation, written as tracks finish, so a long job
@@ -247,7 +267,7 @@ class TrackingEngine(BaseEngine):
                     )
 
                     # Record each track's box on this frame.
-                    self._observe_tracks(
+                    live_tracks = self._observe_tracks(
                         accumulator=accumulator,
                         tracked=tracked,
                         detections=detections,
@@ -256,7 +276,18 @@ class TrackingEngine(BaseEngine):
                         frame_time_s=frame.time_s,
                         frame_width=geometry.width,
                         frame_height=geometry.height,
+                        live_track_metadata=live_track_metadata,
                     )
+
+                    if watch is not None and not watch.present(
+                        frame,
+                        frame.index,
+                        live_tracks,
+                        range_start=start_frame,
+                        range_end=end_frame,
+                    ):
+                        watch.close()
+                        watch = None
 
                     # Close and write out any track the tracker has lost.
                     for ended in accumulator.take_aged_out(frame.index):
@@ -352,6 +383,8 @@ class TrackingEngine(BaseEngine):
             # child process is reaped.
             capture.release()
             self._detector.unload_all()
+            if watch is not None:
+                watch.close()
 
     # _observe_tracks()
     # Records this frame's tracked boxes into the accumulator.
@@ -371,8 +404,12 @@ class TrackingEngine(BaseEngine):
         frame_time_s: float,
         frame_width: int,
         frame_height: int,
-    ) -> None:
+        live_track_metadata: dict[int, dict[str, Any]] | None = None,
+    ) -> list[dict[str, Any]]:
 
+        if live_track_metadata is None:
+            live_track_metadata = {}
+        live_tracks = []
         # Walk the tracks the tracker believes are present on this frame.
         for track in tracked:
             x1, y1, x2, y2 = (float(value) for value in track.tlbr)
@@ -405,10 +442,20 @@ class TrackingEngine(BaseEngine):
             if class_id != -1:
                 class_name = yolo_model.names.get(class_id, str(class_id))
 
+            track_id = int(track.track_id)
+            if class_id != -1:
+                live_track_metadata[track_id] = {
+                    "class_name": class_name,
+                }
+            display_metadata = live_track_metadata.get(
+                track_id,
+                {"class_name": class_name},
+            )
+
             # Normalize to centre form in 0..1, which is what the keyframe
             # reduction's thresholds are calibrated against.
             accumulator.observe(
-                track_id=int(track.track_id),
+                track_id=track_id,
                 class_name=class_name,
                 frame_index=frame_index,
                 frame_time_s=frame_time_s,
@@ -420,6 +467,24 @@ class TrackingEngine(BaseEngine):
                 ),
                 confidence=confidence,
             )
+
+            live_tracks.append(
+                {
+                    "track_id": track_id,
+                    "class_name": display_metadata["class_name"],
+                    # ByteTrack carries its score on every returned track,
+                    # including frames propagated by the tracker.
+                    "confidence": float(track.score),
+                    "bbox_normalized": [
+                        (x1 + x2) / 2 / frame_width,
+                        (y1 + y2) / 2 / frame_height,
+                        (x2 - x1) / frame_width,
+                        (y2 - y1) / frame_height,
+                    ],
+                }
+            )
+
+        return live_tracks
 
     # _write_observation()
     # Reduces one finished track and writes its observation to the results file.

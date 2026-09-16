@@ -1,0 +1,19 @@
+# The worker source is installed separately from the packaged source archive.
+# Keep this input to third-party runtime dependencies only.
+fastapi
+uvicorn[standard]
+pydantic
+httpx
+ultralytics==8.4.145
+opencv-python
+psutil
+nvidia-ml-py
+loguru
+scipy
+lap
+cython-bbox
+cython
+filterpy
+pyinstaller==6.22.2
+torch==2.10.0+cu128
+torchvision==0.25.0+cu128

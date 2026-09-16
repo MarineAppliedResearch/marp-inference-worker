@@ -1,0 +1,9 @@
+{
+  "name": "Chromium",
+  "version": "snapshot-1697351",
+  "platform": "windows",
+  "architecture": "x86_64",
+  "url": "https://storage.googleapis.com/chromium-browser-snapshots/Win_x64/1697351/chrome-win.zip",
+  "size_bytes": 355978824,
+  "sha256": "6bdfa087ffddf87816e46ff98b6b2b735e97c8a8ec410c57fd34b0a2f29ab08e"
+}

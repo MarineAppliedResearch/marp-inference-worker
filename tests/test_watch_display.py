@@ -701,3 +701,45 @@ def test_a_frame_the_window_cannot_take_is_never_encoded() -> None:
     # time, so the assertion is on the counter the skip path increments rather
     # than on a clock that would be flaky.
     assert encoded == []
+
+
+# test_a_window_re_tiles_when_the_worker_takes_another_job()
+# Verifies the layout follower reacts to the count changing.
+# Inputs: pytest monkeypatch.
+# Output: pytest pass/fail result.
+#
+# A window is tiled for the number of windows there were when it opened. The
+# worker decides how many jobs to run from measured throughput, so that number
+# changes while jobs are running -- and the windows already up kept their old
+# layout, so a third window landed on top of one of the first two.
+def test_a_window_re_tiles_when_the_worker_takes_another_job(monkeypatch) -> None:
+    from marp_inference_worker.watch import display as display_module
+
+    primary = (0, 0, 1920, 1080)
+    second = (1920, 0, 1920, 1080)
+
+    monkeypatch.setattr(display_module, "_monitors", lambda: [primary, second])
+    monkeypatch.delenv("MARP_WATCH_WINDOW_POSITION", raising=False)
+
+    # Slot 0 opened when there was one window: the whole first screen.
+    assert display_module._tile(0, 1) == primary
+
+    # A second job starts. Slot 0 keeps a whole screen, slot 1 takes the other.
+    assert display_module._tile(0, 2) == primary
+    assert display_module._tile(1, 2) == second
+
+    # A third starts, and this is the case that was broken: slot 0 must give up
+    # half its screen rather than stay full-width with the newcomer on top.
+    assert display_module._tile(0, 3) == (0, 0, 960, 1080)
+    assert display_module._tile(1, 3) == (960, 0, 960, 1080)
+    assert display_module._tile(2, 3) == second
+
+    # No two windows overlap, which is the property that actually matters.
+    tiles = [display_module._tile(i, 3) for i in range(3)]
+
+    for first_index in range(len(tiles)):
+        for second_index in range(first_index + 1, len(tiles)):
+            ax, ay, aw, ah = tiles[first_index]
+            bx, by, bw, bh = tiles[second_index]
+            overlaps = ax < bx + bw and bx < ax + aw and ay < by + bh and by < ay + ah
+            assert not overlaps, f"{tiles[first_index]} overlaps {tiles[second_index]}"

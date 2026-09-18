@@ -282,6 +282,74 @@ def _chromium_args(
     return args
 
 
+# _visible_windows()
+# Every visible top-level window a process owns.
+# Inputs: the process id.
+# Output: window handles, possibly empty.
+# Use this rather than taking the first one found. Chromium owns several, and
+# the first enumerated is not reliably the app window -- raising that one put
+# the work on something invisible while every call reported success.
+def _visible_windows(process_id: int) -> list[int]:
+
+    if sys.platform != "win32":
+        return []
+
+    import ctypes
+    from ctypes import wintypes
+
+    user32 = ctypes.windll.user32
+    found: list[int] = []
+
+    @ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
+    def visit(handle, _param):
+        owner = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(handle, ctypes.byref(owner))
+
+        if owner.value == process_id and user32.IsWindowVisible(handle):
+            found.append(handle)
+
+        return True
+
+    try:
+        user32.EnumWindows(visit, 0)
+    except Exception:
+        return []
+
+    return found
+
+
+# _move_windows()
+# Puts a process's windows at a rectangle, without disturbing the user.
+# Inputs: the process id and (x, y, width, height).
+# Output: none.
+#
+# `SWP_NOACTIVATE` and no `SetForegroundWindow`: this runs when the layout
+# changes underneath a window that is already open, and a screen saver that
+# steals focus every time another job starts is a screen saver nobody can work
+# beside. The one raise a window gets is when it first appears.
+def _move_windows(process_id: int, rect: tuple[int, int, int, int]) -> None:
+
+    if sys.platform != "win32":
+        return
+
+    import ctypes
+
+    user32 = ctypes.windll.user32
+    left, top, width, height = rect
+    SWP_NOACTIVATE = 0x0010
+    SWP_NOZORDER = 0x0004
+
+    for handle in _visible_windows(process_id):
+        try:
+            user32.SetWindowPos(
+                handle, 0, left, top, width, height, SWP_NOACTIVATE | SWP_NOZORDER
+            )
+        except Exception:
+            # Best effort. A window that will not move is worth less than the
+            # job it is showing.
+            pass
+
+
 # _bring_to_front()
 # Raises the watch window above whatever else is on screen.
 # Inputs: the Chromium process id.
@@ -788,6 +856,17 @@ class WatchDisplay:
                 args=(self._process.pid,),
                 daemon=True,
             ).start()
+
+            # And a second thread to keep it where it belongs as the layout
+            # changes. A window is tiled for the number of windows there were
+            # when it opened, so the ones already up keep a stale layout when
+            # another job starts -- a third window simply landed on top of one
+            # of the first two. Nothing else knows the count has changed, so
+            # each window watches for it and moves itself.
+            threading.Thread(
+                target=self._follow_layout,
+                daemon=True,
+            ).start()
             return True
         except Exception as error:
             self._detach(f"watch display could not start: {type(error).__name__}: {error}")
@@ -816,6 +895,52 @@ class WatchDisplay:
             self._warn(f"{message}; {self._diagnostics()}")
             self._warned = True
         self._channel.close()
+
+    # _follow_layout()
+    # Keeps this window in its tile as the number of windows changes.
+    # Inputs: none; reads the worker's own API.
+    # Output: none; runs until the display closes.
+    #
+    # The worker decides how many jobs to run from measured throughput, so the
+    # count changes while jobs are running. A window tiled for two does not
+    # move when a third opens, and the third is laid out for three -- so it
+    # lands on top of one of them. The layout has to be re-applied to the
+    # windows that are already up, and this is the only thing that knows which
+    # window belongs to which slot.
+    #
+    # Reads `permitted` rather than `total`: the ceiling is what the machine
+    # might grow to, and tiling for it leaves most of the screen empty.
+    def _follow_layout(self) -> None:
+
+        if sys.platform != "win32" or self._process is None:
+            return
+
+        import json as _json
+        import urllib.request
+
+        port = os.environ.get("MARP_WORKER_API_PORT", "8010")
+        url = f"http://127.0.0.1:{port}/status"
+        applied = self._slot_count
+
+        while not self._channel.closed:
+            time.sleep(5.0)
+
+            try:
+                with urllib.request.urlopen(url, timeout=3) as answer:
+                    status = _json.loads(answer.read().decode("utf-8"))
+
+                permitted = int((status.get("slots") or {}).get("permitted") or 0)
+            except Exception:
+                # The worker API being briefly unreachable is not a reason to
+                # stop watching the layout.
+                continue
+
+            if permitted < 1 or permitted == applied:
+                continue
+
+            # The count moved. Re-tile for what there are now.
+            applied = permitted
+            _move_windows(self._process.pid, _tile(self._slot_index, permitted))
 
     def present(
         self,

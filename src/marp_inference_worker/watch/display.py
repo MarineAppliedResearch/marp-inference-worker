@@ -43,8 +43,70 @@ def _chromium_args(chromium: Path, url: str, profile: Path, mode: str) -> list[s
         "--disable-gpu-compositing",
         "--mute-audio",
     ]
-    args.append("--start-fullscreen" if mode == "fullscreen" else "--window-size=1100,700")
+    # Maximised, not a fixed 1100x700 box. A watched job is something the
+    # volunteer is meant to see from across the room, and a small window behind
+    # whatever they had open is a screen saver nobody knows is running.
+    args.append("--start-fullscreen" if mode == "fullscreen" else "--start-maximized")
     return args
+
+
+# _bring_to_front()
+# Raises the watch window above whatever else is on screen.
+# Inputs: the Chromium process id.
+# Output: none.
+# Use this after launch, on Windows only.
+#
+# Chromium does not always come up in front: launched from a background service
+# it can open behind the active window, and a screen saver nobody can see is
+# the same as no screen saver. `--start-maximized` sizes it; only this puts it
+# in front. Best effort throughout -- a window that will not raise is worth
+# less than the job, so nothing here may raise.
+def _bring_to_front(process_id: int, attempts: int = 40) -> None:
+
+    if sys.platform != "win32":
+        return
+
+    import ctypes
+    from ctypes import wintypes
+
+    user32 = ctypes.windll.user32
+    found: list[int] = []
+
+    # EnumWindows rather than a title match: the page title is ours to change
+    # and matching on it would break the moment somebody edited live.html.
+    @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    def visit(handle, _param):
+        owner = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(handle, ctypes.byref(owner))
+        if owner.value == process_id and user32.IsWindowVisible(handle):
+            found.append(handle)
+            return False
+        return True
+
+    # The window does not exist the instant Popen returns, so wait for it
+    # rather than firing once and missing.
+    for _ in range(attempts):
+        found.clear()
+        try:
+            user32.EnumWindows(visit, 0)
+        except Exception:
+            return
+        if found:
+            break
+        time.sleep(0.25)
+
+    if not found:
+        return
+
+    handle = found[0]
+    try:
+        user32.ShowWindow(handle, 3)          # SW_MAXIMIZE
+        user32.SetForegroundWindow(handle)
+        user32.BringWindowToTop(handle)
+    except Exception:
+        # Windows refuses SetForegroundWindow from a process that does not own
+        # the foreground. The window is still maximised and still there.
+        pass
 
 
 class _FrameChannel:
@@ -291,6 +353,14 @@ class WatchDisplay:
                     creationflags=creationflags,
                 )
             threading.Thread(target=self._watch_process, daemon=True).start()
+
+            # Off-thread: raising the window waits for it to appear, and the
+            # job must not wait for that.
+            threading.Thread(
+                target=_bring_to_front,
+                args=(self._process.pid,),
+                daemon=True,
+            ).start()
             return True
         except Exception as error:
             self._detach(f"watch display could not start: {type(error).__name__}: {error}")

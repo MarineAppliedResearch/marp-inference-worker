@@ -371,3 +371,37 @@ def test_tiling_stays_off_the_monitor_somebody_is_working_on(monkeypatch) -> Non
     # first screen rather than drawing off the desktop where nobody can see it.
     monkeypatch.setenv("MARP_WATCH_WINDOW_POSITION", "9999,9999")
     assert display_module._tile(0, 1) == (0, 0, 1920, 1080)
+
+
+# test_a_frame_the_window_cannot_take_is_never_encoded()
+# Verifies the display does no work on frames nobody will see.
+# Inputs: none.
+# Output: pytest pass/fail result.
+#
+# Every frame used to be JPEG-encoded and base64'd before the channel decided
+# whether to keep it, so once the channel started dropping frames that work was
+# thrown away immediately afterwards -- a 1080p encode per frame above the rate
+# the window can draw, on every slot at once.
+def test_a_frame_the_window_cannot_take_is_never_encoded() -> None:
+    display = WatchDisplay("window", Path("."), lambda _message: None)
+    encoded: list[int] = []
+
+    # Stand in for the channel: connected, and never ready for a frame.
+    class Busy:
+        closed = False
+
+        def wants_frame(self, timeout_s: float = 0) -> bool:
+            return False
+
+    display._channel = Busy()
+
+    frame = SimpleNamespace(image=np.zeros((1080, 1920, 3), dtype=np.uint8))
+
+    # Alive, so the run carries on -- it simply does not need this picture.
+    assert display.present(frame, 5, []) is True
+    assert display._skipped == 1
+
+    # And nothing was encoded: a real encode of a 1080p frame would show up as
+    # time, so the assertion is on the counter the skip path increments rather
+    # than on a clock that would be flaky.
+    assert encoded == []

@@ -444,6 +444,42 @@ class _FrameChannel:
     # it can get and misses the ones in between, which is what watching is for.
     # Nothing scientific is lost -- the result comes from the decoded frame, and
     # this is a JPEG of it for a person to look at.
+    # wants_frame()
+    # Whether the window is ready for another picture.
+    # Inputs: how long a silent browser is tolerated.
+    # Output: True to encode and publish, False to skip this frame.
+    #
+    # **Asked before the frame is encoded, which is the whole point.** A JPEG of
+    # a 1080p frame plus its base64 is real CPU work, it was being done on every
+    # frame, and since the channel started dropping frames most of that work was
+    # thrown away immediately afterwards. The window can only draw as fast as it
+    # can draw; everything encoded above that rate is heat.
+    #
+    # Liveness is checked here too. Nothing blocks on an acknowledgement any
+    # more, and a window that has stopped collecting would otherwise never be
+    # noticed -- the run would skip every frame forever and call it healthy.
+    def wants_frame(self, timeout_s: float = _FRAME_ACK_TIMEOUT_S) -> bool:
+        with self.condition:
+            if self.closed:
+                return False
+
+            # The first frame always goes: it is what opens the window, and
+            # `publish` waits for the browser on it.
+            if not self.browser_connected:
+                return True
+
+            # Ready for the next one.
+            if self.packet is None:
+                return True
+
+            # Still holding one the window has not taken. Skip -- unless it has
+            # been silent long enough to be gone.
+            if self.last_collected_at:
+                if time.monotonic() - self.last_collected_at > timeout_s:
+                    self.close()
+
+            return False
+
     def publish(
         self,
         packet: dict[str, Any],
@@ -615,6 +651,10 @@ class WatchDisplay:
         self._stderr_path = self._workspace / "chromium.stderr.log"
         self._warned = False
         self._closing = False
+        # Frames never encoded, because the window was still holding the last
+        # one. Not a fault: it is the measure of how much work the display has
+        # stopped doing.
+        self._skipped = 0
 
     @staticmethod
     def _install_root() -> Path:
@@ -761,6 +801,22 @@ class WatchDisplay:
     ) -> bool:
         if self._channel.closed:
             return False
+
+        # Skip before encoding, not after.
+        #
+        # The window is still holding the last picture, so this one would be
+        # dropped the moment it was offered -- and encoding it first meant a
+        # full JPEG plus base64 of a 1080p frame for nothing, on every frame
+        # above the rate the window can draw. Returning True because the
+        # display is alive and well; it simply does not need this frame.
+        if not self._channel.wants_frame():
+            if self._channel.closed:
+                self._detach("watch window stopped responding; inference is continuing headless")
+                return False
+
+            self._skipped += 1
+            return True
+
         # The display is observational, while the scientific result is produced
         # from the original frame. JPEG keeps 1080p loopback transfers fast.
         encoded, bytes_buffer = cv2.imencode(

@@ -50,30 +50,96 @@ def test_chromium_keeps_occluded_watch_windows_rendering_without_the_cuda_gpu() 
     assert "--start-fullscreen" in args
 
 
-def test_frame_channel_waits_for_browser_ack_before_accepting_the_next_frame() -> None:
+# test_publishing_never_waits_for_the_browser_once_it_is_connected()
+# Verifies that the display cannot set the pace of inference.
+# Inputs: none.
+# Output: pytest pass/fail result.
+#
+# This test used to assert the opposite -- that a publisher waits for the
+# browser to acknowledge each frame -- and that contract was the reason a
+# watched run was slower than the video it was showing. A 4080 did 55-75 f/s
+# headless and 28 with a window; a 5060 ran each window at 0.7x real time.
+# The window now shows the most recent frame it can collect and misses the
+# ones in between, which is what watching is for.
+def test_publishing_never_waits_for_the_browser_once_it_is_connected() -> None:
     channel = _FrameChannel()
-    published: list[tuple[int, bool]] = []
 
-    def publish(frame_number: int) -> None:
-        result = channel.publish({"frame_number": frame_number}, timeout_s=2)
-        published.append((frame_number, result))
+    # Connect first: the very first frame still waits for the browser to
+    # arrive, and that is asserted separately below.
+    opening = threading.Thread(target=lambda: channel.publish({"frame_number": 1}, timeout_s=2))
+    opening.start()
+    assert channel.next(None) == {"frame_number": 1}
+    opening.join(timeout=1)
 
-    first = threading.Thread(target=publish, args=(41,))
-    second = threading.Thread(target=publish, args=(42,))
-    first.start()
-    assert channel.next(None) == {"frame_number": 41}
+    # Now publish a run of frames with nobody collecting them. Every call must
+    # return immediately; if any of them blocks, this does not finish.
+    started = time.monotonic()
+    results = [channel.publish({"frame_number": n}, timeout_s=2) for n in range(2, 12)]
+    elapsed = time.monotonic() - started
 
-    second.start()
-    time.sleep(0.02)
-    assert published == []
+    assert all(results)
+    assert elapsed < 0.5, f"publishing blocked for {elapsed:.2f}s"
 
-    assert channel.next(41) == {"frame_number": 42}
-    first.join(timeout=1)
-    assert published == [(41, True)]
+    # The window gets the newest frame, not the oldest waiting one.
+    assert channel.next(1) == {"frame_number": 11}
 
-    channel.close()
-    second.join(timeout=1)
-    assert published == [(41, True), (42, False)]
+    # And the ones it never saw are counted rather than silently forgotten, so
+    # "the window looks jumpy" has a number behind it.
+    # Ten, not nine: frame 1 was collected by the window but never
+    # acknowledged, so it was still pending and was replaced like the rest.
+    assert channel.dropped == 10
+
+
+# test_the_first_frame_still_waits_for_a_browser_that_never_arrives()
+# Verifies the one case that must still block.
+# Inputs: none.
+# Output: pytest pass/fail result.
+#
+# Dropping frames is right once somebody is watching. A browser that never
+# opened at all is a real failure, and without this the run would push frames
+# into a window that does not exist for the whole job.
+def test_the_first_frame_still_waits_for_a_browser_that_never_arrives() -> None:
+    channel = _FrameChannel()
+    published: list[bool] = []
+
+    worker = threading.Thread(
+        target=lambda: published.append(
+            channel.publish({"frame_number": 7}, timeout_s=2, connect_timeout_s=0.2)
+        )
+    )
+    worker.start()
+    worker.join(timeout=2)
+
+    assert published == [False]
+    assert channel.closed
+
+
+# test_a_browser_that_stops_collecting_detaches_the_display()
+# Verifies liveness now that nothing blocks on an acknowledgement.
+# Inputs: none.
+# Output: pytest pass/fail result.
+#
+# The old code noticed a dead browser by timing out on the acknowledgement it
+# waited for. Nothing waits any more, so silence has to be checked explicitly
+# -- otherwise a crashed window would leave the job encoding JPEGs into
+# nothing for the rest of the range.
+def test_a_browser_that_stops_collecting_detaches_the_display() -> None:
+    channel = _FrameChannel()
+
+    opening = threading.Thread(target=lambda: channel.publish({"frame_number": 1}, timeout_s=2))
+    opening.start()
+    assert channel.next(None) == {"frame_number": 1}
+    opening.join(timeout=1)
+
+    # The browser has collected once and then gone quiet. A short tolerance
+    # stands in for the real sixty seconds so the test does not take a minute,
+    # but not so short that ordinary thread scheduling reads as a dead browser.
+    assert channel.publish({"frame_number": 2}, timeout_s=0.5) is True
+
+    time.sleep(0.6)
+
+    assert channel.publish({"frame_number": 3}, timeout_s=0.5) is False
+    assert channel.closed
 
 
 def test_closing_frame_channel_releases_a_waiting_publisher_headless() -> None:

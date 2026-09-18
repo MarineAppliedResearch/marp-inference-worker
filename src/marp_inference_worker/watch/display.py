@@ -394,17 +394,56 @@ class _FrameChannel:
         self.closed = False
         self.browser_connected = False
 
+        # Frames the window never saw, because a newer one arrived first. Not a
+        # fault: it is the display keeping up with inference rather than the
+        # other way round, and the count is worth having so "the window looks
+        # jumpy" can be answered with a number.
+        self.dropped = 0
+
+        # When a frame was last offered, and when the window last came to
+        # collect one. Their difference is how long the browser has been
+        # silent, which is the only remaining way to notice it has gone.
+        self.last_offered_at = 0.0
+        self.last_collected_at = 0.0
+
     def next(self, acknowledged: int | None) -> dict[str, Any] | None:
         with self.condition:
             self.browser_connected = True
+            self.last_collected_at = time.monotonic()
+
             if acknowledged is not None:
                 self.acknowledged = acknowledged
                 if self.packet and self.packet["frame_number"] == acknowledged:
                     self.packet = None
-                self.condition.notify_all()
+
+            # Notified unconditionally, not only when an acknowledgement came.
+            # The browser's *first* request carries no acknowledgement, and it
+            # is the one the opening publisher is waiting on -- without this it
+            # waits out its connect timeout with the window already open, which
+            # put a minute of nothing at the start of every watched job.
+            self.condition.notify_all()
+
             self.condition.wait_for(lambda: self.packet is not None or self.closed)
             return self.packet
 
+    # publish()
+    # Offers a frame to the window without waiting for it to be drawn.
+    # Inputs: the packet, and how long a silent browser is tolerated.
+    # Output: True while the display is alive; False once it has detached.
+    #
+    # **The display must never set the pace of inference.** This used to wait
+    # for the browser to acknowledge every single frame before returning, so a
+    # run went exactly as fast as Chromium could draw: 55-75 f/s headless on a
+    # 4080 became 28 with a window, and four windowed slots together produced
+    # about what one headless slot did. On a smaller card each window ran at
+    # 0.7x real time -- a screen saver that made the machine slower than the
+    # video it was showing.
+    #
+    # Now the newest frame simply replaces whatever the window has not yet
+    # collected. Inference never blocks; the window shows the most recent frame
+    # it can get and misses the ones in between, which is what watching is for.
+    # Nothing scientific is lost -- the result comes from the decoded frame, and
+    # this is a JPEG of it for a person to look at.
     def publish(
         self,
         packet: dict[str, Any],
@@ -412,24 +451,48 @@ class _FrameChannel:
         connect_timeout_s: float = 60.0,
     ) -> bool:
         with self.condition:
-            if not self.condition.wait_for(
-                lambda: self.packet is None or self.closed,
-                timeout=timeout_s,
-            ):
-                self.close()
-                return False
             if self.closed:
                 return False
-            waiting_for_browser = not self.browser_connected
+
+            # The first frame still waits, and only the first. A browser that
+            # never arrives is a real failure worth detaching over, and without
+            # this the run would carry on pushing frames into a window that was
+            # never opened.
+            if not self.browser_connected:
+                self.packet = packet
+                self.condition.notify_all()
+
+                if not self.condition.wait_for(
+                    lambda: self.browser_connected or self.closed,
+                    timeout=connect_timeout_s,
+                ):
+                    self.close()
+                    return False
+
+                return not self.closed
+
+            # Connected. Replace whatever is pending rather than waiting for it
+            # to be taken: the window wants the latest picture, not a queue of
+            # stale ones.
+            if self.packet is not None:
+                self.dropped += 1
+
             self.packet = packet
+            self.last_offered_at = time.monotonic()
             self.condition.notify_all()
-            if not self.condition.wait_for(
-                lambda: self.acknowledged == packet["frame_number"] or self.closed,
-                timeout=connect_timeout_s if waiting_for_browser else timeout_s,
-            ):
+
+            # Liveness without blocking. A browser that has stopped asking for
+            # frames is gone -- closed, crashed, or hung -- and detaching lets
+            # the job carry on headless instead of drawing into nothing. The
+            # old code noticed this by timing out on the acknowledgement it no
+            # longer waits for, so the check has to be made explicitly.
+            silent_for = self.last_offered_at - self.last_collected_at
+
+            if self.last_collected_at and silent_for > timeout_s:
                 self.close()
                 return False
-            return not self.closed
+
+            return True
 
     def close(self) -> None:
         with self.condition:

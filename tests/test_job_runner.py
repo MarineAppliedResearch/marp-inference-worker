@@ -1580,3 +1580,53 @@ def test_the_video_source_url_back_door_is_gone() -> None:
     for path, module_name in _job_path_module_paths():
         source = path.read_text(encoding="utf-8")
         assert "video_source_url" not in source, f"{module_name} still names video_source_url"
+
+
+# test_an_operator_stop_reports_yielded_with_the_frame_it_reached(tmp_path)
+# Verifies what the worker actually sends when a volunteer presses stop.
+# Inputs: pytest temporary directory.
+# Output: pytest pass/fail result.
+#
+# Nothing tested the stop path at all, which is how the worker came to report
+# an outcome the coordinator had never accepted: it answered 400, the attempt
+# was never published, and the frames the run had really done were lost. Both
+# suites were green throughout, each against its own idea of the vocabulary.
+#
+# Three things are asserted together because they are one contract:
+# the word, the frame, and the absence of a failure reason. MARP_API's matching
+# test proves it accepts exactly this.
+def test_an_operator_stop_reports_yielded_with_the_frame_it_reached(tmp_path: Path) -> None:
+
+    offer = _job_for(tmp_path, "attempt-yield", frames=400, frame_delay_s=0.05, start_frame=1000)
+    coordinator = FakeCoordinator(offers=[offer])
+    runner, state = _runner(coordinator, tmp_path)
+    runner.ensure_enrolled()
+
+    assert runner._poll_once() is True
+    job = runner._jobs_by_slot[0]
+
+    # Let it do some real work first. A stop at frame zero would pass even if
+    # the frame count were hard-coded, and the number is half the point.
+    assert _wait_until(runner, lambda: (job.progress or {}).get("done", 0) >= 5)
+
+    # The volunteer's own control, through the durable file the operator API
+    # writes -- not by calling request_yield() directly, so the whole path from
+    # "stop" to the report is what is under test.
+    state.set_operator_action("stop")
+    assert _wait_until(runner, lambda: bool(coordinator.results))
+
+    result = coordinator.results[0]
+
+    # The word. This is the one that was wrong.
+    assert result["outcome"] == "yielded"
+
+    # The frame. Exclusive, and therefore already the next start_frame under
+    # the half-open convention -- MARP resumes from exactly this number, so an
+    # off-by-one here silently skips or repeats a frame on every hand-over.
+    reached = result["completed_through_frame"]
+    assert reached is not None
+    assert 1000 < reached <= 1400
+
+    # A stop is not a failure and must not describe itself as one. The column
+    # carried "the worker reported yielded" on every ordinary stop.
+    assert result["failure_reason"] is None

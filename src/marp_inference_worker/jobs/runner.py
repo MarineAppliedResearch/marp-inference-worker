@@ -104,8 +104,12 @@ _UPDATE_CHECK_INTERVAL_S = 60.0
 # event stream alongside it.
 def _failure_reason(outcome: str, payload: dict[str, Any]) -> str | None:
 
-    # A success has nothing to explain.
-    if outcome == "succeeded":
+    # A success has nothing to explain, and neither does a yield: the operator
+    # stopped it, which `completed_through_frame` already says better than a
+    # sentence could. Filling the column anyway put "the worker reported
+    # yielded" on the attempt row of every ordinary stop -- a failure reason
+    # reading as a failure, on something that is not one.
+    if outcome in ("succeeded", "yielded"):
         return None
 
     # Prefer what the engine actually said.

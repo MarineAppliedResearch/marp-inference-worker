@@ -361,10 +361,53 @@ def _move_windows(process_id: int, rect: tuple[int, int, int, int]) -> None:
 # the same as no screen saver. `--start-maximized` sizes it; only this puts it
 # in front. Best effort throughout -- a window that will not raise is worth
 # less than the job, so nothing here may raise.
-def _bring_to_front(process_id: int, attempts: int = 40) -> None:
+# How long the machine must have been untouched before a watch window is
+# allowed to take the foreground, in seconds.
+#
+# A screen saver that jumps in front of somebody mid-sentence is a screen saver
+# they uninstall. The window still opens and still tiles; it simply opens behind
+# what they are doing and waits its turn.
+_IDLE_BEFORE_RAISE_S = 45.0
+
+
+# _seconds_since_input()
+# How long since the volunteer last touched this machine.
+# Inputs: none.
+# Output: seconds, or None when the platform cannot say.
+# Use this before taking the foreground. `GetLastInputInfo` counts keyboard and
+# mouse across the whole session, which is the question being asked -- not
+# whether this process has focus.
+def _seconds_since_input() -> float | None:
 
     if sys.platform != "win32":
-        return
+        return None
+
+    import ctypes
+    from ctypes import wintypes
+
+    class _LastInput(ctypes.Structure):
+        _fields_ = [("cbSize", wintypes.UINT), ("dwTime", wintypes.DWORD)]
+
+    info = _LastInput()
+    info.cbSize = ctypes.sizeof(_LastInput)
+
+    if not ctypes.windll.user32.GetLastInputInfo(ctypes.byref(info)):
+        return None
+
+    # Both are millisecond tick counts that wrap after 49 days; the subtraction
+    # is masked to 32 bits so a wrap reads as a small number rather than a
+    # negative one, which would look like input from the future.
+    elapsed_ms = (ctypes.windll.kernel32.GetTickCount() - info.dwTime) & 0xFFFFFFFF
+    return elapsed_ms / 1000.0
+
+
+# _window_handles_for()
+# Every visible top-level window a process owns.
+# Inputs: the process id, and how many quarter-seconds to wait for one.
+# Output: the handles, newest search each call.
+# Separated from the raise so the decision about *whether* to raise can be
+# tested without a real window, which is the half that has been wrong twice.
+def _window_handles_for(process_id: int, attempts: int = 40) -> list[int]:
 
     import ctypes
     from ctypes import wintypes
@@ -403,8 +446,32 @@ def _bring_to_front(process_id: int, attempts: int = 40) -> None:
             break
         time.sleep(0.25)
 
-    if not found:
+    return found
+
+
+def _bring_to_front(process_id: int, attempts: int = 40) -> None:
+
+    if sys.platform != "win32":
         return
+
+    # Do not interrupt somebody who is using their own computer.
+    #
+    # The window is already open and already in the right place; this only
+    # decides whether it is pulled in front. Stealing focus from a volunteer
+    # mid-keystroke is the single most likely reason they stop donating the
+    # machine, and it is not worth a window they can raise themselves.
+    idle = _seconds_since_input()
+
+    if idle is not None and idle < _IDLE_BEFORE_RAISE_S:
+        return
+
+    handles = _window_handles_for(process_id, attempts)
+
+    if not handles:
+        return
+
+    import ctypes
+    user32 = ctypes.windll.user32
 
     # Constants, named once rather than repeated as magic numbers.
     HWND_TOPMOST = -1
@@ -444,7 +511,7 @@ def _bring_to_front(process_id: int, attempts: int = 40) -> None:
     #
     # `HWND_TOPMOST` followed immediately by `HWND_NOTOPMOST` is what lifts it
     # above every ordinary window without pinning it there.
-    for handle in list(found):
+    for handle in list(handles):
         try:
             user32.ShowWindow(handle, SW_SHOWNORMAL)
             user32.SetWindowPos(handle, HWND_TOPMOST, 0, 0, 0, 0, FLAGS)
@@ -469,11 +536,11 @@ def _bring_to_front(process_id: int, attempts: int = 40) -> None:
         if their_thread and their_thread != our_thread:
             user32.AttachThreadInput(our_thread, their_thread, True)
             try:
-                user32.SetForegroundWindow(found[0])
+                user32.SetForegroundWindow(handles[0])
             finally:
                 user32.AttachThreadInput(our_thread, their_thread, False)
         else:
-            user32.SetForegroundWindow(found[0])
+            user32.SetForegroundWindow(handles[0])
     except Exception:
         pass
 

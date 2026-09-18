@@ -161,10 +161,52 @@
     return `hsl(${hue.toFixed(1)} ${saturation}% ${lightness}%)`;
   }
 
+  // A frosted plate behind text, so a name stays readable over pale sand and
+  // dark water alike without a solid block hiding the animal.
+  //
+  // Real blur rather than a flat wash: the region under the text is redrawn
+  // through a blur filter and then dimmed very slightly. `filter` is reset
+  // afterwards because it is sticky on a 2d context and would blur the video.
+  function frostedPlate(x, y, width, height) {
+    const pad = Math.max(3, view.width / 400);
+    const left = x - pad;
+    const top = y - pad;
+    const boxW = width + pad * 2;
+    const boxH = height + pad * 2;
+
+    paint.save();
+    paint.beginPath();
+    const radius = Math.min(boxH / 2, Math.max(3, view.width / 300));
+    paint.roundRect(left, top, boxW, boxH, radius);
+    paint.clip();
+    paint.filter = `blur(${Math.max(2, view.width / 500)}px)`;
+    paint.drawImage(view, 0, 0);
+    paint.filter = 'none';
+    paint.fillStyle = 'rgba(0, 0, 0, 0.18)';
+    paint.fillRect(left, top, boxW, boxH);
+    paint.restore();
+  }
+
+  // One line of white text, centred on `centreX`, on its own frosted plate.
+  function plateText(text, centreX, baselineY, pixels, weight) {
+    paint.font = `${weight} ${pixels}px "Segoe UI", system-ui, sans-serif`;
+    const width = paint.measureText(text).width;
+    const left = centreX - width / 2;
+
+    frostedPlate(left, baselineY - pixels, width, pixels * 1.18);
+    // A shadow as well as the plate: over bright sand the plate alone is not
+    // enough, and the shadow costs nothing where it is not needed.
+    paint.shadowColor = 'rgba(0, 0, 0, 0.85)';
+    paint.shadowBlur = Math.max(2, pixels / 6);
+    paint.fillStyle = '#ffffff';
+    paint.fillText(text, left, baselineY);
+    paint.shadowBlur = 0;
+    paint.shadowColor = 'transparent';
+  }
+
   function drawTracks(tracks) {
     paint.lineWidth = Math.max(2, view.width / 480);
-    paint.font = `${Math.max(13, Math.round(view.width / 62))}px "Segoe UI", sans-serif`;
-    paint.textBaseline = 'bottom';
+    paint.textBaseline = 'alphabetic';
 
     for (const track of tracks || []) {
       // bbox_normalized is [centre_x, centre_y, width, height], all 0..1 of
@@ -174,23 +216,40 @@
       const y = (cy - h / 2) * view.height;
       const boxWidth = w * view.width;
       const boxHeight = h * view.height;
-      const colour = colourFor(track.class_name);
+      const centreX = cx * view.width;
 
-      paint.strokeStyle = colour;
+      paint.strokeStyle = colourFor(track.class_name);
       paint.strokeRect(x, y, boxWidth, boxHeight);
 
-      const confidence = typeof track.confidence === 'number'
-        ? ` ${track.confidence.toFixed(2)}` : '';
-      const label = `${track.class_name ?? 'unknown'} #${track.track_id}${confidence}`;
-      const textWidth = paint.measureText(label).width;
-      const textHeight = parseInt(paint.font, 10) + 6;
+      // The name scales with the box, so a large animal is labelled large and a
+      // distant one does not wear a label wider than itself. Bounded at both
+      // ends: unreadable below about 12px, and a single close organism would
+      // otherwise carry text across the whole frame.
+      const namePixels = Math.round(
+        Math.min(Math.max(boxWidth * 0.17, view.width / 90), view.width / 22));
+      const detailPixels = Math.round(namePixels * 0.72);
 
-      // Label inside the box when it would otherwise run off the top edge.
-      const labelY = y - 2 < textHeight ? y + boxHeight + textHeight : y - 2;
-      paint.fillStyle = colour;
-      paint.fillRect(x, labelY - textHeight, textWidth + 10, textHeight);
-      paint.fillStyle = '#04070a';
-      paint.fillText(label, x + 5, labelY - 3);
+      const name = String(track.class_name ?? 'unknown');
+      const confidence = typeof track.confidence === 'number'
+        ? track.confidence.toFixed(2) : null;
+      // `track_id` is the tracker's identity for this animal across frames. It
+      // is not an observation id -- observations do not exist until MARP
+      // ingests the run -- so it is shown as a track and not mislabelled.
+      const detail = confidence === null
+        ? `#${track.track_id}` : `#${track.track_id} · ${confidence}`;
+
+      // Name above the box, detail below it, both centred on the box. Flipped
+      // when the box is near an edge, so a label never leaves the frame.
+      const gap = Math.max(4, namePixels * 0.35);
+      const nameAbove = y - gap > namePixels * 1.2;
+      const detailBelow = y + boxHeight + gap + detailPixels < view.height;
+
+      plateText(name, centreX,
+        nameAbove ? y - gap : y + boxHeight + gap + namePixels, namePixels, 700);
+      plateText(detail, centreX,
+        detailBelow ? y + boxHeight + gap + detailPixels
+                    : Math.max(detailPixels * 1.2, y - gap - namePixels * 1.2),
+        detailPixels, 500);
     }
   }
 

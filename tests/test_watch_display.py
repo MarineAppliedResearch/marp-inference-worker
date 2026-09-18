@@ -790,3 +790,37 @@ def test_a_frame_packet_says_which_attempt_it_belongs_to(tmp_path: Path) -> None
 
     assert published[0]["attempt_id"] == "3170"
     assert published[0]["job_id"] == "4659"
+
+
+# test_a_busy_machine_is_not_interrupted(monkeypatch)
+# Verifies the watch window does not steal focus from somebody working.
+# Inputs: pytest monkeypatch.
+# Output: pytest pass/fail result.
+#
+# The window still opens and still tiles; only the raise is withheld. A screen
+# saver that jumps in front of a volunteer mid-keystroke is the likeliest single
+# reason they stop donating the machine, which costs far more than a window they
+# can raise themselves.
+def test_a_busy_machine_is_not_interrupted(monkeypatch) -> None:
+    from marp_inference_worker.watch import display as display_module
+
+    raised: list[int] = []
+    monkeypatch.setattr(display_module.sys, "platform", "win32")
+    monkeypatch.setattr(display_module, "_window_handles_for", lambda pid, attempts: raised.append(pid) or [])
+
+    # Actively typing: left alone.
+    monkeypatch.setattr(display_module, "_seconds_since_input", lambda: 2.0)
+    display_module._bring_to_front(1234)
+    assert raised == []
+
+    # Idle long enough: the window may come forward.
+    monkeypatch.setattr(display_module, "_seconds_since_input",
+                        lambda: display_module._IDLE_BEFORE_RAISE_S + 1)
+    display_module._bring_to_front(1234)
+    assert raised == [1234]
+
+    # A platform that cannot answer must not become a platform that never
+    # raises -- silence is not the same as "somebody is typing".
+    monkeypatch.setattr(display_module, "_seconds_since_input", lambda: None)
+    display_module._bring_to_front(5678)
+    assert raised == [1234, 5678]

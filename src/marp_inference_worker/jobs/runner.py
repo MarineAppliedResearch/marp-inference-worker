@@ -152,6 +152,16 @@ class JobRunner:
         self._workspace_root = state_dir / "jobs"
         self._inflight_path = state_dir / "in-flight.json"
 
+        # Results the coordinator would not take. Held here, written into the
+        # in-flight record and retried at the next start.
+        #
+        # Without this a refused result vanished: the slot was freed, the
+        # in-flight record was rewritten without the job, and the only trace was
+        # a line in `last_error`. The attempt stayed leased upstream until the
+        # lease and then the 24h cap decided for it, and nothing ever reported
+        # it again. That is how an operator stop lost its work for weeks.
+        self._unreported: list[dict[str, Any]] = []
+
         # The object the FastAPI app reads for /status and writes for pause.
         self._state = worker_state
         self._state.set_screen_mode(screen_mode)
@@ -286,7 +296,35 @@ class JobRunner:
                 # worker from coming back up; the lease will expire instead.
                 pass
 
-        # Clear it either way, so the same job is not reported lost forever.
+        # Then the results the coordinator refused last time, re-sent exactly
+        # as they were. These are not losses: the work finished and MARP would
+        # not take the answer, so the answer is offered again rather than
+        # rewritten into something MARP prefers. The `yielded` mismatch is the
+        # case this exists for -- once the coordinator learned the word, every
+        # stop a worker had been unable to report becomes reportable, and
+        # without this they were already gone.
+        for owed in record.get("unreported", []):
+            try:
+                self._client.report_result(
+                    attempt_id=str(owed["attempt_id"]),
+                    worker_id=str(owed["worker_id"]),
+                    lease_epoch=int(owed["lease_epoch"]),
+                    outcome=str(owed["outcome"]),
+                    artifacts=owed.get("artifacts") or [],
+                    failure_reason=owed.get("failure_reason"),
+                    completed_through_frame=owed.get("completed_through_frame"),
+                )
+            except CoordinatorError as error:
+                # Still refused. Say so where the operator can see it, rather
+                # than only in a coordinator event they cannot read.
+                self._state.note_error(
+                    f"still cannot report {owed.get('outcome')} for attempt "
+                    f"{owed.get('attempt_id')}: {error}"
+                )
+
+        # Clear it either way, so the same job is not reported forever. A
+        # result refused twice is dropped deliberately: retrying a permanent
+        # refusal at every start is a loop, and `last_error` now carries it.
         self._inflight_path.unlink(missing_ok=True)
 
     # _write_inflight()
@@ -297,9 +335,11 @@ class JobRunner:
     # launched, so a crash in between still leaves the record.
     def _write_inflight(self) -> None:
 
-        # An empty set of jobs means no record at all, which is what a clean
-        # idle worker should leave behind.
-        if not self._jobs_by_slot:
+        # Nothing running and nothing owed means no record at all, which is
+        # what a clean idle worker should leave behind. A refused result counts
+        # as owed: the file has to outlive the job it belongs to, or the retry
+        # at the next start has nothing to read.
+        if not self._jobs_by_slot and not self._unreported:
             self._inflight_path.unlink(missing_ok=True)
             return
 
@@ -316,7 +356,8 @@ class JobRunner:
                             "progress": job.current_progress(),
                         }
                         for job in self._jobs_by_slot.values()
-                    ]
+                    ],
+                    "unreported": self._unreported,
                 },
                 indent=2,
             ),
@@ -887,7 +928,21 @@ class JobRunner:
         except CoordinatorError as error:
             self._state.note_error(f"could not report result for {job.attempt_id}: {error}")
 
-        # Free the slot and clear the in-flight record.
+            # Keep everything needed to say the same thing again. The outcome
+            # is kept as it was -- a refused yield is retried as a yield, not
+            # downgraded to a failure, because the coordinator refusing a word
+            # today does not make the run a failure.
+            self._unreported.append({
+                "attempt_id": job.attempt_id,
+                "worker_id": job.worker_id,
+                "lease_epoch": job.lease_epoch,
+                "outcome": outcome,
+                "artifacts": delivered,
+                "failure_reason": _failure_reason(outcome, payload),
+                "completed_through_frame": completed_through_frame,
+            })
+
+        # Free the slot and rewrite the in-flight record.
         self._jobs_by_slot.pop(slot_index, None)
         self._write_inflight()
         self._state.set_jobs(self._describe_jobs())

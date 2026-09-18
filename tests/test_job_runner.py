@@ -18,6 +18,9 @@
 # ByteTrack over real frames, GPU device selection, and a real Jellyfin stream.
 # Those need a GPU and are listed as uncovered in .marp/verification.md.
 
+# json reads back the in-flight record the runner writes.
+import json
+
 # time waits for the child, with a deadline rather than a fixed sleep.
 import time
 
@@ -28,7 +31,7 @@ from pathlib import Path
 # Any types the fake coordinator's payloads.
 from typing import Any
 
-from marp_inference_worker.jobs.coordinator_client import coordinator_event
+from marp_inference_worker.jobs.coordinator_client import CoordinatorError, coordinator_event
 from marp_inference_worker.jobs.runner import JobRunner
 from marp_inference_worker.jobs.worker_state import WorkerState
 
@@ -1630,3 +1633,61 @@ def test_an_operator_stop_reports_yielded_with_the_frame_it_reached(tmp_path: Pa
     # A stop is not a failure and must not describe itself as one. The column
     # carried "the worker reported yielded" on every ordinary stop.
     assert result["failure_reason"] is None
+
+
+# test_a_refused_result_survives_to_be_reported_at_the_next_start(tmp_path)
+# Verifies a result the coordinator would not take is kept and re-sent.
+# Inputs: pytest temporary directory.
+# Output: pytest pass/fail result.
+#
+# The hole this closes: a refused result used to be swallowed into last_error,
+# the slot freed, and the in-flight record rewritten without the job -- so the
+# attempt was never retried, never reported at restart, and stayed leased until
+# the lease and then the 24h cap decided for it. That is exactly what happened
+# to every operator stop while `yielded` was refused, and the work was gone.
+def test_a_refused_result_survives_to_be_reported_at_the_next_start(tmp_path: Path) -> None:
+
+    class RefusingCoordinator(FakeCoordinator):
+        refuse = True
+
+        def report_result(self, *args, **kwargs):
+            if self.refuse:
+                raise CoordinatorError("400: outcome is not one this coordinator accepts")
+            return super().report_result(*args, **kwargs)
+
+    offer = _job_for(tmp_path, "attempt-refused", frames=5)
+    coordinator = RefusingCoordinator(offers=[offer])
+    state_dir = tmp_path / "shared-state"
+    runner, _state = _runner(coordinator, state_dir)
+    runner.ensure_enrolled()
+
+    assert runner._poll_once() is True
+    job = runner._jobs_by_slot[0]
+    assert _wait_until(runner, lambda: not job.is_running())
+    runner._service_running_jobs()
+
+    # Refused, so nothing was recorded upstream and the slot is free again.
+    assert coordinator.results == []
+    assert runner._jobs_by_slot == {}
+
+    # But the record survives the job it belonged to. Under the old behaviour
+    # this file was deleted here, which is what made the loss permanent.
+    inflight = json.loads((state_dir / "state" / "in-flight.json").read_text(encoding="utf-8"))
+    assert inflight["attempts"] == []
+    assert [owed["attempt_id"] for owed in inflight["unreported"]] == ["attempt-refused"]
+
+    # A second worker start, against a coordinator that now accepts it -- the
+    # real sequence, where MARP learned the word after the worker had already
+    # tried to use it.
+    coordinator.refuse = False
+    restarted, _state = _runner(coordinator, state_dir)
+    restarted.report_lost_job()
+
+    assert len(coordinator.results) == 1
+    resent = coordinator.results[0]
+    assert resent["attempt_id"] == "attempt-refused"
+
+    # Re-sent as what it was. A refused outcome must not be downgraded to
+    # `failed` on the way out: MARP refusing a word today does not make the run
+    # a failure, and rewriting it would put a wrong answer in the record.
+    assert resent["outcome"] == "succeeded"

@@ -30,6 +30,22 @@ class ModelRef(BaseModel):
     # Optional locator the worker may fetch from when the artifact is not cached.
     url: str | None = None
 
+    # The coordinator's registered id for this model, required before a run can
+    # be ingested: every observation records which model produced it.
+    ml_model_id: int | None = None
+
+    # The species this model is registered as trained on, from MARP's own
+    # `model_species` rows.
+    #
+    # **Declared here or it does not arrive.** Pydantic drops unknown fields in
+    # silence, which is how `session` reached the worker and vanished.
+    #
+    # The engine compares this against the class names inside the weights it
+    # actually loaded, and refuses the attempt when they disagree. Absent means
+    # the coordinator could not say -- a model with no `model_species` rows --
+    # and is never itself a refusal.
+    class_names: list[str] | None = None
+
 
 # VideoRef
 # Names the video a job runs over: how to open it, and what MARP calls it.

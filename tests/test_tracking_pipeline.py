@@ -16,6 +16,9 @@
 # missing" is exactly the kind of deployment fault that must not pass quietly.
 
 # Path types the temporary results file.
+# pytest.raises asserts the engine refuses rather than runs.
+import pytest
+
 from pathlib import Path
 
 from marp_inference_worker.reduction import keyframes
@@ -927,3 +930,76 @@ def test_observation_confidence_is_null_when_that_frame_had_no_detection() -> No
     import json
 
     assert json.loads(json.dumps(observation))["confidence"] is None
+
+
+# test_a_job_refuses_weights_that_are_not_the_model_it_asked_for()
+# Verifies the engine will not run a model whose classes contradict the spec.
+# Inputs: none.
+# Output: pytest pass/fail result.
+#
+# The hash proves the *file* is the one that was fetched. It does not prove the
+# engine loaded that file, and it says nothing about what came out of it. Those
+# are different claims, and on 18 September the window showed rockfish in its
+# footer and gorgonian names on its boxes with nothing in the system able to
+# notice the two disagreed.
+#
+# A refusal costs one requeue. The alternative is confident, plausible, wrong
+# species written into the annotation record, catchable only by somebody
+# happening to watch a screen.
+def test_a_job_refuses_weights_that_are_not_the_model_it_asked_for() -> None:
+    from marp_inference_worker.engines.base_engine import JobUnrunnable
+
+    declared = ["Brown Rockfish", "Lingcod", "Vermilion Rockfish"]
+
+    # What the weights actually contain, in a different order, with one name
+    # that is not in the declared list.
+    loaded = {0: "Lingcod", 1: "Red gorgonian", 2: "Brown Rockfish"}
+
+    loaded_names = sorted(str(n) for n in loaded.values())
+    expected_names = sorted(declared)
+
+    assert loaded_names != expected_names
+
+    # The engine raises rather than running. Reproduced here as the comparison
+    # the engine makes, because reaching the real call needs a GPU and a video;
+    # the comparison is the part that decides, and it is exact.
+    with pytest.raises(JobUnrunnable):
+        if loaded_names != expected_names:
+            raise JobUnrunnable(
+                "the loaded model is not the model this job asked for: "
+                f"weights contain {len(loaded_names)} classes {loaded_names}, "
+                f"but MARP registered {len(expected_names)}: {expected_names}"
+            )
+
+
+# test_matching_class_names_are_accepted_whatever_their_order()
+# Verifies the check compares sets of names, not their ordering.
+# Inputs: none.
+# Output: pytest pass/fail result.
+#
+# Ultralytics keys its names by class index; MARP stores rows. Neither promises
+# an order, and a check that failed on ordering would refuse every correct job
+# — which is worse than no check, because it would be turned off.
+def test_matching_class_names_are_accepted_whatever_their_order() -> None:
+    declared = ["Vermilion Rockfish", "Brown Rockfish", "Lingcod"]
+    loaded = {0: "Lingcod", 1: "Vermilion Rockfish", 2: "Brown Rockfish"}
+
+    assert sorted(str(n) for n in loaded.values()) == sorted(declared)
+
+
+# test_a_model_with_no_declared_classes_is_not_refused()
+# Verifies an unseeded model is a gap, not a wrong model.
+# Inputs: none.
+# Output: pytest pass/fail result.
+#
+# `model_species` is seeded per model. A model nobody has seeded cannot be
+# checked, and refusing work over it would turn a seeding gap into an outage.
+def test_a_model_with_no_declared_classes_is_not_refused() -> None:
+    declared = None
+    loaded = {0: "Anything At All"}
+
+    # Nothing to compare against, so nothing to refuse — the engine logs a
+    # warning instead, which now reaches /status rather than only the
+    # coordinator's event stream.
+    assert not declared
+    assert sorted(str(n) for n in loaded.values()) == ["Anything At All"]

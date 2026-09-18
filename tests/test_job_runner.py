@@ -1775,6 +1775,7 @@ def test_slots_are_shed_when_a_window_falls_below_real_time() -> None:
     live = runner_module.JobRunner.__new__(runner_module.JobRunner)
     live._slot_count = 4
     live._effective_slots = 4
+    live._last_slot_decision_at = 0.0
     live._state = FakeState()
 
     # Four jobs, one of them below real time. One slot is given up.
@@ -1785,19 +1786,71 @@ def test_slots_are_shed_when_a_window_falls_below_real_time() -> None:
     # work at all would be worse than a slow one.
     live._jobs_by_slot = {0: FakeJob(10)}
     live._effective_slots = 1
+    live._last_slot_decision_at = 0.0
     assert live._live_slot_count() == 1
 
     # Comfortably above real time, so another job is allowed. The margin
     # matters: growing at exactly real time would slow everything below it
     # again and shed the slot straight back.
     live._effective_slots = 2
+    live._last_slot_decision_at = 0.0
     live._jobs_by_slot = {0: FakeJob(60), 1: FakeJob(55)}
     assert live._live_slot_count() == 3
 
     # Above real time but inside the margin: hold, do not grow.
     live._effective_slots = 2
+    live._last_slot_decision_at = 0.0
     live._jobs_by_slot = {0: FakeJob(28), 1: FakeJob(27)}
     assert live._live_slot_count() == 2
+
+    # Fractionally under: hold. A machine at 24 f/s against a 25 target is
+    # playing at a speed nobody can tell from live, and shedding a quarter of
+    # the machine's throughput to chase 4% is the wrong trade. This worker
+    # settled at exactly that and gave away three slots for it.
+    live._effective_slots = 4
+    live._last_slot_decision_at = 0.0
+    live._jobs_by_slot = {0: FakeJob(24), 1: FakeJob(24), 2: FakeJob(23.5), 3: FakeJob(24)}
+    assert live._live_slot_count() == 4
+
+
+# test_one_slot_decision_per_interval_not_one_per_poll()
+# Verifies the heuristic steps rather than slides.
+# Inputs: none.
+# Output: pytest pass/fail result.
+#
+# **This is the bug the first version shipped with.** The count was recomputed
+# on every poll, which runs several times a second, so one slow reading shed a
+# slot on every pass -- four to one in seconds, before any job could respond to
+# the first decision. A controller has to wait long enough to measure the
+# effect of what it just did.
+def test_one_slot_decision_per_interval_not_one_per_poll() -> None:
+    from marp_inference_worker.jobs import runner as runner_module
+
+    class Slow:
+        def current_progress(self):
+            return {"done": 600, "elapsed_s": 120.0}   # 5 f/s, far below real time
+
+    class FakeState:
+        def is_paused(self):
+            return False
+
+        def note_error(self, _message):
+            pass
+
+    live = runner_module.JobRunner.__new__(runner_module.JobRunner)
+    live._slot_count = 4
+    live._effective_slots = 4
+    live._last_slot_decision_at = 0.0
+    live._state = FakeState()
+    live._jobs_by_slot = {0: Slow(), 1: Slow(), 2: Slow(), 3: Slow()}
+
+    # First call decides: one slot given up.
+    assert live._live_slot_count() == 3
+
+    # Hammered the way the poll loop hammers it. Nothing more may change until
+    # the interval is up, however slow the jobs still look.
+    for _ in range(50):
+        assert live._live_slot_count() == 3
 
 
 # test_a_warming_job_does_not_shed_a_slot()
@@ -1825,6 +1878,7 @@ def test_a_warming_job_does_not_shed_a_slot() -> None:
     live = runner_module.JobRunner.__new__(runner_module.JobRunner)
     live._slot_count = 4
     live._effective_slots = 4
+    live._last_slot_decision_at = 0.0
     live._state = FakeState()
     live._jobs_by_slot = {0: Warming(), 1: Warming()}
 

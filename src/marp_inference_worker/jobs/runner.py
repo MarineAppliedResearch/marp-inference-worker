@@ -161,6 +161,26 @@ _REAL_TIME_FPS = 25.0
 _SLOT_GROWTH_MARGIN = 1.35
 
 
+# How far below real time is worth giving up a slot for.
+#
+# Not 1.0. A machine that settles at 24 f/s against a 25 f/s target is playing
+# the dive at a speed nobody can tell from live, and shedding a slot for it
+# costs a quarter of the machine's throughput to fix a rounding error. This
+# worker settled at 0.95x with four slots and would have thrown three of them
+# away chasing the last 4%.
+_SLOT_SHED_MARGIN = 0.9
+
+
+# How long between slot decisions, in seconds.
+#
+# **The reason this exists is a bug it caused.** The count was recomputed on
+# every poll, so one slow reading shed a slot on every pass through the loop --
+# four slots to one in a few seconds, before a single job had a chance to speed
+# up in response. A decision has to be followed by enough running time to
+# measure its effect, or it is a ratchet rather than a controller.
+_SLOT_DECISION_INTERVAL_S = 45.0
+
+
 # How long a job is left alone before its rate means anything, in seconds.
 #
 # Loading a model and opening a video take most of the first minute and produce
@@ -265,6 +285,11 @@ class JobRunner:
         # The configured count stays the ceiling and the window layout, so the
         # tiles do not reshuffle every time a slot is shed or taken back.
         self._effective_slots = self._slot_count
+
+        # When a slot decision was last made. Zero so the first measurement
+        # counts immediately; after that, one decision per interval so each is
+        # followed by enough running time to see its effect.
+        self._last_slot_decision_at = 0.0
 
         # Slot index -> the job running on it. A slot absent from this mapping
         # is free.
@@ -490,22 +515,32 @@ class JobRunner:
     # slots at the start of every run.
     def _live_slot_count(self) -> int:
 
+        # One decision per interval. This is called from the poll, which runs
+        # several times a second; acting every time turned one slow reading into
+        # a slide from four slots to one before any job could respond.
+        now = time.monotonic()
+
+        if now - self._last_slot_decision_at < _SLOT_DECISION_INTERVAL_S:
+            return self._effective_slots
+
         rates = [
             progress["done"] / progress["elapsed_s"]
             for progress in (job.current_progress() for job in self._jobs_by_slot.values())
             if progress.get("elapsed_s", 0) > _SLOT_WARMUP_S and progress.get("done")
         ]
 
-        # Nothing measurable yet: trust what was configured.
+        # Nothing measurable yet: trust what was configured, and do not start
+        # the clock -- a decision needs a measurement behind it.
         if not rates:
             return self._effective_slots
 
+        self._last_slot_decision_at = now
         slowest = min(rates)
 
-        if slowest < _REAL_TIME_FPS and self._effective_slots > 1:
+        if slowest < _REAL_TIME_FPS * _SLOT_SHED_MARGIN and self._effective_slots > 1:
             self._effective_slots -= 1
             self._state.note_error(
-                f"slowed to {slowest:.1f} f/s; running {self._effective_slots} job(s) at once "
+                f"slowest job {slowest:.1f} f/s; taking {self._effective_slots} at a time "
                 f"so each stays at real time"
             )
         elif slowest > _REAL_TIME_FPS * _SLOT_GROWTH_MARGIN and self._effective_slots < self._slot_count:

@@ -806,6 +806,7 @@ class WatchDisplay:
         self._warn = warn
         self._job_id = job_id
         self._attempt_id = attempt_id
+        self._profile_dir: Path | None = None
         self._model_name = model_name
         self._species_names = list(species_names or [])
         self._channel = _FrameChannel()
@@ -891,6 +892,9 @@ class WatchDisplay:
             threading.Thread(target=self._server.serve_forever, daemon=True).start()
             port = self._server.server_address[1]
             profile = self._workspace / "chromium-profile"
+            # Remembered so close() can find the browser by the profile
+            # it holds, which survives Chromium changing process.
+            self._profile_dir = profile
             # The worker's own API port travels on the URL. The page needs it
             # for the footer's machine figures, and the display server and the
             # worker API are two servers on two ports -- so the page cannot
@@ -1064,12 +1068,63 @@ class WatchDisplay:
             self._detach("watch window stopped responding; inference is continuing headless")
         return presented
 
+    # _kill_by_profile()
+    # Ends any browser still holding this job's profile directory.
+    # Inputs: none.
+    # Output: none.
+    # Use this from close(), before the pid-based kill. Best effort throughout:
+    # a window that will not die must not stop a job being reported.
+    def _kill_by_profile(self) -> None:
+
+        if sys.platform != "win32" or self._profile_dir is None:
+            return
+
+        # Matched on the profile path, which is this attempt's own directory, so
+        # this can never reach the volunteer's own browser or another slot's
+        # window. Quoted for the WMI query, and backslashes doubled because
+        # `LIKE` treats one as an escape.
+        needle = str(self._profile_dir).replace("\\", "\\\\").replace("'", "''")
+        query = (
+            "SELECT ProcessId FROM Win32_Process WHERE Name = 'chrome.exe' "
+            f"AND CommandLine LIKE '%{needle}%'"
+        )
+
+        try:
+            found = subprocess.run(
+                ["powershell.exe", "-NoProfile", "-Command",
+                 f"Get-CimInstance -Query \"{query}\" | "
+                 "ForEach-Object { $_.ProcessId }"],
+                capture_output=True, text=True, timeout=20, check=False,
+            )
+        except Exception:
+            return
+
+        for line in (found.stdout or "").split():
+            if not line.strip().isdigit():
+                continue
+            subprocess.run(
+                ["taskkill", "/PID", line.strip(), "/T", "/F"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False,
+            )
+
     def close(self) -> None:
         self._closing = True
         self._channel.close()
         if self._server is not None:
             self._server.shutdown()
             self._server.server_close()
+        # Kill whatever is showing this job's profile, whether or not the pid we
+        # launched is still alive.
+        #
+        # Chromium does not always stay in the process it was started as: it can
+        # hand the window to another process and exit, and then `poll()` says
+        # the launched process is gone while the window is still on screen. The
+        # old code read that as "already closed" and killed nothing, so the
+        # window outlived its job -- showing a frozen frame and an error from a
+        # server that had shut down underneath it. The profile directory is
+        # unique to this job, so anything holding it is ours.
+        self._kill_by_profile()
+
         if self._process is not None and self._process.poll() is None:
             if sys.platform == "win32":
                 # Installed Chrome owns a renderer tree. Terminating only its

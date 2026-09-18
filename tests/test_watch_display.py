@@ -824,3 +824,48 @@ def test_a_busy_machine_is_not_interrupted(monkeypatch) -> None:
     monkeypatch.setattr(display_module, "_seconds_since_input", lambda: None)
     display_module._bring_to_front(5678)
     assert raised == [1234, 5678]
+
+
+# test_closing_kills_the_browser_even_when_the_launched_process_has_gone(monkeypatch)
+# Verifies a finished job leaves no window behind.
+# Inputs: pytest monkeypatch and temporary directory.
+# Output: pytest pass/fail result.
+#
+# `close()` used to kill only the process it launched, and skip even that when
+# `poll()` said it had exited. Chromium can hand its window to another process
+# and exit, so the pid was gone while the window was not: the server shut down
+# underneath a live page, which then sat there showing a frozen frame and a
+# fetch error. The profile directory is unique to the attempt, so whatever holds
+# it is ours to end.
+def test_closing_kills_the_browser_even_when_the_launched_process_has_gone(
+    monkeypatch, tmp_path: Path
+) -> None:
+    from marp_inference_worker.watch import display as display_module
+
+    display = WatchDisplay("window", tmp_path / "jobs" / "9", lambda _message: None)
+    display._profile_dir = tmp_path / "jobs" / "9" / "chromium-profile"
+
+    # The launched process reports itself already gone, which is the case that
+    # used to skip the kill entirely.
+    display._process = SimpleNamespace(pid=4242, poll=lambda: 0)
+
+    calls: list[list[str]] = []
+
+    def record(args, **_kwargs):
+        calls.append(list(args))
+        return SimpleNamespace(stdout="7777\n8888\n", returncode=0)
+
+    monkeypatch.setattr(display_module.sys, "platform", "win32")
+    monkeypatch.setattr(display_module.subprocess, "run", record)
+    display.close()
+
+    # It asked Windows which processes hold this attempt's profile...
+    assert any("Win32_Process" in " ".join(call) for call in calls)
+    # ...and killed the ones it was told about, rather than the dead pid.
+    killed = {call[2] for call in calls if call and call[0] == "taskkill"}
+    assert killed == {"7777", "8888"}
+
+    # And the query names this attempt's own profile, so it can never reach the
+    # volunteer's browser or another slot's window.
+    query = next(" ".join(call) for call in calls if "Win32_Process" in " ".join(call))
+    assert "chromium-profile" in query

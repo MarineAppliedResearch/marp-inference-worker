@@ -206,20 +206,65 @@ class WatchDisplay:
     def _install_root() -> Path:
         return Path(sys.executable).resolve().parent
 
+    # _packaged_player_root()
+    # Where the watch page ships.
+    # Inputs: none.
+    # Output: the directory holding `live.html`.
+    # Use this as the default rather than an installer-staged directory. The
+    # page is part of this package, so a git checkout and an install both have
+    # it; when it lived only in the installer payload it was in neither, and the
+    # window had never opened on any machine.
+    @staticmethod
+    def _packaged_player_root() -> Path:
+        return Path(__file__).resolve().parent
+
+    # _find_chromium()
+    # Finds a Chromium-family browser to draw in.
+    # Inputs: none.
+    # Output: the executable, or None when the machine has none.
+    # Use this so a volunteer who has Chrome or Edge -- which is every ordinary
+    # Windows machine -- gets a window without the installer's bundled copy.
+    # Explicit configuration still wins, and the bundle is still preferred over
+    # a browser the volunteer uses for their own browsing.
+    @staticmethod
+    def _find_chromium() -> Path | None:
+        configured = os.environ.get("MARP_CHROMIUM_PATH")
+        if configured:
+            candidate = Path(configured).resolve()
+            return candidate if candidate.is_file() else None
+
+        candidates = [WatchDisplay._install_root() / "chromium" / "chrome.exe"]
+
+        if sys.platform == "win32":
+            program_files = [
+                os.environ.get("PROGRAMFILES", r"C:\Program Files"),
+                os.environ.get("PROGRAMFILES(X86)", r"C:\Program Files (x86)"),
+                os.environ.get("LOCALAPPDATA", ""),
+            ]
+            for base in filter(None, program_files):
+                candidates.append(Path(base) / "Google" / "Chrome" / "Application" / "chrome.exe")
+                candidates.append(Path(base) / "Microsoft" / "Edge" / "Application" / "msedge.exe")
+
+        for candidate in candidates:
+            if candidate.is_file():
+                return candidate.resolve()
+        return None
+
     def start(self) -> bool:
         try:
             player_root = Path(
                 os.environ.get("MARP_PLAYER_HOST_DIR")
-                or self._install_root() / "player"
-            ).resolve()
-            chromium = Path(
-                os.environ.get("MARP_CHROMIUM_PATH")
-                or self._install_root() / "chromium" / "chrome.exe"
+                or self._packaged_player_root()
             ).resolve()
             if not (player_root / "live.html").is_file():
                 raise FileNotFoundError(f"live player is missing from {player_root}")
-            if not chromium.is_file():
-                raise FileNotFoundError(f"Chromium is missing at {chromium}")
+
+            chromium = self._find_chromium()
+            if chromium is None:
+                raise FileNotFoundError(
+                    "no Chromium, Chrome or Edge was found to draw the watch window in; "
+                    "set MARP_CHROMIUM_PATH to one"
+                )
 
             self._server = _WatchServer(("127.0.0.1", 0), _Handler)
             self._server.channel = self._channel

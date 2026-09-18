@@ -139,3 +139,55 @@ def test_display_sends_a_browser_decodable_jpeg_frame() -> None:
     assert packets[0]["species_names"] == ["Blue/Deacon Rockfish", "Lingcod"]
     encoded = np.frombuffer(base64.b64decode(packets[0]["image"]), dtype=np.uint8)
     assert cv2.imdecode(encoded, cv2.IMREAD_COLOR).shape == (24, 32, 3)
+
+
+# test_the_watch_page_ships_with_the_package()
+# Verifies the page WatchDisplay.start() refuses to run without is actually there.
+# Inputs: none.
+# Output: pytest pass/fail result.
+#
+# This is the test whose absence let watch mode ship broken for its whole life.
+# `start()` requires `live.html` in the player root, the page existed in neither
+# repository nor in the installer's staging step, and so the window had never
+# once opened -- while six tests around it passed, because not one of them
+# touched the file the feature cannot start without.
+def test_the_watch_page_ships_with_the_package() -> None:
+    page = WatchDisplay._packaged_player_root() / "live.html"
+
+    assert page.is_file(), f"the watch window has no page at {page}"
+
+    # Not merely present. The page's whole job is to ask for the next frame and
+    # acknowledge the one it drew, and a stub that loaded but never polled would
+    # leave a blank window and pass a mere existence check.
+    markup = page.read_text(encoding="utf-8")
+    assert "/next" in markup
+    assert "acknowledged_frame" in markup
+
+
+# test_chromium_is_found_from_configuration_or_an_installed_browser()
+# Verifies the browser search honours configuration and tolerates a bare machine.
+# Inputs: pytest monkeypatch and temporary directory.
+# Output: pytest pass/fail result.
+#
+# A volunteer's machine has Chrome or Edge but not the installer's bundled
+# Chromium. Insisting on the bundle meant no window and a message that reached
+# only the coordinator.
+def test_chromium_is_found_from_configuration_or_an_installed_browser(monkeypatch, tmp_path: Path) -> None:
+    configured = tmp_path / "my-chrome.exe"
+    configured.write_bytes(b"")
+
+    monkeypatch.setenv("MARP_CHROMIUM_PATH", str(configured))
+    assert WatchDisplay._find_chromium() == configured.resolve()
+
+    # A configured path that does not exist is None rather than a silent
+    # fallback: somebody who set the variable meant that browser, and quietly
+    # using a different one would hide their mistake.
+    monkeypatch.setenv("MARP_CHROMIUM_PATH", str(tmp_path / "absent.exe"))
+    assert WatchDisplay._find_chromium() is None
+
+    # With nothing configured, a machine that has a browser finds it. This
+    # asserts the search looks somewhere real rather than asserting the result,
+    # because a CI runner may genuinely have no browser at all.
+    monkeypatch.delenv("MARP_CHROMIUM_PATH", raising=False)
+    found = WatchDisplay._find_chromium()
+    assert found is None or found.is_file()

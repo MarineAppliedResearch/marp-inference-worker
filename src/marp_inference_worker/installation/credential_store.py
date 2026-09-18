@@ -1,6 +1,7 @@
-"""Protect the worker's machine credential with Windows DPAPI."""
+"""Protect the worker's machine credential: Windows DPAPI, or file permissions elsewhere."""
 
 import ctypes
+import os
 import sys
 from ctypes import wintypes
 from pathlib import Path
@@ -48,8 +49,27 @@ def _windows_functions() -> tuple[Any, Any, Any]:
 
 
 def protect(value: str) -> bytes:
+
+    # Off Windows the credential is stored as it is, and `save()` is what protects it by
+    # creating the file 0600. Read this before assuming the name means encryption.
+    #
+    # What that defends against: another user account on the machine reading the file.
+    # What it does not: anyone who can already run as this user, read this user's files,
+    # or read the disk. There is no encryption at rest here at all.
+    #
+    # This is a deliberate reduction from the Windows behaviour, not an oversight. DPAPI
+    # binds the credential to a Windows account and Linux has no equivalent primitive.
+    # Secret Service (libsecret) is the closest analogue and was rejected because it needs
+    # an unlocked keyring, which a headless machine logging in automatically does not have
+    # -- an option that fails on the target hardware is not the more secure option, it is
+    # the one that does not ship. Deriving a key from /etc/machine-id was rejected as
+    # obfuscation: whatever can read this file can read machine-id too.
+    #
+    # The credential is machine-specific and individually revocable, so the blast radius of
+    # losing one is that one volunteer's worker, not the pool.
     if sys.platform != "win32":
-        raise RuntimeError("Installed worker credentials require Windows DPAPI")
+        return value.encode("utf-8")
+
     source, source_buffer = _blob(value.encode("utf-8"))
     description = "MARP inference worker credential"
     result = _Blob()
@@ -66,8 +86,11 @@ def protect(value: str) -> bytes:
 
 
 def unprotect(value: bytes) -> str:
+
+    # The mirror of protect(): off Windows the bytes are the credential.
     if sys.platform != "win32":
-        raise RuntimeError("Installed worker credentials require Windows DPAPI")
+        return value.decode("utf-8")
+
     source, source_buffer = _blob(value)
     result = _Blob()
     _, unprotect_data, local_free = _windows_functions()
@@ -85,7 +108,23 @@ def unprotect(value: bytes) -> str:
 def save(path: Path, credential: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(".tmp")
-    temporary.write_bytes(protect(credential))
+
+    # A previous run that died between creating this and renaming it leaves the temporary
+    # behind, and O_EXCL below would then refuse forever rather than once.
+    temporary.unlink(missing_ok=True)
+
+    # Create with 0600 rather than writing and chmod-ing afterwards. The obvious order
+    # leaves the credential on disk world-readable for as long as it takes to reach the
+    # next line, which on a shared machine is the whole of the protection missing. O_EXCL
+    # means we never write into a file somebody else made and left readable.
+    #
+    # The mode is ignored on Windows, where DPAPI is the protection and this is just a file.
+    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        os.write(descriptor, protect(credential))
+    finally:
+        os.close(descriptor)
+
     temporary.replace(path)
 
 

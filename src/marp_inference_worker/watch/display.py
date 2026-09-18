@@ -2,6 +2,7 @@
 
 import base64
 import json
+import math
 import os
 import subprocess
 import sys
@@ -22,10 +23,10 @@ _FRAME_ACK_TIMEOUT_S = 60.0
 # _window_position()
 # Where the watch window opens, as Chromium's `x,y`.
 # Inputs: none; reads `MARP_WATCH_WINDOW_POSITION`.
-# Output: a coordinate string.
+# Output: a coordinate string, or None when nothing was configured.
 # Use this rather than a literal. Negative values are legitimate -- a monitor
 # to the left of the primary one has negative coordinates in Windows.
-def _window_position() -> str:
+def _window_position() -> str | None:
 
     configured = (os.environ.get("MARP_WATCH_WINDOW_POSITION") or "").strip()
 
@@ -38,12 +39,200 @@ def _window_position() -> str:
             except ValueError:
                 pass
 
-    # The old literal, and still the right default: the primary display, where
-    # a disconnected second monitor cannot hide the window.
-    return "50,50"
+    return None
 
 
-def _chromium_args(chromium: Path, url: str, profile: Path, mode: str) -> list[str]:
+# _monitors()
+# The desktop's monitors, as (x, y, width, height) in virtual-screen space.
+# Inputs: none; asks the window system.
+# Output: at least one rectangle, left to right.
+# Use this to lay windows out. Coordinates can be negative: a monitor to the
+# left of or above the primary one starts at a negative origin, which is why
+# nothing here assumes the desktop begins at 0,0.
+def _monitors() -> list[tuple[int, int, int, int]]:
+
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            found: list[tuple[int, int, int, int]] = []
+
+            # The callback signature EnumDisplayMonitors expects.
+            callback_type = ctypes.WINFUNCTYPE(
+                ctypes.c_int,
+                ctypes.c_ulong,
+                ctypes.c_ulong,
+                ctypes.POINTER(wintypes.RECT),
+                ctypes.c_double,
+            )
+
+            def collect(_monitor, _dc, rect_pointer, _data) -> int:
+                rect = rect_pointer.contents
+                found.append(
+                    (
+                        int(rect.left),
+                        int(rect.top),
+                        int(rect.right - rect.left),
+                        int(rect.bottom - rect.top),
+                    )
+                )
+                return 1
+
+            ctypes.windll.user32.EnumDisplayMonitors(
+                0, 0, callback_type(collect), 0
+            )
+
+            if found:
+                # Left to right, then top to bottom, so "the first monitor" is
+                # the leftmost one rather than whichever the driver enumerated
+                # first -- which is not stable across reboots.
+                return sorted(found, key=lambda rect: (rect[0], rect[1]))
+
+        except Exception:
+            # Any failure here falls through to the single-screen assumption.
+            # A worker must not refuse to draw because it could not enumerate
+            # displays.
+            pass
+
+    # One screen, conservative size. Wrong on a large display only in that the
+    # windows are smaller than they could be, which is the harmless direction.
+    return [(0, 0, 1920, 1080)]
+
+
+# _tile()
+# Where one slot's window goes, given how many there are.
+# Inputs: this slot's index, and how many slots the worker runs.
+# Output: (x, y, width, height).
+#
+# The rule Isaac asked for: fill the monitors first, and only start subdividing
+# when there are more windows than screens.
+#
+#   slots <= monitors : one window per monitor, filling it
+#   slots  > monitors : slots shared out over the monitors, then gridded
+#                       within each one
+#
+# A grid rather than a cascade because these are watched, not clicked: a
+# volunteer glancing across the room wants to see every running job at once, and
+# overlapping windows hide all but the top one.
+def _tile(slot_index: int, slot_count: int) -> tuple[int, int, int, int]:
+
+    monitors = _monitors()
+    count = max(1, slot_count)
+    index = max(0, slot_index) % count
+
+    # A configured position names the watching screen, not just a coordinate.
+    #
+    # `MARP_WATCH_WINDOW_POSITION` exists because windows kept opening on the
+    # monitor somebody was working on. A tiler that then helpfully fills every
+    # monitor puts them straight back. So when a position is set, every slot is
+    # tiled inside the monitor that position falls on and the others are left
+    # alone -- the person has said which screen is for watching.
+    anchor = _window_position()
+
+    if anchor:
+        x_text, y_text = anchor.split(",")
+        anchor_point = (int(x_text), int(y_text))
+        chosen = _monitor_containing(anchor_point, monitors)
+
+        return _grid_within(chosen, index, count)
+
+    # Fewer windows than screens: one each, filling the monitor.
+    if count <= len(monitors):
+        return monitors[index]
+
+    # More windows than screens. Share them out as evenly as possible, giving
+    # the earlier monitors the extra one when it does not divide -- the primary
+    # is usually the larger and the one being looked at.
+    per_monitor = [count // len(monitors)] * len(monitors)
+
+    for spare in range(count % len(monitors)):
+        per_monitor[spare] += 1
+
+    # Which monitor this slot lands on, and where in that monitor's own run.
+    monitor_index = 0
+    local_index = index
+
+    for position, share in enumerate(per_monitor):
+        if local_index < share:
+            monitor_index = position
+            break
+        local_index -= share
+
+    return _grid_within(monitors[monitor_index], local_index, per_monitor[monitor_index])
+
+
+# _monitor_containing()
+# The monitor a point falls on.
+# Inputs: an (x, y) point and the monitor rectangles.
+# Output: one rectangle; the first when the point is off every screen.
+# Use this to turn a configured coordinate into the screen it meant. A stale
+# coordinate from an unplugged monitor lands nowhere, and falling back to the
+# first screen is better than drawing off the desktop where nobody can see it.
+def _monitor_containing(
+    point: tuple[int, int],
+    monitors: list[tuple[int, int, int, int]],
+) -> tuple[int, int, int, int]:
+
+    x, y = point
+
+    for rect in monitors:
+        left, top, width, height = rect
+
+        if left <= x < left + width and top <= y < top + height:
+            return rect
+
+    return monitors[0]
+
+
+# _grid_within()
+# One tile of a near-square grid filling a rectangle.
+# Inputs: the rectangle, this tile's index, and how many tiles share it.
+# Output: (x, y, width, height).
+# Use this for the windows sharing one monitor. Columns are taken before rows
+# because these frames are wider than they are tall, so a short wide window
+# wastes less of one than a tall narrow one.
+def _grid_within(
+    rect: tuple[int, int, int, int],
+    index: int,
+    share: int,
+) -> tuple[int, int, int, int]:
+
+    left, top, width, height = rect
+    share = max(1, share)
+    index = max(0, index) % share
+
+    columns = math.ceil(math.sqrt(share))
+    rows = math.ceil(share / columns)
+
+    column = index % columns
+    row = index // columns
+
+    # Integer division leaves a few pixels at the right and bottom edges. The
+    # last column and row absorb them, so the tiling covers the monitor exactly
+    # rather than leaving a seam down the side of the screen.
+    tile_width = width // columns
+    tile_height = height // rows
+    this_width = width - tile_width * (columns - 1) if column == columns - 1 else tile_width
+    this_height = height - tile_height * (rows - 1) if row == rows - 1 else tile_height
+
+    return (
+        left + tile_width * column,
+        top + tile_height * row,
+        this_width,
+        this_height,
+    )
+
+
+def _chromium_args(
+    chromium: Path,
+    url: str,
+    profile: Path,
+    mode: str,
+    slot_index: int = 0,
+    slot_count: int = 1,
+) -> list[str]:
+    left, top, width, height = _tile(slot_index, slot_count)
     args = [
         str(chromium),
         f"--app={url}",
@@ -60,7 +249,8 @@ def _chromium_args(chromium: Path, url: str, profile: Path, mode: str) -> list[s
         # one they are not working on, and without this every job opens on top
         # of whatever they are doing. Malformed values fall back rather than
         # raise -- a bad coordinate must not cost somebody their job.
-        f"--window-position={_window_position()}",
+        f"--window-position={left},{top}",
+        f"--window-size={width},{height}",
         "--disable-background-timer-throttling",
         "--disable-backgrounding-occluded-windows",
         "--disable-renderer-backgrounding",
@@ -71,10 +261,16 @@ def _chromium_args(chromium: Path, url: str, profile: Path, mode: str) -> list[s
         "--disable-gpu-compositing",
         "--mute-audio",
     ]
-    # Maximised, not a fixed 1100x700 box. A watched job is something the
-    # volunteer is meant to see from across the room, and a small window behind
-    # whatever they had open is a screen saver nobody knows is running.
-    args.append("--start-fullscreen" if mode == "fullscreen" else "--start-maximized")
+    # Fullscreen only when asked for it outright.
+    #
+    # `--start-maximized` used to be here and now fights the tiling: maximising
+    # fills whichever monitor the window landed on and throws the computed size
+    # away, so two windows meant to sit side by side end up stacked on top of
+    # each other. The tile is already the whole monitor when there is a screen
+    # per slot, which is what "maximised" was for.
+    if mode == "fullscreen":
+        args.append("--start-fullscreen")
+
     return args
 
 
@@ -215,7 +411,14 @@ class _Handler(BaseHTTPRequestHandler):
         if not candidate.is_file():
             self.send_error(HTTPStatus.NOT_FOUND)
             return
-        content_type = "text/html" if candidate.suffix == ".html" else "text/javascript"
+        # The logo is served from here too, so the window and its taskbar entry
+        # carry the MARP mark. Without an image type it went out as JavaScript
+        # and the browser refused to draw it.
+        content_type = {
+            ".html": "text/html",
+            ".png": "image/png",
+            ".svg": "image/svg+xml",
+        }.get(candidate.suffix, "text/javascript")
         body = candidate.read_bytes()
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", content_type)
@@ -275,8 +478,15 @@ class WatchDisplay:
         job_id: str | None = None,
         model_name: str | None = None,
         species_names: list[str] | None = None,
+        slot_index: int = 0,
+        slot_count: int = 1,
     ) -> None:
         self._mode = screen_mode
+        # Which of the worker's windows this is, and how many there are. Only
+        # the layout uses them: a slot has to know about its siblings to be
+        # tiled beside them rather than on top of them.
+        self._slot_index = slot_index
+        self._slot_count = slot_count
         # The job child may run with its workspace as the current directory.
         # Chromium must receive an absolute profile path or a relative worker
         # state directory is applied twice and the viewer never connects.
@@ -364,11 +574,20 @@ class WatchDisplay:
             threading.Thread(target=self._server.serve_forever, daemon=True).start()
             port = self._server.server_address[1]
             profile = self._workspace / "chromium-profile"
+            # The worker's own API port travels on the URL. The page needs it
+            # for the footer's machine figures, and the display server and the
+            # worker API are two servers on two ports -- so the page cannot
+            # infer it from where it was loaded. Without this it falls back to
+            # the default, which is right for one worker and silently wrong for
+            # a second one: an empty footer rather than an error.
+            api_port = os.environ.get("MARP_WORKER_API_PORT", "8010")
             args = _chromium_args(
                 chromium,
-                f"http://127.0.0.1:{port}/",
+                f"http://127.0.0.1:{port}/?api={api_port}",
                 profile,
                 self._mode,
+                self._slot_index,
+                self._slot_count,
             )
             creationflags = subprocess.CREATE_NEW_PROCESS_GROUP if sys.platform == "win32" else 0
             # Keep Chromium diagnostics with the attempt. A blank app window used

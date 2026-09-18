@@ -38,7 +38,12 @@ def test_chromium_keeps_occluded_watch_windows_rendering_without_the_cuda_gpu() 
     assert "--no-proxy-server" in args
     assert "--proxy-bypass-list=<-loopback>" in args
     assert "--new-window" not in args
-    assert "--window-position=50,50" in args
+    # A geometry is always given now, because a window has to be tiled beside
+    # its siblings rather than left where Chromium puts it. What the numbers are
+    # depends on the monitors, so this asserts that both flags are present
+    # rather than pinning a coordinate the next machine would not have.
+    assert any(argument.startswith("--window-position=") for argument in args)
+    assert any(argument.startswith("--window-size=") for argument in args)
     assert "--disable-gpu" in args
     assert "--disable-gpu-compositing" in args
     assert "--use-angle=swiftshader" not in args
@@ -204,8 +209,10 @@ def test_chromium_is_found_from_configuration_or_an_installed_browser(monkeypatc
 def test_the_watch_window_can_be_pinned_to_another_monitor(monkeypatch) -> None:
     from marp_inference_worker.watch.display import _window_position
 
+    # Unset now means "nothing was said", so the tiler decides. It used to
+    # mean the literal 50,50, which is the default the tiler replaces.
     monkeypatch.delenv("MARP_WATCH_WINDOW_POSITION", raising=False)
-    assert _window_position() == "50,50"
+    assert _window_position() is None
 
     monkeypatch.setenv("MARP_WATCH_WINDOW_POSITION", "2560,0")
     assert _window_position() == "2560,0"
@@ -220,4 +227,81 @@ def test_the_watch_window_can_be_pinned_to_another_monitor(monkeypatch) -> None:
     # a typo in an environment variable must not cost somebody their job.
     for bad in ("nonsense", "1,2,3", "", "x,0"):
         monkeypatch.setenv("MARP_WATCH_WINDOW_POSITION", bad)
-        assert _window_position() == "50,50", bad
+        assert _window_position() is None, bad
+
+
+# test_slots_fill_the_monitors_before_they_are_subdivided(monkeypatch)
+# Verifies the tiling rule.
+# Inputs: pytest monkeypatch.
+# Output: pytest pass/fail result.
+#
+# A worker running several slots opens several windows, and they used to all be
+# maximised on the same screen -- so a volunteer saw one job and had no idea the
+# other three were running. Fill the screens first, subdivide only when there
+# are more windows than screens.
+def test_slots_fill_the_monitors_before_they_are_subdivided(monkeypatch) -> None:
+    from marp_inference_worker.watch import display as display_module
+
+    monkeypatch.delenv("MARP_WATCH_WINDOW_POSITION", raising=False)
+    monkeypatch.setattr(
+        display_module,
+        "_monitors",
+        lambda: [(0, 0, 1920, 1080), (1920, 0, 1920, 1080)],
+    )
+
+    # One slot, two screens: the first screen, filled.
+    assert display_module._tile(0, 1) == (0, 0, 1920, 1080)
+
+    # Two slots, two screens: one each, no subdivision.
+    assert display_module._tile(0, 2) == (0, 0, 1920, 1080)
+    assert display_module._tile(1, 2) == (1920, 0, 1920, 1080)
+
+    # Four slots, two screens: two per screen, side by side.
+    tiles = [display_module._tile(slot, 4) for slot in range(4)]
+
+    assert tiles == [
+        (0, 0, 960, 1080),
+        (960, 0, 960, 1080),
+        (1920, 0, 960, 1080),
+        (2880, 0, 960, 1080),
+    ]
+
+    # The tiles cover both screens exactly: no gap, no overlap. Integer
+    # division would otherwise leave a seam down the right-hand edge.
+    assert sum(width * height for _x, _y, width, height in tiles) == 2 * 1920 * 1080
+
+
+# test_tiling_stays_off_the_monitor_somebody_is_working_on(monkeypatch)
+# Verifies that a configured position names the watching screen.
+# Inputs: pytest monkeypatch.
+# Output: pytest pass/fail result.
+#
+# `MARP_WATCH_WINDOW_POSITION` exists because windows kept opening on the screen
+# the volunteer was using. A tiler that then helpfully fills every monitor puts
+# them straight back, which would undo the setting rather than honour it.
+def test_tiling_stays_off_the_monitor_somebody_is_working_on(monkeypatch) -> None:
+    from marp_inference_worker.watch import display as display_module
+
+    monkeypatch.setattr(
+        display_module,
+        "_monitors",
+        lambda: [(0, 0, 1920, 1080), (1920, 0, 1920, 1080)],
+    )
+    monkeypatch.setenv("MARP_WATCH_WINDOW_POSITION", "1920,0")
+
+    tiles = [display_module._tile(slot, 4) for slot in range(4)]
+
+    # All four on the second screen, as a 2x2 grid. The first screen is left
+    # alone entirely, which is the whole point of the setting.
+    assert all(x >= 1920 for x, _y, _w, _h in tiles)
+    assert tiles == [
+        (1920, 0, 960, 540),
+        (2880, 0, 960, 540),
+        (1920, 540, 960, 540),
+        (2880, 540, 960, 540),
+    ]
+
+    # A coordinate on a monitor that is no longer plugged in falls back to the
+    # first screen rather than drawing off the desktop where nobody can see it.
+    monkeypatch.setenv("MARP_WATCH_WINDOW_POSITION", "9999,9999")
+    assert display_module._tile(0, 1) == (0, 0, 1920, 1080)

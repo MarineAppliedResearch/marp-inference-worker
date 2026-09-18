@@ -50,7 +50,7 @@ _STATE_DIR_ENV = "MARP_WORKER_STATE_DIR"
 # Use this from start_worker(). Raises when the token or address is missing,
 # because a worker with neither cannot do anything and should say so at start
 # rather than failing silently on its first poll.
-def build_runner(screen_mode: str = "window"):
+def build_runner(screen_mode: str = "window", slot_count: int | None = None):
 
     # Imported here so importing this module does not pull the runner's
     # dependency tree into a test that only wanted the API.
@@ -83,6 +83,7 @@ def build_runner(screen_mode: str = "window"):
         client=client,
         state_dir=state_dir,
         worker_state=WORKER_STATE,
+        slot_count=slot_count,
         screen_mode=screen_mode,
     )
 
@@ -103,9 +104,9 @@ def build_runner(screen_mode: str = "window"):
 # Use this from the service entry point. A thread rather than a second process:
 # the loop and the API have to share one WorkerState, and a job's real isolation
 # is its own child process, which the runner already gives it.
-def start_worker(screen_mode: str = "window"):
+def start_worker(screen_mode: str = "window", slot_count: int | None = None):
 
-    runner = build_runner(screen_mode)
+    runner = build_runner(screen_mode, slot_count)
 
     # Daemon, so a stopped API server does not leave the loop running. The
     # runner's own jobs are separate processes and are stopped through it.
@@ -128,6 +129,16 @@ def main() -> None:
         choices=("off", "window", "fullscreen"),
         default="window",
         help="permit watched jobs to open a local display",
+    )
+    # How many jobs to run at once. Omitted, the worker measures the machine
+    # -- see derive_slot_count(). Given, it is believed without argument: a
+    # person who has watched their own machine knows something the derivation
+    # does not, and a small card wants fewer slots than its memory suggests.
+    parser.add_argument(
+        "--slots",
+        type=int,
+        default=None,
+        help="how many jobs to run at once; omit to decide from this machine",
     )
     parser.add_argument("--activate-code-file", help=argparse.SUPPRESS)
     parser.add_argument("--coordinator-url", help=argparse.SUPPRESS)
@@ -153,7 +164,7 @@ def main() -> None:
 
     # Start taking work first, so a worker is useful even if the API fails to
     # bind -- the API is a window, not the service.
-    runner = start_worker(args.screen)
+    runner = start_worker(args.screen, args.slots)
 
     try:
         # Loopback only. Not a default that can be overridden by an environment

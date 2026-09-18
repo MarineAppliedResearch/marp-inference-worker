@@ -221,6 +221,11 @@ class TrackingEngine(BaseEngine):
                 job_id=str(params.get("_job_id") or "") or None,
                 model_name=str((spec.get("model") or {}).get("name") or "") or None,
                 species_names=species_names,
+                # So the window can be tiled beside its siblings rather than
+                # opened on top of them. Both come from the runner, which is the
+                # only thing that knows how many jobs this machine runs at once.
+                slot_index=int(params.get("slot_index") or 0),
+                slot_count=int(params.get("slot_count") or 1),
             )
             if not watch.start():
                 watch = None

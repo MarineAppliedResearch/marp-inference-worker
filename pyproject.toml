@@ -63,7 +63,7 @@ marp-worker-launcher = "marp_inference_worker.installation.launcher:main"
 # window had never opened. Shipping it with the module that serves it means no
 # build step can leave it out.
 [tool.setuptools.package-data]
-"marp_inference_worker.watch" = ["live.html"]
+"marp_inference_worker.watch" = ["live.html", "marp-logo.png"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

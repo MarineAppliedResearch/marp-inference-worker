@@ -21,6 +21,15 @@
 -->
 <meta charset="utf-8">
 <title>MARP · watching inference</title>
+<!--
+  The window's own icon, and the taskbar entry's. A Chromium `--app` window
+  takes both from the page's favicon, so this one line is what puts the MARP
+  mark on the window somebody sees running on a donated machine. Served from
+  this package by the display server, for the same reason the page itself is:
+  a file that only exists in an installer payload is a file that is missing
+  from a git checkout, which is how the watch window never ran at all.
+-->
+<link rel="icon" type="image/png" href="marp-logo.png">
 <style>
   :root { color-scheme: dark; }
   html, body {
@@ -63,6 +72,15 @@
   #footer .k { color: #5f6f7f; }
   #footer .v { color: #c9d6e2; }
   #footer .sep { color: #33414f; }
+  /* The watermark. Bottom left, above the footer, faint enough to read the
+     video through and large enough to recognise across a room. Never over the
+     centre of frame, where the animals are. */
+  #mark {
+    position: absolute; left: 12px; bottom: 26px;
+    width: 132px; opacity: 0.28;
+    pointer-events: none; user-select: none;
+    filter: drop-shadow(0 1px 2px #000a);
+  }
 </style>
 
 <div id="stage"><canvas id="view" width="16" height="9"></canvas></div>
@@ -73,6 +91,7 @@
   <span id="count"></span>
 </div>
 <div id="note">waiting for the first frame…</div>
+<img id="mark" src="marp-logo.png" alt="MARP">
 <div id="footer">
   <span><span class="k">gpu</span> <span class="v" id="gpu">–</span></span>
   <span><span class="k">net</span> <span class="v" id="net">–</span></span>

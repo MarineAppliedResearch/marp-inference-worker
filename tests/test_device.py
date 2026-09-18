@@ -84,21 +84,53 @@ def test_auto_resolves_to_the_slots_own_gpu(monkeypatch) -> None:
     assert device_module.resolve_device("auto", slot_index=3) == "cuda:3"
 
 
-# test_auto_refuses_a_slot_beyond_the_gpus_present(monkeypatch)
-# Verifies the slot bound.
+# test_auto_shares_the_cards_when_there_are_more_slots_than_gpus(monkeypatch)
+# Verifies that a slot is a unit of concurrency rather than a device index.
 # Inputs: pytest monkeypatch.
 # Output: pytest pass/fail result.
-# Proves a misconfigured slot count is caught before a job starts rather than
-# producing a CUDA error part way through inference.
-def test_auto_refuses_a_slot_beyond_the_gpus_present(monkeypatch) -> None:
+#
+# This test used to assert the opposite -- that `auto` refuses a slot past the
+# last GPU -- and that assertion was the bug. A slot *was* a device, so one card
+# meant one job however large the card was. Raising the slot count then failed
+# three leases out of four with "job was pinned to slot 3 but this worker has 1
+# CUDA device(s)", and each failure spent one of the job's attempts; seven jobs
+# were exhausted before it was caught.
+#
+# A card holds several jobs comfortably -- under 1 GiB each measured on a 16 GiB
+# card -- so slots now wrap over the devices. The refusal that matters is kept
+# below: a job naming a device outright is still checked.
+def test_auto_shares_the_cards_when_there_are_more_slots_than_gpus(monkeypatch) -> None:
 
     monkeypatch.setattr(device_module, "cuda_device_count", lambda: 2)
 
-    with pytest.raises(JobUnrunnable) as raised:
-        device_module.resolve_device("auto", slot_index=5)
+    # Two cards, six slots: round robin, so the load spreads rather than
+    # piling onto the first card or refusing.
+    assert device_module.resolve_device("auto", slot_index=0) == "cuda:0"
+    assert device_module.resolve_device("auto", slot_index=1) == "cuda:1"
+    assert device_module.resolve_device("auto", slot_index=5) == "cuda:1"
 
-    assert "slot 5" in str(raised.value)
-    assert "2 CUDA device" in str(raised.value)
+    # One card, four slots: the case that failed in the field.
+    monkeypatch.setattr(device_module, "cuda_device_count", lambda: 1)
+
+    assert [
+        device_module.resolve_device("auto", slot_index=slot) for slot in range(4)
+    ] == ["cuda:0"] * 4
+
+
+# test_auto_still_refuses_when_there_is_no_gpu_at_all(monkeypatch)
+# Verifies the one refusal `auto` must keep.
+# Inputs: pytest monkeypatch.
+# Output: pytest pass/fail result.
+# Sharing cards is only meaningful when there is a card. A machine with none
+# has to be told so, rather than being handed `cuda:0` that does not exist.
+def test_auto_still_refuses_when_there_is_no_gpu_at_all(monkeypatch) -> None:
+
+    monkeypatch.setattr(device_module, "cuda_device_count", lambda: 0)
+
+    with pytest.raises(JobUnrunnable) as raised:
+        device_module.resolve_device("auto", slot_index=0)
+
+    assert "no usable CUDA device" in str(raised.value)
 
 
 # test_explicit_cuda_index_is_checked_against_what_exists(monkeypatch)

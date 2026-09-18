@@ -751,6 +751,7 @@ class JobRunner:
         # Tell the engine which slot it is pinned to, so device resolution can
         # map it to a GPU (R6).
         params["slot_index"] = slot_index
+        params["slot_count"] = self._slot_count
         params["_job_id"] = envelope.job_id
 
         # Fetch the model and verify it. A job spec's model always carries a

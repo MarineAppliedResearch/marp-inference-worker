@@ -1,101 +1,87 @@
 ---
-task: MarineAppliedResearch/marp-inference-worker#18
-repos: [marp-inference-worker, marp-api]
-status: ready-for-pr
+task: MarineAppliedResearch/marp-inference-worker#20
+repos: [marp-inference-worker, MARP_API]
+status: design
 needs: []
 ---
 
 ## Goal
 
-A person on a supported Windows NVIDIA computer opens one small MARP installer once. It
-prepares, activates, and starts the inference worker without asking them to install or
-understand developer tools, runtimes, browsers, or packages.
+A volunteer who presses stop on a running job sees it stop, and the work the run
+actually completed reaches MARP. Today the stop is reported with a word the
+coordinator has never accepted, so it is refused, the attempt is never published,
+nothing is ingested, and the volunteer is told nothing. The person stopping a job
+is the whole point of the screen-saver behaviour; at the moment it is the one
+action that silently loses work.
 
 ## Requirements
 
-- **R1** — The Windows x64 development installer is one-click and per-user. It requires no
-  preinstalled Python, Node, Git, browser, CUDA toolkit, or C++ compiler.
-- **R2** — The bootstrap remains a practical single download and downloads large versioned
-  components during setup, with visible aggregate progress. The 69.3 MB development build
-  was accepted for the pilot. It does not bundle PyTorch, models, or the completed runtime
-  inside its initial executable.
-- **R3** — Setup detects a supported NVIDIA driver and GPU and installs the approved runtime
-  variant. CUDA 12.6 serves compatible GPUs; compute capability 12.x receives CUDA 12.8,
-  and release metadata can name additional variants later. Setup proves compatibility by
-  executing a CUDA kernel before it declares the worker ready.
-- **R4** — Every downloaded component has an approved URL, byte size, and SHA-256. Setup
-  rejects incomplete, altered, wrong-platform, and path-traversing content before use.
-- **R5** — The installer accepts a one-time activation code, creates a durable machine
-  identity, and exchanges the code for a narrowly scoped credential unique to that worker.
-- **R6** — The credential is protected with Windows DPAPI, is never logged or passed on a
-  command line, and remains outside replaceable version directories. MARP can revoke one
-  machine without affecting another.
-- **R7** — Setup installs versions side by side, points a stable launcher at the active
-  version, keeps persistent configuration and caches separately, and can uninstall cleanly.
-- **R8** — The installed worker starts in the interactive user session at Windows sign-in,
-  authenticates automatically, and permits visible watched-job windows by default.
-- **R9** — Models remain outside the installer and are downloaded, verified, and cached from
-  MARP_API when a job requests them.
-- **R10** — Setup reports understandable progress and actionable failures and finishes by
-  verifying worker startup, API enrollment, GPU discovery, and local health.
-- **R11** — The first milestone produces an unsigned development installer usable for a
-  real two-computer API job. Volunteer releases remain blocked on later code signing.
-- **R12** — The installation layout and manifest support later operator-requested atomic
-  updates and rollback without requiring that full update workflow in the first pilot.
+- **R1** — When an operator stops a job mid-run, the worker reports a terminal
+  outcome the coordinator accepts. It does not invent a word that is not in the
+  coordinator's vocabulary.
+- **R2** — The report carries how far the run actually got, so MARP can tell
+  which part of the frame range is real work.
+- **R3** — A result the coordinator refuses does not cause the worker to forget
+  the attempt. The in-flight record survives, so the attempt is reported rather
+  than left to expire against the lease and then the 24h attempt cap.
+- **R4** — A refused stop is visible to the operator, not only written into
+  `note_error` where nobody looks.
+- **R5** — The worker's test asserts what it actually sends on a stop, named
+  against the same requirement as `MARP_API`'s test that the coordinator accepts
+  it. Neither suite may pass on its own assumption about the other.
 
 ## Open assumptions
 
-- [x] **A1 · product/UI · blocking** — answered 2026-09-14: the volunteer clicks one setup
-  application; dependency installation is entirely handled by setup.
-- [x] **A2 · distribution · blocking** — answered 2026-09-14: the initial installer should
-  be small; large runtimes are downloaded during setup rather than embedded in it.
-- [x] **A3 · environment · blocking** — answered 2026-09-14: Windows x64 first, per user,
-  start at sign-in, CUDA 12.6 first, with other runtime variants possible later.
-- [x] **A4 · security/API contract · blocking** — answered 2026-09-14: a one-time activation
-  code becomes a unique revocable machine credential protected with DPAPI.
-- [x] **A5 · distribution/API contract · blocking** — answered 2026-09-14: MARP_API approves
-  release metadata; immutable packages may be downloaded from GitHub Releases.
-- [x] **A6 · release · blocking** — answered 2026-09-14: unsigned development installers are
-  acceptable for the pilot; public volunteer releases require code signing.
-- [x] **A7 · scope · blocking** — answered 2026-09-14: prove installation and a real job on a
-  second computer first; production automatic rollout follows as a separate milestone.
+- [ ] **A1 · API contract · blocking** — what does a worker report when an
+      operator stops a job mid-run?
+      **(a)** the coordinator's vocabulary grows a fourth outcome, `yielded` — a
+      run stopped early with real work in it is a distinct thing from a cancel,
+      and ingest keys on it directly; or
+      **(b)** the worker reports `cancelled`, and the partial-work signal is
+      carried entirely by `completed_through_frame`.
+      Either answer requires `completed_through_frame` to be read and stored, and
+      the ingest condition to stop keying on `succeeded` alone — both on the
+      `MARP_API` side, both a migration. Settled before implementation, not
+      during it.
+- [ ] **A2 · cross-repository · blocking** — R3 changes what a worker does with
+      an attempt the coordinator refused. If it keeps the in-flight record and
+      reports it at restart, the coordinator sees a second result call for an
+      attempt it already refused. Is that idempotent today for a refused attempt,
+      or does it need handling on the `MARP_API` side too? Asked of the desktop
+      session; it owns that file.
 
 ## Decisions
 
-- **2026-09-14** — Reuse installer, launcher, activation, and manifest work preserved on
-  `backup-11-installer-scope`; remove its monolithic bundled-runtime approach.
-- **2026-09-14** — Treat bootstrap size and installed/downloaded size as separate facts. The
-  setup experience is one click even though GPU inference dependencies are necessarily large.
-- **2026-09-14** — Select the runtime from NVIDIA compute capability. A real RTX 5060 laptop
-  exposed that CUDA visibility alone is insufficient: cu126 could enumerate its 12.0 device
-  but had no executable kernel for it. The final setup check therefore runs a CUDA kernel.
+- **2026-09-17** — Worker side and API side are split: this branch changes
+  `runner.py`, `operator_control.py`, `worker_state.py` and `watch/` only. The
+  outcome vocabulary, the `completed_through_frame` column and the ingest
+  condition belong to `MARP_API` and to the desktop session working there.
+- **2026-09-17** — The stop/outcome contract is done before job targeting and
+  before repeated ingest. It is small, it is genuinely broken, and both of those
+  goals stand on it.
 
 ## Plan
 
-1. Extract the existing installer, launcher, credential, and manifest code from the backup.
-2. Replace the bundled multi-gigabyte payload with verified component downloads.
-3. Implement the matching one-time activation endpoint and machine-bound credential.
-4. Register per-user start-at-sign-in and retain visible watch mode as the default.
-5. Build an unsigned development installer and write the focused verification plan.
-6. After plan approval, install it on the second computer and run one real API-assigned job.
+Not started — A1 is open and blocking, and it decides what R1 and R2 are.
 
 ## Acceptance criteria
 
-- Opening the development installer on a clean supported Windows computer is the only manual
-  installation action.
-- The machine appears separately in the MARP worker pool with its real GPU capabilities.
-- Restarting Windows starts the worker without another activation or login.
-- A real assigned inference job downloads its model from MARP_API, runs, reports progress,
-  and displays its viewer when requested.
-- Removing or revoking that worker credential prevents only that machine from taking work.
+- Pressing stop on a running job produces a terminal result the coordinator
+  accepts, and the attempt leaves `leased`.
+- The frame the run reached is stored against the attempt and readable back.
+- Killing the coordinator during the stop, then restarting the worker, still
+  reports the attempt rather than leaving it to expire.
+- A test in each repository names R1 and fails if the other side's assumption
+  changes.
 
 ## Test plan
 
-See `.marp/verification.md`; the approved focused verification is complete.
+G3. Not written.
 
 ## Status
 
-- **Gate:** verified; ready for pull request
-- **Notes:** All material product, distribution, security, and first-platform decisions were
-  answered during issue #11 and carried here. The old branch is source material, not a base:
-  issue #18 starts from current `develop` and deliberately excludes its monolithic payload.
+- **Gate:** design
+- **Notes:** Issue #20 filed. Branch cut from `develop` at 56cdcff. Nothing
+  implemented; A1 and A2 are open and blocking. Networking to the desktop's API
+  is arranged but not yet proven — no live round trip has been run from this
+  machine.

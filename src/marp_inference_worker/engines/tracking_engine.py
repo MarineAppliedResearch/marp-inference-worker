@@ -208,7 +208,62 @@ class TrackingEngine(BaseEngine):
         # Build the model, the tracker and the accumulator for this range only.
         # A fresh tracker per range is what makes the boundary a seam (R10a).
         ctx.report_progress(0, expected_frames, "frames", phase="loading_model")
+
+        # Hash the file that is about to be loaded, not the one that was
+        # fetched.
+        #
+        # The cache verifies an artifact when it puts it there and on every hit,
+        # which is real -- but it verifies *a path*, and loading is a separate
+        # step afterwards. Nothing proved the engine opened the file that was
+        # checked. Hashing here closes that gap for a few seconds on a 136 MB
+        # file, which is nothing against publishing a run made by the wrong
+        # weights.
+        # Imported here rather than at module scope: `models` pulls in the
+        # engine registry, which imports this module, and the cycle breaks the
+        # package at import time.
+        from marp_inference_worker.models import model_cache
+
+        expected_sha = str((spec.get("model") or {}).get("sha256") or "")
+        loaded_sha = model_cache.verify_sha256(Path(model_path), expected_sha)             if expected_sha else None
+
         yolo_model = self._detector.load_weights(model_path, device)
+
+        # And check the vocabulary against what MARP registered for this model.
+        #
+        # This is the one thing that catches weights which are not the weights
+        # the job asked for. A hash proves the *file* is right; this proves what
+        # came out of it is. They are not the same claim, and the evening this
+        # was written the two disagreed on screen with nothing to notice it.
+        loaded_names = sorted(str(name) for name in (yolo_model.names or {}).values())
+        declared = (spec.get("model") or {}).get("class_names")
+
+        if declared:
+            expected_names = sorted(str(name) for name in declared)
+
+            if loaded_names != expected_names:
+                raise JobUnrunnable(
+                    "the loaded model is not the model this job asked for: "
+                    f"weights contain {len(loaded_names)} classes {loaded_names}, "
+                    f"but MARP registered {len(expected_names)} for "
+                    f"{(spec.get('model') or {}).get('name')!r}: {expected_names}"
+                )
+        else:
+            # A model with no registered species is a seeding gap, not a wrong
+            # model. Say so plainly rather than refusing work over it.
+            ctx.log(
+                "MARP declared no class names for this model, so the loaded "
+                "weights could not be checked against it",
+                level="warning",
+            )
+
+        # Record what actually ran, so "which weights made this?" is a query
+        # rather than somebody's recollection.
+        ctx.log(
+            f"loaded model {(spec.get('model') or {}).get('name')!r} "
+            f"sha256={loaded_sha or 'unverified'} "
+            f"classes={loaded_names}",
+            level="info",
+        )
         if wants_watch:
             from marp_inference_worker.watch import WatchDisplay
 

@@ -941,6 +941,10 @@ class JobRunner:
         params["model_path"] = cache_state["artifact_path"]
         params["model_sha256"] = cache_state["sha256"]
 
+        # What MARP says this model was trained on. The engine checks it
+        # against the weights it actually loads and refuses a mismatch.
+        params["model_class_names"] = model.class_names
+
         return params
 
     # _service_running_jobs()

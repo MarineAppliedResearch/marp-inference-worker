@@ -1,168 +1,158 @@
 ---
-task: MarineAppliedResearch/marp-inference-worker#20
-repos: [marp-inference-worker, MARP_API]
-status: design
+task: MarineAppliedResearch/marp-inference-worker#32
+repos: [marp-inference-worker]
+status: implementing
 needs: []
 ---
 
 ## Goal
 
-A volunteer who presses stop on a running job sees it stop, and the work the run
-actually completed reaches MARP. Today the stop is reported with a word the
-coordinator has never accepted, so it is refused, the attempt is never published,
-nothing is ingested, and the volunteer is told nothing. The person stopping a job
-is the whole point of the screen-saver behaviour; at the moment it is the one
-action that silently loses work.
+A volunteer on Linux can enrol their machine. Today they cannot: the worker encrypts its
+credential with Windows DPAPI and raises on any other platform, so activation reaches the
+coordinator, receives a credential, and then dies writing it to disk. The machine is left
+holding a local id and nothing that can authenticate, and the single-use activation code is
+already spent. No Linux worker has ever reached the job loop, and none can until the
+credential has somewhere to live.
 
 ## Requirements
 
-- **R1** — When an operator stops a job mid-run, the worker reports a terminal
-  outcome the coordinator accepts. It does not invent a word that is not in the
-  coordinator's vocabulary.
-- **R2** — The report carries how far the run actually got, so MARP can tell
-  which part of the frame range is real work.
-- **R3** — A result the coordinator refuses does not cause the worker to forget
-  the attempt. The in-flight record survives, so the attempt is reported rather
-  than left to expire against the lease and then the 24h attempt cap.
-- **R4** — A refused stop is visible to the operator, not only written into
-  `note_error` where nobody looks.
-- **R5** — The worker's test asserts what it actually sends on a stop, named
-  against the same requirement as `MARP_API`'s test that the coordinator accepts
-  it. Neither suite may pass on its own assumption about the other.
+- **R1** — On a non-Windows platform the worker stores its credential in the state
+  directory with owner-only permissions (0600), and reads it back.
+- **R2** — Windows behaviour is unchanged. DPAPI remains the path on `win32`; this adds a
+  branch rather than replacing one.
+- **R3** — `protect()` states its own threat model in words: what the filesystem protects
+  against, what it does not, and that the reduction from DPAPI is deliberate.
+- **R4** — A credential file created by this path is not readable by another user on the
+  machine, and the permissions are set before the secret reaches the file rather than
+  after.
+- **R5** — A round trip through `save()` and `load()` returns the credential unchanged, and
+  `load()` on a machine that has never activated returns `None` rather than raising.
 
 ## Open assumptions
 
-- [x] **A1 · API contract · blocking** — answered 2026-09-17: **(a)**. The
-      coordinator's vocabulary grows a fourth outcome, `yielded`. A run stopped
-      early with real work in it is a distinct thing from a cancel, and ingest
-      keys on it directly rather than on a nullable frame number. Rejected: (b),
-      reporting `cancelled` and carrying the whole signal in
-      `completed_through_frame` — `cancelled` already means "called off, nothing
-      to keep", and overloading it makes the ingest condition depend on a number
-      rather than on what happened. → ADR in the umbrella before this merges; it
-      spans two repositories.
+- [x] **A1 · security/permissions · blocking** — answered 2026-09-18: how should a Linux
+  worker hold its credential at rest, given Linux has no DPAPI equivalent? **0600 file
+  permissions in the state directory.** Isaac's decision, confirmed directly and relayed
+  through MARP-DESKTOP-DEV. The alternatives were Secret Service/libsecret and a key
+  derived from `/etc/machine-id`. libsecret is the closest analogue to DPAPI but needs an
+  unlocked keyring, which a headless autologin machine does not have — demonstrated on this
+  box today, where GDM autologin left the login keyring locked. *An option that fails on
+  the target hardware is not the more secure option, it is the one that does not ship.* The
+  machine-id derivation was rejected as obfuscation: anything that can read the credential
+  can read `/etc/machine-id`. Isaac attached a condition — the threat model goes in the
+  code, not left implied. That condition is R3.
 
-- [x] **A2 · cross-repository · blocking** — answered 2026-09-17 by reading
-      `MARP_API`, and independently by the desktop session: **safe, build the
-      retry.** `requiredEnum` throws in the service layer before
-      `publishResult` is reached, so a refused result writes nothing — the
-      attempt keeps its live state, worker and epoch. A later retry is therefore
-      a first report, not a replay: `isReplay` is false because the state is not
-      terminal, `leaseRefusalReason` checks four things and no wall clock, and
-      if all four hold it publishes normally. If the sweeper took the lease back
-      meanwhile the answer is `{action:'abandon', accepted:false}`, which the
-      client already understands. The window is the lease, not forever — a
-      restart after the sweeper is told to let go and the work is still lost.
-      Recovering beyond the lease is a second change, on the `MARP_API` side,
-      and deliberately not in scope here.
-- [x] **A3 · behavioural / database · blocking** — answered 2026-09-17: **(b)**.
-      A stopped job returns to `queued` with the remaining range, and another
-      volunteer carries on from `completed_through_frame`. A stop is a normal
-      event in a volunteer pool, not a decision to abandon the range. This is
-      what makes `completed_through_frame` earn its place: something later reads
-      it to resume from.
-- [x] **A4 · database/schema · blocking** — answered 2026-09-17, decided here on
-      Isaac's instruction to choose: **a yield does not consume an attempt.**
-      `max_attempts` guards against a job that keeps failing, and a volunteer
-      pressing stop is not a failure. Were it to increment `attempts_made`, the
-      jobs passed between the most volunteers would be the first to become
-      unclaimable, which is the opposite of what a pool is for.
-- [x] **A5 · API contract · blocking** — answered 2026-09-17, same instruction:
-      **ingest idempotency keys on the attempt, not the job.** `ingested_at` on
-      `gpu_job_attempts`, guarded on that. `observations.gpu_job_id` is left
-      alone — the job is the unit of scientific work, so provenance stays at the
-      job and only the guard moves. `gpu_jobs.published_attempt_id` must also
-      stop being one-shot: its `publishedAttemptId === null` check would let only
-      the first segment of a requeued job publish.
-- [x] **A6 · environment · blocking** — answered 2026-09-17: an activation code,
-      exchanged at `POST /api/v2/gpu/workers/activate` for a per-machine
-      credential. A hand-minted application token cannot enrol and has not been
-      able to since `MARP_API#190`. Worker 898 enrolled this way against the
-      desktop coordinator and has run three real jobs.
+- [x] **A2 · architectural · blocking** — answered 2026-09-18: does this replace DPAPI or
+  sit alongside it? **Alongside.** A `sys.platform` branch. Windows keeps DPAPI exactly as
+  it is. Confirmed by MARP-DESKTOP-DEV in the issue.
 
+- [x] **A3 · security/permissions · blocking** — answered 2026-09-18 by Isaac: **option 3,
+  weaken it to the round trip only.** Asked twice and confirmed, so it is a decision rather
+  than a slip. The test is renamed `test_credential_round_trip`, because a test named for an
+  assertion it no longer makes is worse than no test — and a comment above it records what
+  was dropped and where the replacement lives.
+
+  Recorded because both I and MARP-DESKTOP-DEV recommended option 2 and were overruled: the
+  cost is that **no test now asserts DPAPI encrypts anything on Windows**. The Linux mode
+  assertion in `tests/test_credential_store.py` does not substitute for it — different
+  guarantee, different platform. If Windows coverage is revisited, that is the gap.
+
+  The question, as originally raised during G2:
+  `tests/test_installed_worker.py:50` is `test_dpapi_credential_round_trip_is_not_plaintext`,
+  and line 56 asserts `secret.encode("utf-8") not in path.read_bytes()` — *the credential is
+  never plaintext on disk*. That is an existing test asserting the exact property A1
+  deliberately gives up on Linux, so on this platform it cannot pass. **What should happen
+  to it?**
+
+  It already fails on `develop` here, before any change of mine, because `protect()` raised
+  rather than returned — so this is not a regression I introduced. But it stops being a
+  platform gap and starts being a contradiction the moment 0600 lands, and it should be
+  settled deliberately rather than left red.
+
+  Three ways, and the choice is a statement about what the test is for:
+  1. **Mark it `skipif(sys.platform != "win32")`.** The function is named for DPAPI and is
+     testing DPAPI; on a platform without DPAPI it is not applicable. Cuts against the
+     testing doctrine's *a skipped suite looks green*, though what is skipped here is
+     genuinely absent rather than merely unavailable.
+  2. **Split it in two** — keep the not-plaintext assertion for `win32`, and assert the
+     0600 property off it. Costs a little duplication with
+     `tests/test_credential_store.py`, which already asserts the Linux half.
+  3. **Weaken the assertion to the round trip only**, dropping the not-plaintext check.
+     Cheapest, and the worst: it silently removes the assertion that DPAPI is doing
+     anything at all on Windows, which is the one thing that test exists to prove.
+
+  My read is **2**, because it keeps the Windows guarantee asserted rather than skipped,
+  and 3 would quietly delete a real security assertion on the platform where it still
+  holds. Not acting on that read — it is a security assertion and the call is Isaac's.
 
 ## Decisions
 
-- **2026-09-17** — A hand-minted application token cannot enrol a worker, by
-  design. `authorizeEnrol` requires the token to be already bound to a
-  `gpu_workers` row whose `local_id` matches, and a new token is bound to
-  nothing, so it is 403 before `local_id` is compared. Activation (MARP_API#190)
-  is the only enrolment path. `.marp/handoff.md`'s bring-up instructions predate
-  it and are stale.
-- **2026-09-17** — A stopped job is requeued with its remaining range rather than
-  cancelled. Isaac's call, answering A3. Consequence: one job is now finished by
-  several attempts in sequence, which is what raises A4 and A5 — neither was
-  visible while a job had exactly one publishing attempt.
-- **2026-09-17** — Adding `yielded` to `RESULT_OUTCOMES` alone is not enough and
-  is worse than doing nothing: `gpu_job_attempts` has no `outcome` column, so the
-  outcome is the attempt state. `ATTEMPT_STATES` and the
-  `gpu_job_attempts_state_check` constraint must grow the word too, and
-  `publishResult` needs a branch of its own — its `else` hardcodes
-  `state='cancelled'`. Without all three, a stop stops returning 400 and starts
-  quietly recording a cancel, erasing the distinction the fourth word exists to
-  make.
-- **2026-09-17** — A stop reports `yielded`, a fourth outcome, rather than
-  reusing `cancelled`. Isaac's call, answering A1. The point of no return is
-  `MARP_API`'s migration: the check constraint on `gpu_job_attempts.outcome`
-  spells its vocabulary out, so adding the word is a migration and removing it
-  later is another one.
-- **2026-09-17** — Worker side and API side are split: this branch changes
-  `runner.py`, `operator_control.py`, `worker_state.py` and `watch/` only. The
-  outcome vocabulary, the `completed_through_frame` column and the ingest
-  condition belong to `MARP_API` and to the desktop session working there.
-- **2026-09-17** — The stop/outcome contract is done before job targeting and
-  before repeated ingest. It is small, it is genuinely broken, and both of those
-  goals stand on it.
+- **2026-09-18** — 0600 file permissions on non-Windows, DPAPI retained on Windows. The
+  threat model is stated in `protect()` rather than implied. Durable enough to promote to a
+  decision record if the credential store is revisited; left here for now because it
+  records one platform branch rather than an architecture.
+
+- **2026-09-18** — the file is opened with `O_CREAT | O_EXCL` and mode `0o600` so the
+  permissions exist before the secret does. Writing then `chmod`-ing leaves a window where
+  the credential is on disk world-readable, which on a multi-user box is the whole of the
+  defence missing for as long as it takes to run the next line.
+
+- **2026-09-18** — `O_BINARY` is included in the open flags via `getattr(os, "O_BINARY", 0)`,
+  because the constant does not exist off Windows. **This was a regression introduced by the
+  decision above and caught by Windows verification, not by reasoning.** `os.open` without it
+  gives a text-mode descriptor on Windows, which translates every `0x0A` written to
+  `0x0D 0x0A`; DPAPI ciphertext is binary, so the credential was corrupted on write and
+  `CryptUnprotectData` failed at startup with *The data is invalid*. Demonstrated rather than
+  argued: `010a020a0a03` came back as `010d0a020d0a0d0a03`.
+
+  Worth recording because of its shape. A Windows worker would have activated successfully,
+  written a corrupted credential, and failed to authenticate later — the same failure that
+  opened this issue, arriving from the opposite platform. The tests written here are what
+  caught it; the original code never went near `os.open`.
 
 ## Plan
 
-A1 is settled, A2 is not. Ordered, and the first two are the whole of R1/R2 here:
-
-1. `runner.py` reports `yielded` only once `MARP_API` accepts it — the two land
-   together or the worker is broken against a coordinator that has not shipped.
-2. Send `completed_through_frame` as it already computes it, and assert it.
-3. R3: keep the in-flight record when the result call is refused, so the attempt
-   is reported at restart instead of expiring. A2 answered — safe to build.
-4. R4: surface a refused stop to the operator.
+1. Branch `32-linux-credential-store` off `develop` at `1d0f50f`. *(done)*
+2. Add the non-Windows branch to `protect()` and `unprotect()`, with the threat model
+   written into `protect()`.
+3. Make `save()` create the file with 0600 from the moment it exists, not after.
+4. Tests at the tier that can see it: a round trip, the permission bits, `load()` on a
+   machine that never activated, and that the Windows path is untouched.
+5. Report to MARP-DESKTOP-DEV before activating — worker 1081 holds this machine's
+   `local_id`, so a fresh activation returns 409 until that row is cleared.
 
 ## Acceptance criteria
 
-- Pressing stop on a running job produces a terminal result the coordinator
-  accepts, and the attempt leaves `leased`.
-- The frame the run reached is stored against the attempt and readable back.
-- Killing the coordinator during the stop, then restarting the worker, still
-  reports the attempt rather than leaving it to expire.
-- A test in each repository names R1 and fails if the other side's assumption
-  changes.
+- `marp-worker-activate` completes on Linux and leaves a credential the worker can read.
+- The credential file is `-rw-------`.
+- `unprotect(protect(x)) == x` on Linux.
+- `load()` returns `None`, not an exception, before first activation.
+- No change to behaviour on `win32`.
 
 ## Test plan
 
-G3. Not written.
+Filled at G3. Targeted at `tests/` for the credential store only — not the whole suite,
+per the testing doctrine. The Windows path cannot be executed here, so R2 is covered by
+asserting the branch is not taken rather than by running DPAPI, and that limit is stated
+rather than left to look like coverage.
 
 ## Status
 
-- **Gate:** verifying
-- **Notes:** All six assumptions answered. Implemented and committed on
-  `20-stop-reports-refused-outcome`; nothing pushed, no PR.
+- **Gate:** implementing (A3 answered; R1–R5 complete)
+- **Notes:** R1–R5 are implemented and committed on this branch, and
+  `tests/test_credential_store.py` is 8/8 green. Proven red first: 7 of those 8 fail against
+  the original module, the eighth being `load()` before activation, which never reaches the
+  DPAPI call and passes either way.
 
-  **Done:** the watch display is decidable by either side (R-watch, Isaac's
-  instruction); engines declare `requires_model` and the mock engine no longer
-  needs weights; `model` and `reduction` are optional on a job spec; `live.html`
-  ships with the package and Chromium falls back to an installed browser;
-  `failure_reason` is null on a yield (R1); the stop path is tested (R5); a
-  refused result survives to be retried at the next start (R3).
+  **A3** turned up during G2, went back to Isaac, and is answered. The contradicting test is
+  weakened to the round trip and renamed. `tests/test_installed_worker.py` now runs 11 passed
+  where it ran 3 failed, 2 passed on `develop`.
 
-  **R2 needs no worker change** — `runner.py` already sends
-  `completed_through_frame`, and a resumed lease already carries the moved
-  `start_frame`. Proven live rather than argued: the desktop stopped a job at
-  400 and the next lease began at exactly 400 with 2600 to go.
+  Not verified end to end: activation cannot be retested until MARP-DESKTOP-DEV clears
+  worker 1081 and mints a new code — the previous one is spent. So the first acceptance
+  criterion is unproven, and the tests here cover the store rather than the enrolment.
 
-  **Not done:** R4's remaining half. A refused result now reaches `/status`
-  through `last_error`, but a watch-display failure happens in the child process
-  and still only reaches the coordinator's event stream. That was the shape that
-  hid the missing page for the life of the feature, and it deserves its own fix
-  rather than being folded in here.
-
-  **Verified live**, two machines on two networks, coordinator at the desktop:
-  three `marp_tracking` jobs on worker 898, weights streamed from MARP, and the
-  watch window drawing boxes over real dive video.
+  Found and left alone, in `tests/test_installed_worker.py` and pre-dating this branch:
+  `test_update_is_verified_and_staged_beside_the_active_release` and
+  `test_update_rejects_path_traversal` both fail on `develop` here. Unrelated to the
+  credential store and not investigated.

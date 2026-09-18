@@ -47,13 +47,16 @@ def _serve(monkeypatch, package: bytes) -> httpx.Client:
     return client
 
 
-def test_dpapi_credential_round_trip_is_not_plaintext(tmp_path) -> None:
+# Asserts the round trip only. It used to also assert the stored bytes were not the secret,
+# which stopped being true off Windows when #32 made the Linux store 0600 plaintext -- the
+# protection there is the file mode, not encryption, and `tests/test_credential_store.py`
+# asserts it. Renamed because the old name claimed something this no longer checks.
+def test_credential_round_trip(tmp_path) -> None:
     path = tmp_path / "worker-credential.dpapi"
     secret = "svc_this-is-the-test-secret"
     credential_store.save(path, secret)
 
     assert credential_store.load(path) == secret
-    assert secret.encode("utf-8") not in path.read_bytes()
 
 
 def test_launcher_reads_windows_powershell_utf8_json(tmp_path) -> None:

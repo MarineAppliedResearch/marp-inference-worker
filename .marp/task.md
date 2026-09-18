@@ -46,7 +46,18 @@ credential has somewhere to live.
   sit alongside it? **Alongside.** A `sys.platform` branch. Windows keeps DPAPI exactly as
   it is. Confirmed by MARP-DESKTOP-DEV in the issue.
 
-- [ ] **A3 · security/permissions · blocking** — found during G2, not anticipated at G1.
+- [x] **A3 · security/permissions · blocking** — answered 2026-09-18 by Isaac: **option 3,
+  weaken it to the round trip only.** Asked twice and confirmed, so it is a decision rather
+  than a slip. The test is renamed `test_credential_round_trip`, because a test named for an
+  assertion it no longer makes is worse than no test — and a comment above it records what
+  was dropped and where the replacement lives.
+
+  Recorded because both I and MARP-DESKTOP-DEV recommended option 2 and were overruled: the
+  cost is that **no test now asserts DPAPI encrypts anything on Windows**. The Linux mode
+  assertion in `tests/test_credential_store.py` does not substitute for it — different
+  guarantee, different platform. If Windows coverage is revisited, that is the gap.
+
+  The question, as originally raised during G2:
   `tests/test_installed_worker.py:50` is `test_dpapi_credential_round_trip_is_not_plaintext`,
   and line 56 asserts `secret.encode("utf-8") not in path.read_bytes()` — *the credential is
   never plaintext on disk*. That is an existing test asserting the exact property A1
@@ -114,17 +125,15 @@ rather than left to look like coverage.
 
 ## Status
 
-- **Gate:** design (returned from implementing — A3 opened during G2)
+- **Gate:** implementing (A3 answered; R1–R5 complete)
 - **Notes:** R1–R5 are implemented and committed on this branch, and
   `tests/test_credential_store.py` is 8/8 green. Proven red first: 7 of those 8 fail against
   the original module, the eighth being `load()` before activation, which never reaches the
   DPAPI call and passes either way.
 
-  Returned to design because **A3** turned up during G2 — an existing test asserts the
-  credential is never plaintext on disk, which is the property A1 deliberately gives up on
-  Linux. It already failed on `develop` before this branch, so it is not a regression, but
-  it is now a contradiction rather than a gap and it should be settled rather than left red.
-  Nothing further is implemented while it is open.
+  **A3** turned up during G2, went back to Isaac, and is answered. The contradicting test is
+  weakened to the round trip and renamed. `tests/test_installed_worker.py` now runs 11 passed
+  where it ran 3 failed, 2 passed on `develop`.
 
   Not verified end to end: activation cannot be retested until MARP-DESKTOP-DEV clears
   worker 1081 and mints a new code — the previous one is spent. So the first acceptance

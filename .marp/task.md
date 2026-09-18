@@ -42,15 +42,41 @@ action that silently loses work.
       rather than on what happened. → ADR in the umbrella before this merges; it
       spans two repositories.
 
-- [ ] **A2 · cross-repository · blocking** — R3 changes what a worker does with
-      an attempt the coordinator refused. If it keeps the in-flight record and
-      reports it at restart, the coordinator sees a second result call for an
-      attempt it already refused. Is that idempotent today for a refused attempt,
-      or does it need handling on the `MARP_API` side too? Asked of the desktop
-      session; it owns that file.
+- [x] **A2 · cross-repository · blocking** — answered 2026-09-17 by reading
+      `MARP_API`, and independently by the desktop session: **safe, build the
+      retry.** `requiredEnum` throws in the service layer before
+      `publishResult` is reached, so a refused result writes nothing — the
+      attempt keeps its live state, worker and epoch. A later retry is therefore
+      a first report, not a replay: `isReplay` is false because the state is not
+      terminal, `leaseRefusalReason` checks four things and no wall clock, and
+      if all four hold it publishes normally. If the sweeper took the lease back
+      meanwhile the answer is `{action:'abandon', accepted:false}`, which the
+      client already understands. The window is the lease, not forever — a
+      restart after the sweeper is told to let go and the work is still lost.
+      Recovering beyond the lease is a second change, on the `MARP_API` side,
+      and deliberately not in scope here.
+- [ ] **A3 · behavioural / database · blocking** — when a volunteer stops a job
+      halfway, what happens to the **job**, as distinct from the attempt?
+      **(a)** the job is cancelled, as today — terminal, nobody finishes the
+      range; or **(b)** the job returns to `queued` with the remaining range, and
+      another volunteer carries on from `completed_through_frame`.
+      Raised because `publishResult`'s `else` branch currently writes
+      `state='cancelled'` on both attempt and job, so a `yielded` outcome with
+      no branch of its own silently becomes a cancel. (b) is what
+      `completed_through_frame` is for and is the same machinery goals 1 and 4
+      will want, but it is a different migration and different ingest semantics.
+      `MARP_API`'s change, my requirement.
 
 ## Decisions
 
+- **2026-09-17** — Adding `yielded` to `RESULT_OUTCOMES` alone is not enough and
+  is worse than doing nothing: `gpu_job_attempts` has no `outcome` column, so the
+  outcome is the attempt state. `ATTEMPT_STATES` and the
+  `gpu_job_attempts_state_check` constraint must grow the word too, and
+  `publishResult` needs a branch of its own — its `else` hardcodes
+  `state='cancelled'`. Without all three, a stop stops returning 400 and starts
+  quietly recording a cancel, erasing the distinction the fourth word exists to
+  make.
 - **2026-09-17** — A stop reports `yielded`, a fourth outcome, rather than
   reusing `cancelled`. Isaac's call, answering A1. The point of no return is
   `MARP_API`'s migration: the check constraint on `gpu_job_attempts.outcome`
@@ -93,6 +119,10 @@ G3. Not written.
 
 - **Gate:** design
 - **Notes:** Issue #20 filed. Branch cut from `develop` at 56cdcff. Nothing
-  implemented. A1 is answered; A2 is open and blocking. Networking to the desktop's API
+  implemented. A1 and A2 are answered; A3 is open and blocking. The desktop's
+  API is reachable from this network at the address Isaac gave — 200 on root,
+  401 on the GPU family, so the forward and the auth gate are both proven. The
+  family is mounted under `/api/v2/gpu`, not the `/api/gpu` its `path:` fields
+  declare; `registerVersionedRoute` rewrites it. No worker token yet. Networking to the desktop's API
   is arranged but not yet proven — no live round trip has been run from this
   machine.

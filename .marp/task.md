@@ -136,6 +136,13 @@ invoked when there is no profile. 24 passed, up from 18.
   blocking assumption was open while the code was written, but the spec did not exist at
   G1 and this note is here rather than left for someone to notice.
 
-  Found and left alone: `test_slots_fill_the_monitors_before_they_are_subdivided` is defined
-  twice in `tests/test_watch_display.py`, at lines 318 and 660. The second shadows the first,
-  so one of them has never run. Pre-dates this branch.
+  Found and left alone: **ten tests in `tests/test_watch_display.py` are defined twice** —
+  ruff reports ten F811 redefinitions on `develop`, unchanged by this branch. A block of the
+  file appears to have been duplicated, so the first definition of each is shadowed and has
+  never run. Among them is
+  `test_chromium_is_found_from_configuration_or_an_installed_browser`, which covers the very
+  function this branch changes — so the existing coverage of `_find_chromium()` is half what
+  it looks like. Pre-dates this branch and is not fixed here.
+
+  Also from Windows verification, recorded because it is expensive to rediscover: `wmic` has
+  been removed from current Windows builds, so anything reaching for it fails.

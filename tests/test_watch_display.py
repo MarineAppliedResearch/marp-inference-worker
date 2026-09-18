@@ -1,6 +1,7 @@
 """Tests for the child-owned ordered watch channel."""
 
 import base64
+import sys
 import threading
 import time
 from pathlib import Path
@@ -8,6 +9,7 @@ from types import SimpleNamespace
 
 import cv2
 import numpy as np
+import pytest
 
 from marp_inference_worker.watch.display import (
     WatchDisplay,
@@ -902,6 +904,10 @@ def test_find_chromium_finds_a_linux_browser_on_path(monkeypatch, tmp_path) -> N
 # which snap to run. Resolving it hands Chromium's arguments to the snap tool and
 # nothing opens. This is the real layout on an Ubuntu box with the chromium snap,
 # and it is the difference between a window and silence. Refs #31.
+# Creating a symlink on Windows needs elevation or developer mode, and the layout this
+# asserts -- a multi-call wrapper reached through PATH -- cannot occur there at all. A red
+# test nobody can fix reads as decay, so this one is skipped rather than left failing.
+@pytest.mark.skipif(sys.platform == "win32", reason="symlink creation needs elevation")
 def test_find_chromium_does_not_resolve_a_multi_call_wrapper(monkeypatch, tmp_path) -> None:
     from marp_inference_worker.watch import display as display_module
 

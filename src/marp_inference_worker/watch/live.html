@@ -288,6 +288,8 @@
     updateBar(packet);
     note.hidden = true;
 
+    drawnAnything = true;
+
     if (!proofSent) {
       proofSent = true;
       // Best effort: the run must not depend on the proof being accepted.
@@ -297,6 +299,31 @@
         0.8,
       );
     }
+  }
+
+  // Whether this window has ever drawn a frame. A failure before the first one
+  // is a real fault worth leaving on screen; after it, the server going away is
+  // just the job ending.
+  let drawnAnything = false;
+
+  // End of the run: close the window.
+  //
+  // A watched job leaves nothing behind. The worker also kills the browser, but
+  // it cannot always: Chromium may hand the window to another process and exit,
+  // and the pid the worker holds is then gone while the window lives on. So the
+  // page closes itself as well, and whichever gets there first wins.
+  function finish(message) {
+    note.textContent = message;
+    note.hidden = false;
+
+    try {
+      window.close();
+    } catch { /* blocked: the message stays up instead */ }
+
+    // `window.close()` is refused for a window a script did not open, on some
+    // builds and some launch modes. Say plainly that it can be closed, rather
+    // than leaving a stale frame that looks like a stuck job.
+    setTimeout(() => { note.textContent = `${message} — this window can be closed`; }, 1500);
   }
 
   async function pump() {
@@ -311,10 +338,9 @@
         });
 
         // 204 is the channel closing: the job has finished or the worker has
-        // detached the display. Say so rather than leaving a frozen frame.
+        // detached the display.
         if (response.status === 204) {
-          note.textContent = 'the run has finished';
-          note.hidden = false;
+          finish('the run has finished');
           return;
         }
         if (!response.ok) throw new Error(`/next answered ${response.status}`);
@@ -323,10 +349,15 @@
         await show(packet);
         acknowledged = packet.frame_number;
       } catch (error) {
-        // The server going away is the ordinary end of a job, not a fault
-        // worth a dialog. Stop quietly and leave the last frame up.
-        note.textContent = `display stopped: ${error.message}`;
-        note.hidden = false;
+        // The server going away is the ordinary end of a job once this window
+        // has drawn something: `close()` shuts the channel and the server
+        // together, so whether a window sees a clean 204 or a failed fetch is a
+        // race. Both mean the same thing and both must close the window --
+        // treating only the 204 as the end left the loser of that race on
+        // screen forever, showing a dead frame and an error.
+        finish(drawnAnything
+          ? 'the run has finished'
+          : `display stopped: ${error.message}`);
         return;
       }
     }

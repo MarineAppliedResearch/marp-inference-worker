@@ -644,6 +644,23 @@ class JobRunner:
         params["slot_index"] = slot_index
         params["_job_id"] = envelope.job_id
 
+        # An engine that performs no inference needs no weights, and asking for
+        # them anyway is not a harmless extra step: it is the difference between
+        # a bare machine being able to prove the round trip and not. The engine
+        # declares this rather than the runner guessing from its name, and the
+        # default is True so an engine that says nothing keeps today's behaviour.
+        try:
+            engine_wants_model = bool(
+                engine_registry.get_job_engine(envelope.spec.engine).describe().get("requires_model", True)
+            )
+        except Exception:
+            # An unknown engine is the engine's own problem and surfaces in
+            # preflight with a better message than anything this could raise.
+            engine_wants_model = True
+
+        if not engine_wants_model:
+            return params
+
         # Fetch the model and verify it. A job spec's model always carries a
         # sha256, so this always verifies -- unlike the frame routes, where the
         # hash is optional.

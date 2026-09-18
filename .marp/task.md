@@ -61,27 +61,33 @@ action that silently loses work.
       event in a volunteer pool, not a decision to abandon the range. This is
       what makes `completed_through_frame` earn its place: something later reads
       it to resume from.
-- [ ] **A4 · database/schema · blocking** — does a yield consume an attempt?
-      `selectClaimableJobRow` filters on `attempts_made < max_attempts`, so if a
-      yield increments `attempts_made` like a failure, a job stopped by a few
-      volunteers in turn stops being claimable while most of its range is
-      unrun — the pool would quietly stop finishing exactly the jobs that get
-      passed around most. A yield is not a failure and probably should not
-      count, but that is a coordinator decision. `MARP_API`'s change, my
-      requirement.
-- [ ] **A5 · API contract · blocking** — per-job ingest idempotency versus
-      ingesting a job in segments. `POST /jobs/:id/ingest` documents itself as
-      "idempotent per job: a job whose observations are already present reports
-      `already_ingested` and writes nothing", and `published_attempt_id` on
-      `gpu_jobs` holds exactly one attempt. Under (b) one job is finished by
-      several attempts and must ingest more than once — which is goal 4. So the
-      idempotency key has to move from the job to the attempt or the frame
-      range, or the second volunteer's work is refused as already ingested.
-      Raised now because it changes the same migration.
+- [x] **A4 · database/schema · blocking** — answered 2026-09-17, decided here on
+      Isaac's instruction to choose: **a yield does not consume an attempt.**
+      `max_attempts` guards against a job that keeps failing, and a volunteer
+      pressing stop is not a failure. Were it to increment `attempts_made`, the
+      jobs passed between the most volunteers would be the first to become
+      unclaimable, which is the opposite of what a pool is for.
+- [x] **A5 · API contract · blocking** — answered 2026-09-17, same instruction:
+      **ingest idempotency keys on the attempt, not the job.** `ingested_at` on
+      `gpu_job_attempts`, guarded on that. `observations.gpu_job_id` is left
+      alone — the job is the unit of scientific work, so provenance stays at the
+      job and only the guard moves. `gpu_jobs.published_attempt_id` must also
+      stop being one-shot: its `publishedAttemptId === null` check would let only
+      the first segment of a requeued job publish.
+- [ ] **A6 · environment · blocking** — this worker cannot enrol with a
+      hand-minted application token, so bring-up needs an activation code from
+      the coordinator. Requested from the desktop session; not a design question,
+      just a credential I do not have yet.
 
 
 ## Decisions
 
+- **2026-09-17** — A hand-minted application token cannot enrol a worker, by
+  design. `authorizeEnrol` requires the token to be already bound to a
+  `gpu_workers` row whose `local_id` matches, and a new token is bound to
+  nothing, so it is 403 before `local_id` is compared. Activation (MARP_API#190)
+  is the only enrolment path. `.marp/handoff.md`'s bring-up instructions predate
+  it and are stale.
 - **2026-09-17** — A stopped job is requeued with its remaining range rather than
   cancelled. Isaac's call, answering A3. Consequence: one job is now finished by
   several attempts in sequence, which is what raises A4 and A5 — neither was
@@ -136,8 +142,10 @@ G3. Not written.
 
 - **Gate:** design
 - **Notes:** Issue #20 filed. Branch cut from `develop` at 56cdcff. Nothing
-  implemented. A1, A2 and A3 are answered; A4 and A5 are open and blocking, and both were
-  raised by A3's answer. Token held in `.marp/local/coordinator.md`, verified
+  implemented. A1, A2 and A3 are answered; A4 and A5 answered. A6 open — waiting on an
+  activation code from the desktop; the token it minted returns 403 on enrol.
+  Worker started once against the live coordinator and was stopped again; it
+  left nothing listening. Token held in `.marp/local/coordinator.md`, verified
   against the live pool: `GET /api/v2/gpu/workers` answers 200 and shows the
   desktop's worker. Local venv proven — torch 2.11.0+cu128, CUDA on the RTX
   5060. The desktop's

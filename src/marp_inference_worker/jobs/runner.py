@@ -740,11 +740,22 @@ class JobRunner:
             # Send progress up and read the instruction that comes back. The
             # event batch rides along with it, so logging is not per-line HTTP.
             try:
+                events = job.take_events()
+
+                # A child's warning has to reach the operator, not only MARP.
+                #
+                # Everything a job says travels to the coordinator's event
+                # stream and stopped there, which a volunteer cannot read. The
+                # watch window is what proved how bad that is: it failed to
+                # start on every machine for the life of the feature, said so
+                # in a warning, and every local surface reported healthy.
+                self._surface_warnings(events)
+
                 self._client.post_events(
                     attempt_id=job.attempt_id,
                     worker_id=job.worker_id,
                     lease_epoch=job.lease_epoch,
-                    events=job.take_events(),
+                    events=events,
                 )
                 response = self._client.heartbeat(
                     attempt_id=job.attempt_id,
@@ -795,6 +806,28 @@ class JobRunner:
         # is most of what R15's report is for.
         if self._jobs_by_slot:
             self._write_inflight()
+
+    # _surface_warnings()
+    # Puts a child's warnings where the operator can see them.
+    # Inputs: the events taken from one job this pass.
+    # Output: none.
+    # Use this before the batch is posted upstream. A warning is not a fault --
+    # the job carries on -- so it lands in the notice rather than the error.
+    def _surface_warnings(self, events: list[dict[str, Any]]) -> None:
+
+        for event in events:
+            if event.get("kind") != "log":
+                continue
+
+            # The child's `log` events carry their level in the payload the
+            # context wrote; anything below a warning is ordinary chatter and
+            # would drown the one line worth reading.
+            if str(event.get("level", "info")).lower() not in ("warning", "error"):
+                continue
+
+            message = str(event.get("message") or "").strip()
+            if message:
+                self._state.note(message)
 
     # _finish_job()
     # Reports one finished job's outcome and frees its slot.

@@ -1706,3 +1706,38 @@ def test_a_coordinator_cancel_is_a_notice_not_an_error(tmp_path: Path) -> None:
 
     job.kill(grace_s=1)
     runner._service_running_jobs()
+
+
+# test_a_childs_warning_reaches_the_operator_not_only_the_coordinator(tmp_path)
+# Verifies a warning from inside a job is visible locally.
+# Inputs: pytest temporary directory.
+# Output: pytest pass/fail result.
+#
+# The watch window is why this exists. It failed to start on every machine for
+# the whole life of the feature, said so in exactly this kind of warning, and
+# the warning went only to the coordinator's event stream -- which a volunteer
+# cannot read. `/status` said healthy, the job succeeded, and the feature had
+# never once run. A warning nobody can see is the same as no warning.
+def test_a_childs_warning_reaches_the_operator_not_only_the_coordinator(tmp_path: Path) -> None:
+
+    coordinator = FakeCoordinator()
+    runner, state = _runner(coordinator, tmp_path)
+
+    runner._surface_warnings([
+        {"seq": 1, "kind": "log", "level": "info", "message": "opened video 1920x1080"},
+        {"seq": 2, "kind": "log", "level": "warning", "message": "Chromium is missing at C:/x"},
+    ])
+
+    described = state.describe()
+    assert described["last_notice"] == "Chromium is missing at C:/x"
+
+    # A warning is not a fault -- the job carries on headless -- so it must not
+    # land in the error field, where it would be indistinguishable from one.
+    assert described["last_error"] is None
+
+    # Ordinary chatter must not overwrite it, or the one line worth reading is
+    # gone by the time anybody looks.
+    runner._surface_warnings([
+        {"seq": 3, "kind": "log", "level": "info", "message": "frame 400"},
+    ])
+    assert state.describe()["last_notice"] == "Chromium is missing at C:/x"

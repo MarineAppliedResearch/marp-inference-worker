@@ -55,20 +55,37 @@ action that silently loses work.
       restart after the sweeper is told to let go and the work is still lost.
       Recovering beyond the lease is a second change, on the `MARP_API` side,
       and deliberately not in scope here.
-- [ ] **A3 · behavioural / database · blocking** — when a volunteer stops a job
-      halfway, what happens to the **job**, as distinct from the attempt?
-      **(a)** the job is cancelled, as today — terminal, nobody finishes the
-      range; or **(b)** the job returns to `queued` with the remaining range, and
-      another volunteer carries on from `completed_through_frame`.
-      Raised because `publishResult`'s `else` branch currently writes
-      `state='cancelled'` on both attempt and job, so a `yielded` outcome with
-      no branch of its own silently becomes a cancel. (b) is what
-      `completed_through_frame` is for and is the same machinery goals 1 and 4
-      will want, but it is a different migration and different ingest semantics.
-      `MARP_API`'s change, my requirement.
+- [x] **A3 · behavioural / database · blocking** — answered 2026-09-17: **(b)**.
+      A stopped job returns to `queued` with the remaining range, and another
+      volunteer carries on from `completed_through_frame`. A stop is a normal
+      event in a volunteer pool, not a decision to abandon the range. This is
+      what makes `completed_through_frame` earn its place: something later reads
+      it to resume from.
+- [ ] **A4 · database/schema · blocking** — does a yield consume an attempt?
+      `selectClaimableJobRow` filters on `attempts_made < max_attempts`, so if a
+      yield increments `attempts_made` like a failure, a job stopped by a few
+      volunteers in turn stops being claimable while most of its range is
+      unrun — the pool would quietly stop finishing exactly the jobs that get
+      passed around most. A yield is not a failure and probably should not
+      count, but that is a coordinator decision. `MARP_API`'s change, my
+      requirement.
+- [ ] **A5 · API contract · blocking** — per-job ingest idempotency versus
+      ingesting a job in segments. `POST /jobs/:id/ingest` documents itself as
+      "idempotent per job: a job whose observations are already present reports
+      `already_ingested` and writes nothing", and `published_attempt_id` on
+      `gpu_jobs` holds exactly one attempt. Under (b) one job is finished by
+      several attempts and must ingest more than once — which is goal 4. So the
+      idempotency key has to move from the job to the attempt or the frame
+      range, or the second volunteer's work is refused as already ingested.
+      Raised now because it changes the same migration.
+
 
 ## Decisions
 
+- **2026-09-17** — A stopped job is requeued with its remaining range rather than
+  cancelled. Isaac's call, answering A3. Consequence: one job is now finished by
+  several attempts in sequence, which is what raises A4 and A5 — neither was
+  visible while a job had exactly one publishing attempt.
 - **2026-09-17** — Adding `yielded` to `RESULT_OUTCOMES` alone is not enough and
   is worse than doing nothing: `gpu_job_attempts` has no `outcome` column, so the
   outcome is the attempt state. `ATTEMPT_STATES` and the
@@ -98,7 +115,7 @@ A1 is settled, A2 is not. Ordered, and the first two are the whole of R1/R2 here
    together or the worker is broken against a coordinator that has not shipped.
 2. Send `completed_through_frame` as it already computes it, and assert it.
 3. R3: keep the in-flight record when the result call is refused, so the attempt
-   is reported at restart instead of expiring. Blocked on A2.
+   is reported at restart instead of expiring. A2 answered — safe to build.
 4. R4: surface a refused stop to the operator.
 
 ## Acceptance criteria
@@ -119,7 +136,11 @@ G3. Not written.
 
 - **Gate:** design
 - **Notes:** Issue #20 filed. Branch cut from `develop` at 56cdcff. Nothing
-  implemented. A1 and A2 are answered; A3 is open and blocking. The desktop's
+  implemented. A1, A2 and A3 are answered; A4 and A5 are open and blocking, and both were
+  raised by A3's answer. Token held in `.marp/local/coordinator.md`, verified
+  against the live pool: `GET /api/v2/gpu/workers` answers 200 and shows the
+  desktop's worker. Local venv proven — torch 2.11.0+cu128, CUDA on the RTX
+  5060. The desktop's
   API is reachable from this network at the address Isaac gave — 200 on root,
   401 on the GPU family, so the forward and the auth gate are both proven. The
   family is mounted under `/api/v2/gpu`, not the `/api/gpu` its `path:` fields

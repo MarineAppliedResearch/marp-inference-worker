@@ -42,13 +42,30 @@ concluded the files did not exist.
 ```
 marp db up                                    # from the umbrella
 cd MARP_API && npm run dev                    # port 3000, branch checked out
-# worker token, if a new one is needed:
-node scripts/create-application-token.js --app "MARP GPU worker (dev)" \
-  --permissions workers:enrol,jobs:execute,jobs:read,jobs:write
+# an activation code, from a signed-in user (not a service token):
+#   POST /api/v2/gpu/worker-activation-codes
 cd ../marp-inference-worker
-MARP_WORKER_TOKEN=<svc_…> MARP_COORDINATOR_URL=http://localhost:3000 \
-  ./.venv312/Scripts/python.exe -m marp_inference_worker.worker_main
+MARP_COORDINATOR_URL=http://localhost:3000   ./.venv312/Scripts/python.exe -m marp_inference_worker.worker_main   --activate-code-file <file holding the code>
+MARP_COORDINATOR_URL=http://localhost:3000   ./.venv312/Scripts/python.exe -m marp_inference_worker.worker_main
 ```
+
+**Activation, not a hand-minted token, and this is not a preference.** An
+application token from `create-application-token.js` **cannot enrol a worker**
+and has not been able to since `MARP_API#190`: `authorizeEnrol` requires the
+credential to be bound already to a `gpu_workers` row whose `local_id` matches,
+and a new token is bound to nothing, so it is `403 This credential belongs to a
+different worker identity` before `local_id` is ever compared. That message is
+misleading for the commonest case -- a credential bound to nothing at all --
+and reads as though somebody else's credential had been used.
+
+Reading still works with such a token, which is the trap: `GET /workers`
+answers 200, so the token tests fine and then fails at the one call that
+matters.
+
+Activation exchanges the code for a per-machine credential, DPAPI-protected at
+`<state dir>/worker-credential.dpapi`. After it, **no token goes in the
+environment at all** -- the worker loads its own. The token script is still
+right for a service consumer that only reads.
 
 The worker's own loopback API is on `127.0.0.1:8010`. Confirm enrolment with
 `GET /api/v2/gpu/workers` using the token.
@@ -58,6 +75,23 @@ The worker's own loopback API is on `127.0.0.1:8010`. Confirm enrolment with
 Enrolment, end to end, against the real coordinator: the pool shows
 `SoftwareEngineering-<id>` online, one slot, the real GPU with VRAM and
 capability, and both engines (`marp_tracking`, `mock`).
+
+**The job round trip, across two machines on two networks -- 17 Sep 2026.** It
+had never run at all before that day; item 1 below was open for a week. Two
+workers enrolled against one coordinator over a public address, and a
+`marp_tracking` job ran on a laptop holding no model: MARP streamed the weights
+from `GET /api/v2/model/:id/artifact`, the `sha256` in the spec verified them on
+arrival, ultralytics and ByteTrack ran on the second machine's GPU, and a
+content-addressed artifact came back whose hash matched what MARP recorded.
+Stop and resume too: a stopped run reports `yielded` with the frame it reached,
+the job returns to the queue, and the next lease begins at exactly that frame.
+
+What the second machine found, and one machine could not: every model in a job
+spec was named by an absolute Windows path, because the registered artifact had
+no bytes behind it; the mock engine could not run without weights it has no use
+for; `yielded` was a word the coordinator refused; and the watch window had
+never opened on any machine, because its page existed in neither repository.
+All four were invisible with one computer.
 
 ## What is NOT proven — start here
 

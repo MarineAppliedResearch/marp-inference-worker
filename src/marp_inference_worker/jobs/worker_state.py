@@ -70,14 +70,14 @@ class WorkerState:
         # The jobs currently running, as the runner described them.
         self._jobs: list[dict[str, Any]] = []
 
-        # Detections from jobs that have already finished.
+        # Tracks from jobs that have already finished.
         #
         # Held separately because a running job's count lives on that job and
         # goes away with it. Adding the two is what makes the total a figure for
         # this worker since it started, rather than for whatever it happens to
         # be running now -- which would fall back to nothing every time a piece
         # rolled over.
-        self._detections_finished = 0
+        self._tracks_finished = 0
 
         # How many job slots this host has. The ceiling, not the working
         # number: it is what the machine could grow to if every job stayed
@@ -154,26 +154,26 @@ class WorkerState:
         with self._lock:
             self._jobs = jobs
 
-    # retire_job_detections()
-    # Banks a finished job's detections into the running total.
+    # retire_job_tracks()
+    # Banks a finished job's track count into the running total.
     # Inputs: the count that job reached.
     # Output: none.
     # Use this as a job ends, before its row leaves `set_jobs`.
-    def retire_job_detections(self, count: int) -> None:
+    def retire_job_tracks(self, count: int) -> None:
 
         with self._lock:
-            self._detections_finished += max(0, int(count or 0))
+            self._tracks_finished += max(0, int(count or 0))
 
-    # detections_total()
-    # Every detection this worker has drawn since it started.
+    # tracks_total()
+    # Every distinct animal this worker has tracked since it started.
     # Inputs: none.
     # Output: finished jobs plus whatever the running ones have reached.
-    def detections_total(self) -> int:
+    def tracks_total(self) -> int:
 
         with self._lock:
-            running = sum(int((job.get("progress") or {}).get("detections") or 0)
+            running = sum(int((job.get("progress") or {}).get("tracks") or 0)
                           for job in self._jobs)
-            return self._detections_finished + running
+            return self._tracks_finished + running
 
     # set_paused()
     # Sets whether this worker takes new work.
@@ -278,9 +278,9 @@ class WorkerState:
                 # computed from `permitted`, because reporting `total - busy`
                 # advertised three free slots on a machine that had worked out
                 # it had none -- two true numbers, only one of them useful.
-                "detections_total": (
-                    self._detections_finished
-                    + sum(int((job.get("progress") or {}).get("detections") or 0)
+                "tracks_total": (
+                    self._tracks_finished
+                    + sum(int((job.get("progress") or {}).get("tracks") or 0)
                           for job in self._jobs)
                 ),
                 "slots": {

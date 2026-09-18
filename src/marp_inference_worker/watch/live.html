@@ -360,10 +360,13 @@
   const RATE_WINDOW_MS = 10000;
   const rateHistory = [];
 
-  // How many detections this frame has, and how many this machine has drawn
-  // since the worker started -- every slot, every job, added up. The first
-  // comes from the frame packet and the second from `/status`, so they arrive
-  // on different clocks and the line is rendered from whichever last changed.
+  // How many tracks are on this frame, and how many distinct animals this
+  // machine has tracked since the worker started -- every slot, every job.
+  //
+  // The total counts each animal once, however many frames it was visible for,
+  // which is why it comes from the worker rather than from adding up what this
+  // window has drawn: a track lives across frames and only the engine holding
+  // the tracker knows it is the same animal.
   let onScreen = 0;
   let machineTotal = null;
 
@@ -372,10 +375,10 @@
   const grouped = (value) => value.toLocaleString('en-US');
 
   function renderDetections() {
-    const noun = onScreen === 1 ? 'detection' : 'detections';
+    const noun = machineTotal === 1 && onScreen === 1 ? 'track' : 'tracks';
     document.getElementById('count').textContent =
       machineTotal === null
-        ? `${onScreen} ${noun}`
+        ? `${onScreen} ${onScreen === 1 ? 'track' : 'tracks'}`
         : `${grouped(onScreen)} of ${grouped(machineTotal)} ${noun}`;
   }
 
@@ -484,8 +487,8 @@
           ? jobs[0]
           : jobs.find((job) => String(job.attempt_id) === String(attemptId)) || null;
 
-        if (typeof status.detections_total === 'number') {
-          machineTotal = status.detections_total;
+        if (typeof status.tracks_total === 'number') {
+          machineTotal = status.tracks_total;
           renderDetections();
         }
 

@@ -205,3 +205,35 @@ def test_watch_page_origin_can_call_loopback_controls() -> None:
     )
     assert response.status_code == 200
     assert response.headers["access-control-allow-origin"] == "http://127.0.0.1:54321"
+
+
+# test_detections_total_survives_a_job_ending()
+# Verifies the machine-wide detection count is not reset by a job rolling over.
+# Inputs: none.
+# Output: pytest pass/fail result.
+#
+# The window shows "N of TOTAL detections", where TOTAL is every detection this
+# worker has drawn since it started. A running job carries its own count, so a
+# total read only from running jobs would fall back to nothing every time a
+# piece finished — and a counter that goes backwards is worse than no counter.
+def test_detections_total_survives_a_job_ending() -> None:
+    from marp_inference_worker.jobs.worker_state import WorkerState
+
+    state = WorkerState()
+    assert state.describe()["detections_total"] == 0
+
+    state.set_jobs([
+        {"progress": {"detections": 40}},
+        {"progress": {"detections": 12}},
+    ])
+    assert state.describe()["detections_total"] == 52
+
+    # The first job ends: its count is banked, its row goes, and the total holds.
+    state.retire_job_detections(40)
+    state.set_jobs([{"progress": {"detections": 12}}])
+    assert state.describe()["detections_total"] == 52
+
+    # And a new job adds to it rather than replacing it.
+    state.retire_job_detections(12)
+    state.set_jobs([{"progress": {"detections": 3}}])
+    assert state.describe()["detections_total"] == 55

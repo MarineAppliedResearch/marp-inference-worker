@@ -258,9 +258,8 @@
     // top cost the space the frame rates now use.
     document.getElementById('job').textContent = packet.job_id ? `job ${packet.job_id}` : '';
     document.getElementById('frame').textContent = packet.frame_number;
-    const n = (packet.tracks || []).length;
-    document.getElementById('count').textContent =
-      n === 1 ? '1 detection' : `${n} detections`;
+    onScreen = (packet.tracks || []).length;
+    renderDetections();
 
     const { range_start: from, range_end: to } = packet;
     if (typeof from === 'number' && typeof to === 'number' && to > from) {
@@ -360,6 +359,25 @@
   // jumps is a number nobody can read.
   const RATE_WINDOW_MS = 10000;
   const rateHistory = [];
+
+  // How many detections this frame has, and how many this machine has drawn
+  // since the worker started -- every slot, every job, added up. The first
+  // comes from the frame packet and the second from `/status`, so they arrive
+  // on different clocks and the line is rendered from whichever last changed.
+  let onScreen = 0;
+  let machineTotal = null;
+
+  // Grouped, because the total runs to millions within an hour and an
+  // unseparated row of digits is not a number anybody can read at a glance.
+  const grouped = (value) => value.toLocaleString('en-US');
+
+  function renderDetections() {
+    const noun = onScreen === 1 ? 'detection' : 'detections';
+    document.getElementById('count').textContent =
+      machineTotal === null
+        ? `${onScreen} ${noun}`
+        : `${grouped(onScreen)} of ${grouped(machineTotal)} ${noun}`;
+  }
 
   // Inputs: the `/status` jobs array. Output: {mine, all} in frames per second,
   // either null until there is enough history to divide by.
@@ -465,6 +483,11 @@
         const mine = attemptId === null
           ? jobs[0]
           : jobs.find((job) => String(job.attempt_id) === String(attemptId)) || null;
+
+        if (typeof status.detections_total === 'number') {
+          machineTotal = status.detections_total;
+          renderDetections();
+        }
 
         const rates = frameRates(jobs);
         setText('fps', rates.mine === null ? null : rates.mine.toFixed(1));

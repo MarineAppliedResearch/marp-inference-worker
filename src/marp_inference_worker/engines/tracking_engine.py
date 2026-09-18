@@ -241,6 +241,11 @@ class TrackingEngine(BaseEngine):
         observations_written = 0
         detections_seen = 0
         stopped_early = False
+
+        # Every tracked animal on every frame, added up for this job. The same
+        # organism on a hundred frames counts a hundred times: this is how much
+        # the model has looked at, not how many animals there were.
+        detections_seen = 0
         live_track_metadata: dict[int, dict[str, Any]] = {}
 
         try:
@@ -289,6 +294,8 @@ class TrackingEngine(BaseEngine):
                         live_track_metadata=live_track_metadata,
                     )
 
+                    detections_seen += len(live_tracks)
+
                     if watch is not None and not watch.present(
                         frame,
                         frame.index,
@@ -315,7 +322,8 @@ class TrackingEngine(BaseEngine):
 
                     # Report progress and check for a stop on the same cadence.
                     if frames_processed % _PROGRESS_EVERY_FRAMES == 0:
-                        ctx.report_progress(frames_processed, expected_frames, "frames")
+                        ctx.report_progress(frames_processed, expected_frames, "frames",
+                                            detections=detections_seen)
                         ctx.report_metrics(
                             step=frame.index,
                             phase="inference",

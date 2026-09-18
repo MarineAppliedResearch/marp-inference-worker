@@ -170,6 +170,7 @@ class ChildJobContext:
         total: int | None,
         unit: str,
         phase: str | None = None,
+        detections: int | None = None,
     ) -> None:
 
         # Preserve the current phase when callers report only a new counter.
@@ -188,9 +189,16 @@ class ChildJobContext:
             self._progress_phase = phase
 
         # The parent keeps only the latest of these and sends it on heartbeat.
+        # `detections` is this job's running total, not this frame's count: the
+        # parent keeps only the latest progress event, so a per-frame number
+        # would be whatever the last event happened to carry and could not be
+        # added up.
         self._emit(
             "progress",
-            {"done": done, "total": total, "unit": unit, "phase": next_phase},
+            {
+                "done": done, "total": total, "unit": unit, "phase": next_phase,
+                "detections": detections,
+            },
         )
 
     # report_metrics()

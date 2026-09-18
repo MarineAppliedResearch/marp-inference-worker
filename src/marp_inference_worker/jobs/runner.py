@@ -1189,6 +1189,12 @@ class JobRunner:
                 "completed_through_frame": completed_through_frame,
             })
 
+        # Bank this job's detections before its row goes: the running total is
+        # finished jobs plus live ones, and a job that vanished without being
+        # banked would take its share of the count with it.
+        self._state.retire_job_detections(
+            (job.current_progress() or {}).get("detections") or 0)
+
         # Free the slot and rewrite the in-flight record.
         self._jobs_by_slot.pop(slot_index, None)
         self._write_inflight()

@@ -105,6 +105,65 @@ def _legacy_function_source(name: str) -> str:
     return _normalized_source(ast.unparse(definitions[-1]))
 
 
+# A change the port makes on purpose, and the reason it was made.
+#
+# The byte-identity check below is the only thing standing between this port
+# and silent drift from the reference, so it must not simply be relaxed when
+# somebody improves the port. Instead each deliberate change is written down
+# here, applied to the legacy side, and the comparison stays exact -- so an
+# *un*declared change still fails, loudly, with a diff.
+#
+# **This exists because the test went red and stayed red.** `confidence` was
+# added to the reduction on 2026-09-13 under #9, with its own spec, its own
+# verification and eighty lines of new tests -- and nobody updated this one.
+# It failed on `develop` for five days and was dismissed as noise by two agents
+# in one evening, because a test that cannot tell an improvement from a
+# regression teaches people to ignore it.
+class _Divergence:
+
+    # name: what changed. why: the issue and the reason. old/new: the exact
+    # source fragment, so applying it is a substitution rather than a rewrite.
+    def __init__(self, name: str, why: str, old: str, new: str) -> None:
+        self.name = name
+        self.why = why
+        self._old = old
+        self._new = new
+
+    # apply()
+    # Rewrites the legacy source so it carries this intended change.
+    # Inputs: the normalized legacy source.
+    # Output: the same source with the change applied.
+    # Raises when the fragment is absent, because a divergence that no longer
+    # applies is a stale entry and should be removed rather than ignored.
+    def apply(self, source: str) -> str:
+
+        if self._old not in source:
+            raise AssertionError(
+                f"the declared divergence {self.name!r} no longer applies to the legacy "
+                f"source -- remove it from _INTENDED_DIVERGENCES rather than leaving it"
+            )
+
+        return source.replace(self._old, self._new)
+
+
+# Every change the port makes to the line-814 reduction on purpose.
+#
+# Add to this only with an issue number and a reason. An entry here is a claim
+# that somebody decided the port should differ; anything not listed is drift.
+_INTENDED_DIVERGENCES = [
+    _Divergence(
+        name="keyframe confidence",
+        why=(
+            "#9 -- each selected frame keeps its raw detection score. Directional "
+            "padding changes presentation geometry, not the model's confidence, so "
+            "the score belongs on the reduced keyframe. The legacy script dropped it."
+        ),
+        old="'framenum': kf['frame'], 'x': x",
+        new="'framenum': kf['frame'], 'confidence': kf.get('confidence'), 'x': x",
+    ),
+]
+
+
 # test_ported_reduction_is_the_line_814_definition()
 # Verifies the ported reduction is source-identical to the legacy live one.
 # Inputs: none.
@@ -124,7 +183,16 @@ def test_ported_reduction_is_the_line_814_definition() -> None:
     ported = _normalized_source(inspect.getsource(keyframes.reduce_to_keyframes_v3_dirpad))
     legacy = _legacy_function_source("reduce_to_keyframes_v3_dirpad")
 
-    assert ported == legacy
+    # The port is the legacy maths plus whatever is listed in
+    # `_INTENDED_DIVERGENCES`, and nothing else. Applying them to the legacy
+    # side rather than stripping them from the ported side is deliberate: an
+    # unlisted change still fails, which is the whole value of the test.
+    expected = legacy
+
+    for divergence in _INTENDED_DIVERGENCES:
+        expected = divergence.apply(expected)
+
+    assert ported == expected
 
 
 # test_ported_directional_pad_is_the_line_930_definition()

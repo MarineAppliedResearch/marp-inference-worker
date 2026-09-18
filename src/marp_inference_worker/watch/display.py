@@ -299,12 +299,20 @@ def _bring_to_front(process_id: int, attempts: int = 40) -> None:
     # EnumWindows rather than a title match: the page title is ours to change
     # and matching on it would break the moment somebody edited live.html.
     @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    # **Every visible window the process owns, not the first one found.**
+    # Stopping at the first cost an evening: Chromium owns several top-level
+    # windows and the first one enumerated is not reliably the app window, so
+    # the raise landed on something invisible and the real window stayed behind
+    # whatever the volunteer was doing -- with `SetWindowPos` returning success
+    # the whole time. Applying it to all of them is harmless for the others and
+    # certain for the one that matters.
     def visit(handle, _param):
         owner = wintypes.DWORD()
         user32.GetWindowThreadProcessId(handle, ctypes.byref(owner))
+
         if owner.value == process_id and user32.IsWindowVisible(handle):
             found.append(handle)
-            return False
+
         return True
 
     # The window does not exist the instant Popen returns, so wait for it
@@ -322,49 +330,62 @@ def _bring_to_front(process_id: int, attempts: int = 40) -> None:
     if not found:
         return
 
-    handle = found[0]
+    # Constants, named once rather than repeated as magic numbers.
+    HWND_TOPMOST = -1
+    HWND_NOTOPMOST = -2
+    SW_SHOWNORMAL = 1
+    SWP_NOMOVE = 0x0002
+    SWP_NOSIZE = 0x0001
+    SWP_NOACTIVATE = 0x0010
+    FLAGS = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE
+
+    # Let Chromium finish building its real window before raising anything.
+    #
+    # The enumeration above returns as soon as the process owns *a* visible
+    # window, which is not reliably the app window -- it owns several and the
+    # first one is often not the one with the video in it. A short settle, then
+    # one more look, costs half a second at the start of a job and is the
+    # difference between raising the window and raising something invisible.
+    time.sleep(0.6)
 
     try:
-        # Shown, not maximised.
-        #
-        # This was SW_MAXIMIZE, from before the windows were tiled, and the two
-        # cannot both win: maximising fills whichever monitor the window landed
-        # on and throws away the size it was given, so four tiles meant to sit
-        # in a 2x2 grid all ended up stacked full-screen on one monitor with
-        # only the last one visible. The geometry is already the whole monitor
-        # when there is a screen per slot, which is what maximising was for.
-        user32.ShowWindow(handle, 1)          # SW_SHOWNORMAL
+        found.clear()
+        user32.EnumWindows(visit, 0)
+    except Exception:
+        return
 
-        # **`SetForegroundWindow` alone does not work from here, and silently.**
-        #
-        # Windows refuses it from a process that does not already own the
-        # foreground -- which a background worker never does -- and the refusal
-        # is a `False` return nobody was reading. The windows were tiled
-        # correctly and sat behind whatever the volunteer had open, which is
-        # the same as not opening them.
-        #
-        # Two mechanisms together, because either alone leaves a case:
-        #
-        #  1. Z-order. `HWND_TOPMOST` then `HWND_NOTOPMOST` lifts the window
-        #     above every ordinary window without leaving it permanently on
-        #     top -- a screen saver that could never be covered would be worse
-        #     than one that is hard to find.
-        #  2. Focus. Attaching this thread's input queue to the foreground
-        #     window's thread makes Windows treat the call as coming from the
-        #     active application, which is what lifts the restriction. Detached
-        #     again immediately; leaving them attached couples the two threads'
-        #     input state for the life of the process.
-        HWND_TOPMOST = -1
-        HWND_NOTOPMOST = -2
-        SWP_NOMOVE = 0x0002
-        SWP_NOSIZE = 0x0001
-        SWP_NOACTIVATE = 0x0010
-        flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE
+    if not found:
+        return
 
-        user32.SetWindowPos(handle, HWND_TOPMOST, 0, 0, 0, 0, flags)
-        user32.SetWindowPos(handle, HWND_NOTOPMOST, 0, 0, 0, 0, flags)
-        user32.BringWindowToTop(handle)
+    # **Once, when the window opens. Never again.**
+    #
+    # A watched job should come to the front when it starts, so the volunteer
+    # sees it appear -- and then stay out of the way. An earlier version left
+    # the windows permanently topmost and re-asserted it in a loop, which is a
+    # screen saver that will not let you work: every few seconds it climbs back
+    # over whatever you are doing. One raise at open, then the window takes its
+    # chances in the Z-order like anything else.
+    #
+    # `HWND_TOPMOST` followed immediately by `HWND_NOTOPMOST` is what lifts it
+    # above every ordinary window without pinning it there.
+    for handle in list(found):
+        try:
+            user32.ShowWindow(handle, SW_SHOWNORMAL)
+            user32.SetWindowPos(handle, HWND_TOPMOST, 0, 0, 0, 0, FLAGS)
+            user32.SetWindowPos(handle, HWND_NOTOPMOST, 0, 0, 0, 0, FLAGS)
+            user32.BringWindowToTop(handle)
+        except Exception:
+            # Best effort. A window that will not raise is worth less than the
+            # job it is showing, so nothing here may raise.
+            pass
 
+    # Focus, last. `SetForegroundWindow` is refused from a process that does not
+    # already own the foreground -- which a background worker never does, and
+    # the refusal is a `False` return nobody reads. Attaching this thread's
+    # input queue to the foreground window's thread makes Windows treat the call
+    # as coming from the active application. Detached again immediately: left
+    # attached, the two threads share input state for the life of the process.
+    try:
         foreground = user32.GetForegroundWindow()
         our_thread = ctypes.windll.kernel32.GetCurrentThreadId()
         their_thread = user32.GetWindowThreadProcessId(foreground, None)
@@ -372,15 +393,12 @@ def _bring_to_front(process_id: int, attempts: int = 40) -> None:
         if their_thread and their_thread != our_thread:
             user32.AttachThreadInput(our_thread, their_thread, True)
             try:
-                user32.SetForegroundWindow(handle)
+                user32.SetForegroundWindow(found[0])
             finally:
                 user32.AttachThreadInput(our_thread, their_thread, False)
         else:
-            user32.SetForegroundWindow(handle)
-
+            user32.SetForegroundWindow(found[0])
     except Exception:
-        # Best effort throughout. A window that will not raise is worth less
-        # than the job it is showing, so nothing here may raise.
         pass
 
 

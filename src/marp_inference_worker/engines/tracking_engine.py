@@ -71,6 +71,14 @@ _CLASS_MATCH_IOU = 0.4
 # Runs MARP's detect -> track -> reduce pipeline over one frame range.
 # One instance per job, in the job's own child process, so its tracker and model
 # state belong to that job alone and need no locking or unload coordination.
+# How many frames to wait before reopening a watch display that died.
+#
+# About eight seconds of video at 25 fps: long enough that a browser failing to
+# start is not retried in a tight loop, short enough that a volunteer who closed
+# a window by accident gets it back rather than wondering where it went.
+_WATCH_RETRY_FRAMES = 200
+
+
 class TrackingEngine(BaseEngine):
 
     # __init__()
@@ -209,12 +217,17 @@ class TrackingEngine(BaseEngine):
         # A fresh tracker per range is what makes the boundary a seam (R10a).
         ctx.report_progress(0, expected_frames, "frames", phase="loading_model")
         yolo_model = self._detector.load_weights(model_path, device)
-        if wants_watch:
+        # Rebuilt rather than built once. A display that dies -- the volunteer
+        # closed the window, Chromium crashed, something killed it -- used to
+        # end the display for the rest of the job, which on an hour of video
+        # means the screen saver somebody asked for is simply gone and nothing
+        # says why. If a display was asked for, it is reopened.
+        def build_watch():
             from marp_inference_worker.watch import WatchDisplay
 
             model_names = yolo_model.names
             species_names = [str(model_names[key]) for key in sorted(model_names)]
-            watch = WatchDisplay(
+            display = WatchDisplay(
                 screen_mode=screen_mode,
                 workspace=ctx.checkpoint_dir.parent,
                 warn=lambda message: ctx.log(message, level="warning"),
@@ -228,8 +241,18 @@ class TrackingEngine(BaseEngine):
                 slot_index=int(params.get("slot_index") or 0),
                 slot_count=int(params.get("slot_count") or 1),
             )
-            if not watch.start():
-                watch = None
+            return display if display.start() else None
+
+        if wants_watch:
+            watch = build_watch()
+
+            # How many frames to wait before trying again after a display dies,
+            # and how many times. Not immediately: a browser that cannot start
+            # would be retried every frame, which is a spin rather than a
+            # recovery. Not forever either -- a machine with no usable browser
+            # says so a few times and then gets on with the work.
+            watch_retry_at = None
+            watch_retries_left = 5
         tracker, tracker_args = create_tracker(params)
         accumulator = TrackAccumulator(track_buffer=tracker_args.as_dict["track_buffer"])
 
@@ -310,6 +333,23 @@ class TrackingEngine(BaseEngine):
                     ):
                         watch.close()
                         watch = None
+
+                        # Try again shortly rather than giving up on the job.
+                        if watch_retries_left > 0:
+                            watch_retry_at = frame.index + _WATCH_RETRY_FRAMES
+
+                    # Reopen a display that died, if one was asked for.
+                    elif watch is None and wants_watch and watch_retry_at is not None                             and frame.index >= watch_retry_at:
+                        watch_retry_at = None
+                        watch_retries_left -= 1
+                        watch = build_watch()
+
+                        if watch is None and watch_retries_left > 0:
+                            watch_retry_at = frame.index + _WATCH_RETRY_FRAMES
+                        elif watch is None:
+                            ctx.log("could not reopen the watch window; "
+                                    "this job will finish without a display",
+                                    level="warning")
 
                     # Close and write out any track the tracker has lost.
                     for ended in accumulator.take_aged_out(frame.index):

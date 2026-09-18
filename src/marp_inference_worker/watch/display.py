@@ -324,12 +324,20 @@ def _bring_to_front(process_id: int, attempts: int = 40) -> None:
 
     handle = found[0]
     try:
-        user32.ShowWindow(handle, 3)          # SW_MAXIMIZE
+        # Shown, not maximised.
+        #
+        # This was SW_MAXIMIZE, from before the windows were tiled, and the two
+        # cannot both win: maximising fills whichever monitor the window landed
+        # on and throws away the size it was given, so four tiles meant to sit
+        # in a 2x2 grid all ended up stacked full-screen on one monitor with
+        # only the last one visible. The geometry is already the whole monitor
+        # when there is a screen per slot, which is what maximising was for.
+        user32.ShowWindow(handle, 1)          # SW_SHOWNORMAL
         user32.SetForegroundWindow(handle)
         user32.BringWindowToTop(handle)
     except Exception:
         # Windows refuses SetForegroundWindow from a process that does not own
-        # the foreground. The window is still maximised and still there.
+        # the foreground. The window is still placed and still there.
         pass
 
 

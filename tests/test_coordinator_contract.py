@@ -620,7 +620,11 @@ def test_the_outcome_is_one_the_coordinator_accepts(coordinator) -> None:
 
     body = recorder.for_path("/result")[0]["body"]
 
-    assert body["outcome"] in ("succeeded", "failed", "cancelled")
+    # Four now, not three. `yielded` was added on both sides together when an
+    # operator stop turned out to be reported with a word MARP refused; the
+    # list is spelled out here rather than imported so that widening it stays a
+    # deliberate edit on each side.
+    assert body["outcome"] in ("succeeded", "failed", "cancelled", "yielded")
     assert body["failure_reason"].startswith("Lost:")
 
 

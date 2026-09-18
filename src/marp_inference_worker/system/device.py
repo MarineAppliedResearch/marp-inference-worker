@@ -120,9 +120,9 @@ def resolve_device(requested: str | None, slot_index: int) -> str:
                 f"job requested device {request!r} but this worker has no usable CUDA device"
             )
 
-        # A bare "cuda" means the slot's device; "cuda:N" names one outright.
+        # A bare "cuda" means this slot's device; "cuda:N" names one outright.
         if request == "cuda":
-            return f"cuda:{slot_index}"
+            return f"cuda:{slot_index % device_count}"
 
         try:
             requested_index = int(request.split(":", 1)[1])
@@ -143,12 +143,17 @@ def resolve_device(requested: str | None, slot_index: int) -> str:
                 "job requested device 'auto' but this worker has no usable CUDA device; "
                 "set device to 'cpu' explicitly to run without a GPU"
             )
-        if slot_index >= device_count:
-            raise JobUnrunnable(
-                f"job was pinned to slot {slot_index} but this worker has "
-                f"{device_count} CUDA device(s)"
-            )
-        return f"cuda:{slot_index}"
+
+        # Slots share the cards, round robin.
+        #
+        # A slot used to *be* a device -- the worker ran one job per GPU, so
+        # `slot_index` and the device index were the same number and a slot past
+        # the last card was a contradiction worth refusing. A slot is now a unit
+        # of concurrency: one card can hold several jobs, measured at well under
+        # 1 GiB each on a 16 GiB card, and the GPU is not the constraint anyway.
+        # So the index wraps instead of refusing, and a two-card machine
+        # alternates between them.
+        return f"cuda:{slot_index % device_count}"
 
     # Anything else is a value this worker does not understand.
     raise JobUnrunnable(f"job requested an unsupported device: {requested!r}")

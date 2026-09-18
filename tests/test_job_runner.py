@@ -18,6 +18,9 @@
 # ByteTrack over real frames, GPU device selection, and a real Jellyfin stream.
 # Those need a GPU and are listed as uncovered in .marp/verification.md.
 
+# json reads back the in-flight record the runner writes.
+import json
+
 # time waits for the child, with a deadline rather than a fixed sleep.
 import time
 
@@ -27,7 +30,7 @@ from pathlib import Path
 # Any types the fake coordinator's payloads.
 from typing import Any
 
-from marp_inference_worker.jobs.coordinator_client import coordinator_event
+from marp_inference_worker.jobs.coordinator_client import CoordinatorError, coordinator_event
 from marp_inference_worker.jobs.runner import JobRunner
 from marp_inference_worker.jobs.worker_state import WorkerState
 
@@ -687,10 +690,17 @@ def test_paused_worker_reports_no_free_slots(tmp_path: Path) -> None:
     assert runner.free_slots() == 2
 
 
-def test_watch_display_requires_both_the_machine_policy_and_job_request(tmp_path: Path) -> None:
+def test_watch_display_is_decidable_by_either_side(tmp_path: Path) -> None:
+    # Both middle cases used to assert None, because the old gate needed the
+    # machine AND the job to agree. Either one is now enough: a volunteer in a
+    # display mode is running a screen saver and did not ask per job, and a job
+    # that asks is honoured on a machine that set no mode. Only the first case
+    # -- nobody asking -- draws nothing. Fullscreen stays the volunteer's own
+    # choice, so a job asking on an `off` machine gets a window, not the screen.
     cases = [
-        ("off", True, None),
-        ("fullscreen", False, None),
+        ("off", False, None),
+        ("off", True, "window"),
+        ("fullscreen", False, "fullscreen"),
         ("fullscreen", True, "fullscreen"),
     ]
 
@@ -1560,3 +1570,381 @@ def test_the_video_source_url_back_door_is_gone() -> None:
     for path, module_name in _job_path_module_paths():
         source = path.read_text(encoding="utf-8")
         assert "video_source_url" not in source, f"{module_name} still names video_source_url"
+
+
+# test_an_operator_stop_reports_yielded_with_the_frame_it_reached(tmp_path)
+# Verifies what the worker actually sends when a volunteer presses stop.
+# Inputs: pytest temporary directory.
+# Output: pytest pass/fail result.
+#
+# Nothing tested the stop path at all, which is how the worker came to report
+# an outcome the coordinator had never accepted: it answered 400, the attempt
+# was never published, and the frames the run had really done were lost. Both
+# suites were green throughout, each against its own idea of the vocabulary.
+#
+# Three things are asserted together because they are one contract:
+# the word, the frame, and the absence of a failure reason. MARP_API's matching
+# test proves it accepts exactly this.
+def test_an_operator_stop_reports_yielded_with_the_frame_it_reached(tmp_path: Path) -> None:
+
+    offer = _job_for(tmp_path, "attempt-yield", frames=400, frame_delay_s=0.05, start_frame=1000)
+    coordinator = FakeCoordinator(offers=[offer])
+    runner, state = _runner(coordinator, tmp_path)
+    runner.ensure_enrolled()
+
+    assert runner._poll_once() is True
+    job = runner._jobs_by_slot[0]
+
+    # Let it do some real work first. A stop at frame zero would pass even if
+    # the frame count were hard-coded, and the number is half the point.
+    assert _wait_until(runner, lambda: (job.progress or {}).get("done", 0) >= 5)
+
+    # The volunteer's own control, through the durable file the operator API
+    # writes -- not by calling request_yield() directly, so the whole path from
+    # "stop" to the report is what is under test.
+    state.set_operator_action("stop")
+    assert _wait_until(runner, lambda: bool(coordinator.results))
+
+    result = coordinator.results[0]
+
+    # The word. This is the one that was wrong.
+    assert result["outcome"] == "yielded"
+
+    # The frame. Exclusive, and therefore already the next start_frame under
+    # the half-open convention -- MARP resumes from exactly this number, so an
+    # off-by-one here silently skips or repeats a frame on every hand-over.
+    reached = result["completed_through_frame"]
+    assert reached is not None
+    assert 1000 < reached <= 1400
+
+    # A stop is not a failure and must not describe itself as one. The column
+    # carried "the worker reported yielded" on every ordinary stop.
+    assert result["failure_reason"] is None
+
+
+# test_a_refused_result_survives_to_be_reported_at_the_next_start(tmp_path)
+# Verifies a result the coordinator would not take is kept and re-sent.
+# Inputs: pytest temporary directory.
+# Output: pytest pass/fail result.
+#
+# The hole this closes: a refused result used to be swallowed into last_error,
+# the slot freed, and the in-flight record rewritten without the job -- so the
+# attempt was never retried, never reported at restart, and stayed leased until
+# the lease and then the 24h cap decided for it. That is exactly what happened
+# to every operator stop while `yielded` was refused, and the work was gone.
+def test_a_refused_result_survives_to_be_reported_at_the_next_start(tmp_path: Path) -> None:
+
+    class RefusingCoordinator(FakeCoordinator):
+        refuse = True
+
+        def report_result(self, *args, **kwargs):
+            if self.refuse:
+                raise CoordinatorError("400: outcome is not one this coordinator accepts")
+            return super().report_result(*args, **kwargs)
+
+    offer = _job_for(tmp_path, "attempt-refused", frames=5)
+    coordinator = RefusingCoordinator(offers=[offer])
+    state_dir = tmp_path / "shared-state"
+    runner, _state = _runner(coordinator, state_dir)
+    runner.ensure_enrolled()
+
+    assert runner._poll_once() is True
+    job = runner._jobs_by_slot[0]
+    assert _wait_until(runner, lambda: not job.is_running())
+    runner._service_running_jobs()
+
+    # Refused, so nothing was recorded upstream and the slot is free again.
+    assert coordinator.results == []
+    assert runner._jobs_by_slot == {}
+
+    # But the record survives the job it belonged to. Under the old behaviour
+    # this file was deleted here, which is what made the loss permanent.
+    inflight = json.loads((state_dir / "state" / "in-flight.json").read_text(encoding="utf-8"))
+    assert inflight["attempts"] == []
+    assert [owed["attempt_id"] for owed in inflight["unreported"]] == ["attempt-refused"]
+
+    # A second worker start, against a coordinator that now accepts it -- the
+    # real sequence, where MARP learned the word after the worker had already
+    # tried to use it.
+    coordinator.refuse = False
+    restarted, _state = _runner(coordinator, state_dir)
+    restarted.report_lost_job()
+
+    assert len(coordinator.results) == 1
+    resent = coordinator.results[0]
+    assert resent["attempt_id"] == "attempt-refused"
+
+    # Re-sent as what it was. A refused outcome must not be downgraded to
+    # `failed` on the way out: MARP refusing a word today does not make the run
+    # a failure, and rewriting it would put a wrong answer in the record.
+    assert resent["outcome"] == "succeeded"
+
+
+# test_a_coordinator_cancel_is_a_notice_not_an_error(tmp_path)
+# Verifies an instruction obeyed does not report as a fault.
+# Inputs: pytest temporary directory.
+# Output: pytest pass/fail result.
+#
+# A coordinator cancel was written into `last_error`, so `/status` reported an
+# error for the rest of the session over a job that had been stopped exactly as
+# intended -- and a real fault arriving later was indistinguishable from it.
+def test_a_coordinator_cancel_is_a_notice_not_an_error(tmp_path: Path) -> None:
+
+    offer = _job_for(tmp_path, "attempt-cancelled", frames=200, frame_delay_s=0.05)
+    coordinator = FakeCoordinator(offers=[offer])
+    coordinator.heartbeat_action = "cancel"
+    runner, state = _runner(coordinator, tmp_path)
+    runner.ensure_enrolled()
+
+    assert runner._poll_once() is True
+    job = runner._jobs_by_slot[0]
+    assert _wait_until(runner, lambda: job.stop_requested)
+
+    described = state.describe()
+    assert described["last_error"] is None, described["last_error"]
+    assert "cancel" in (described["last_notice"] or "")
+
+    job.kill(grace_s=1)
+    runner._service_running_jobs()
+
+
+# test_a_childs_warning_reaches_the_operator_not_only_the_coordinator(tmp_path)
+# Verifies a warning from inside a job is visible locally.
+# Inputs: pytest temporary directory.
+# Output: pytest pass/fail result.
+#
+# The watch window is why this exists. It failed to start on every machine for
+# the whole life of the feature, said so in exactly this kind of warning, and
+# the warning went only to the coordinator's event stream -- which a volunteer
+# cannot read. `/status` said healthy, the job succeeded, and the feature had
+# never once run. A warning nobody can see is the same as no warning.
+def test_a_childs_warning_reaches_the_operator_not_only_the_coordinator(tmp_path: Path) -> None:
+
+    coordinator = FakeCoordinator()
+    runner, state = _runner(coordinator, tmp_path)
+
+    runner._surface_warnings([
+        {"seq": 1, "kind": "log", "level": "info", "message": "opened video 1920x1080"},
+        {"seq": 2, "kind": "log", "level": "warning", "message": "Chromium is missing at C:/x"},
+    ])
+
+    described = state.describe()
+    assert described["last_notice"] == "Chromium is missing at C:/x"
+
+    # A warning is not a fault -- the job carries on headless -- so it must not
+    # land in the error field, where it would be indistinguishable from one.
+    assert described["last_error"] is None
+
+    # Ordinary chatter must not overwrite it, or the one line worth reading is
+    # gone by the time anybody looks.
+    runner._surface_warnings([
+        {"seq": 3, "kind": "log", "level": "info", "message": "frame 400"},
+    ])
+    assert state.describe()["last_notice"] == "Chromium is missing at C:/x"
+
+
+# test_slots_are_shed_when_a_window_falls_below_real_time()
+# Verifies the live-slot heuristic.
+# Inputs: none.
+# Output: pytest pass/fail result.
+#
+# The derived slot count is a guess from VRAM and cores, and both said 4 on a
+# machine whose honest answer depended on the model and the video. What can be
+# observed is how fast the running jobs are going, and the goal is that every
+# watched window plays at least at real time -- a screen saver at 0.7x is a
+# machine that looks broken to whoever donated it.
+def test_slots_are_shed_when_a_window_falls_below_real_time() -> None:
+    from marp_inference_worker.jobs import runner as runner_module
+
+    class FakeJob:
+        def __init__(self, rate: float) -> None:
+            self._rate = rate
+
+        def current_progress(self):
+            # Past the warm-up, so the rate counts.
+            elapsed = 120.0
+            return {"done": int(self._rate * elapsed), "elapsed_s": elapsed}
+
+    class FakeState:
+        def is_paused(self):
+            return False
+
+        def note_error(self, _message):
+            pass
+
+        def set_permitted_slots(self, _permitted):
+            pass
+
+    live = runner_module.JobRunner.__new__(runner_module.JobRunner)
+    live._slot_count = 4
+    live._effective_slots = 4
+    live._last_slot_decision_at = 0.0
+    live._state = FakeState()
+
+    # Four jobs, one of them below real time. One slot is given up.
+    live._jobs_by_slot = {0: FakeJob(30), 1: FakeJob(28), 2: FakeJob(18), 3: FakeJob(26)}
+    assert live._live_slot_count() == 3
+
+    # Still slow: keep shedding, but never below one -- a worker that took no
+    # work at all would be worse than a slow one.
+    live._jobs_by_slot = {0: FakeJob(10)}
+    live._effective_slots = 1
+    live._last_slot_decision_at = 0.0
+    assert live._live_slot_count() == 1
+
+    # Comfortably above real time, so another job is allowed. The margin
+    # matters: growing at exactly real time would slow everything below it
+    # again and shed the slot straight back.
+    live._effective_slots = 2
+    live._last_slot_decision_at = 0.0
+    live._jobs_by_slot = {0: FakeJob(60), 1: FakeJob(55)}
+    assert live._live_slot_count() == 3
+
+    # Above real time but inside the margin: hold, do not grow.
+    live._effective_slots = 2
+    live._last_slot_decision_at = 0.0
+    live._jobs_by_slot = {0: FakeJob(28), 1: FakeJob(27)}
+    assert live._live_slot_count() == 2
+
+    # Fractionally under: hold. A machine at 24 f/s against a 25 target is
+    # playing at a speed nobody can tell from live, and shedding a quarter of
+    # the machine's throughput to chase 4% is the wrong trade. This worker
+    # settled at exactly that and gave away three slots for it.
+    live._effective_slots = 4
+    live._last_slot_decision_at = 0.0
+    live._jobs_by_slot = {0: FakeJob(24), 1: FakeJob(24), 2: FakeJob(23.5), 3: FakeJob(24)}
+    assert live._live_slot_count() == 4
+
+
+# test_one_slot_decision_per_interval_not_one_per_poll()
+# Verifies the heuristic steps rather than slides.
+# Inputs: none.
+# Output: pytest pass/fail result.
+#
+# **This is the bug the first version shipped with.** The count was recomputed
+# on every poll, which runs several times a second, so one slow reading shed a
+# slot on every pass -- four to one in seconds, before any job could respond to
+# the first decision. A controller has to wait long enough to measure the
+# effect of what it just did.
+def test_one_slot_decision_per_interval_not_one_per_poll() -> None:
+    from marp_inference_worker.jobs import runner as runner_module
+
+    class Slow:
+        def current_progress(self):
+            return {"done": 600, "elapsed_s": 120.0}   # 5 f/s, far below real time
+
+    class FakeState:
+        def is_paused(self):
+            return False
+
+        def note_error(self, _message):
+            pass
+
+        def set_permitted_slots(self, _permitted):
+            pass
+
+    live = runner_module.JobRunner.__new__(runner_module.JobRunner)
+    live._slot_count = 4
+    live._effective_slots = 4
+    live._last_slot_decision_at = 0.0
+    live._state = FakeState()
+    live._jobs_by_slot = {0: Slow(), 1: Slow(), 2: Slow(), 3: Slow()}
+
+    # First call decides: one slot given up.
+    assert live._live_slot_count() == 3
+
+    # Hammered the way the poll loop hammers it. Nothing more may change until
+    # the interval is up, however slow the jobs still look.
+    for _ in range(50):
+        assert live._live_slot_count() == 3
+
+
+# test_a_warming_job_does_not_shed_a_slot()
+# Verifies the warm-up guard.
+# Inputs: none.
+# Output: pytest pass/fail result.
+#
+# Loading a model and opening a video take most of the first minute and report
+# a rate near zero. Without this the worker would shed every slot at the start
+# of every run and never take them back.
+def test_a_warming_job_does_not_shed_a_slot() -> None:
+    from marp_inference_worker.jobs import runner as runner_module
+
+    class Warming:
+        def current_progress(self):
+            return {"done": 3, "elapsed_s": 5.0}
+
+    class FakeState:
+        def is_paused(self):
+            return False
+
+        def note_error(self, _message):
+            pass
+
+        def set_permitted_slots(self, _permitted):
+            pass
+
+    live = runner_module.JobRunner.__new__(runner_module.JobRunner)
+    live._slot_count = 4
+    live._effective_slots = 4
+    live._last_slot_decision_at = 0.0
+    live._state = FakeState()
+    live._jobs_by_slot = {0: Warming(), 1: Warming()}
+
+    assert live._live_slot_count() == 4
+
+
+# test_a_worker_starts_at_one_job_and_grows_into_the_machine()
+# Verifies the ramp direction.
+# Inputs: none.
+# Output: pytest pass/fail result.
+#
+# Both directions converge, but only one is wrong quietly on the way. A machine
+# that starts at its derived ceiling and needs fewer spends minutes running
+# every job at a fraction of speed -- real work, on somebody's donated
+# computer, going slowly for no reason. Starting at one costs a fast machine a
+# short ramp and costs a slow machine nothing.
+#
+# An explicit --slots is believed immediately and does not ramp: somebody who
+# named a number has already decided.
+def test_a_worker_starts_at_one_job_and_grows_into_the_machine(monkeypatch) -> None:
+    from marp_inference_worker.jobs import runner as runner_module
+
+    monkeypatch.setattr(runner_module, "derive_slot_count", lambda: 4)
+
+    derived = runner_module.JobRunner.__new__(runner_module.JobRunner)
+    derived._slot_count = runner_module.derive_slot_count()
+    derived._effective_slots = 1
+
+    # The ceiling is what was derived; the starting point is one.
+    assert derived._slot_count == 4
+    assert derived._effective_slots == 1
+
+    class Fast:
+        def current_progress(self):
+            return {"done": 7200, "elapsed_s": 120.0}   # 60 f/s, far above real time
+
+    class FakeState:
+        def is_paused(self):
+            return False
+
+        def note_error(self, _message):
+            pass
+
+        def set_permitted_slots(self, _permitted):
+            pass
+
+        def set_permitted_slots(self, _permitted):
+            pass
+
+        def set_permitted_slots(self, _permitted):
+            pass
+
+    derived._state = FakeState()
+    derived._jobs_by_slot = {0: Fast()}
+    derived._last_slot_decision_at = 0.0
+
+    # Grows one step at a time, never in a jump, and stops at the ceiling.
+    for expected in (2, 3, 4, 4):
+        derived._last_slot_decision_at = 0.0
+        assert derived._live_slot_count() == expected

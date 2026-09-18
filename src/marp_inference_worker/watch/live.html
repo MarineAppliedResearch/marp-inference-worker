@@ -1,0 +1,370 @@
+<!DOCTYPE html>
+<!--
+  live.html
+  Created: 2026-09-17
+  Author: Isaac Travers
+
+  The watch window's only page. Asks the worker's loopback server for the next
+  frame, draws it, draws the tracker's boxes over it, and acknowledges so the
+  next one is released.
+
+  This file lives in the worker package rather than in the player host the
+  installer stages. It was missing from both for the whole life of the feature:
+  `WatchDisplay.start()` refuses without it, so the window had never once opened
+  on any machine, and the failure went to a coordinator log event where nobody
+  could see it. Shipping it beside the code that serves it is what stops that
+  happening again -- there is no build step that can omit it now.
+
+  It deliberately does not use marp-video-player. That player seeks a video; this
+  draws frames the worker has already decoded and pushes over loopback, which is
+  a different job and a much smaller one.
+-->
+<meta charset="utf-8">
+<title>MARP · watching inference</title>
+<!--
+  The window's own icon, and the taskbar entry's. A Chromium `--app` window
+  takes both from the page's favicon, so this one line is what puts the MARP
+  mark on the window somebody sees running on a donated machine. Served from
+  this package by the display server, for the same reason the page itself is:
+  a file that only exists in an installer payload is a file that is missing
+  from a git checkout, which is how the watch window never ran at all.
+-->
+<link rel="icon" type="image/png" href="marp-mark.png">
+<style>
+  :root { color-scheme: dark; }
+  html, body {
+    margin: 0; height: 100%; background: #0b0f14; color: #e6edf3;
+    font: 13px/1.45 "Segoe UI", system-ui, sans-serif; overflow: hidden;
+  }
+  #stage {
+    position: absolute; inset: 0; display: flex;
+    align-items: center; justify-content: center;
+  }
+  canvas { max-width: 100%; max-height: 100%; background: #000; }
+  #bar {
+    position: absolute; left: 0; right: 0; top: 0; padding: 8px 12px;
+    display: flex; gap: 18px; align-items: baseline; flex-wrap: wrap;
+    background: linear-gradient(#0b0f14e6, #0b0f1400);
+    pointer-events: none;
+  }
+  #bar b { font-weight: 600; color: #fff; }
+  #bar span { color: #9fb0c0; }
+  #count { color: #7ee787; font-variant-numeric: tabular-nums; }
+  #frame { font-variant-numeric: tabular-nums; }
+  #note {
+    position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%);
+    color: #9fb0c0; text-align: center;
+  }
+  #progress {
+    position: absolute; left: 0; bottom: 0; height: 3px;
+    background: #2f81f7; width: 0;
+  }
+  /* The footer. Deliberately small: it is provenance for somebody glancing at
+     a donated machine, not a dashboard. It sits above the progress bar rather
+     than over the video, so it never hides an organism. */
+  #footer {
+    position: absolute; left: 0; right: 0; bottom: 3px; padding: 4px 10px;
+    display: flex; gap: 14px; align-items: baseline; flex-wrap: wrap;
+    font-size: 10px; line-height: 1.3; color: #8b9bab;
+    background: linear-gradient(#0b0f1400, #0b0f14e6);
+    pointer-events: none; font-variant-numeric: tabular-nums;
+  }
+  #footer .k { color: #5f6f7f; }
+  #footer .v { color: #c9d6e2; }
+  #footer .sep { color: #33414f; }
+  /* The watermark. Bottom left, above the footer, faint enough to read the
+     video through and large enough to recognise across a room. Never over the
+     centre of frame, where the animals are. */
+  #mark {
+    position: absolute; left: 12px; bottom: 26px;
+    /* The mark is near square (599x525), not the wide wordmark -- a wordmark
+       shrunk into a taskbar slot is an illegible smear, and the M reads at any
+       size. Sized so it stays small in a quarter-screen tile. */
+    width: 58px; opacity: 0.3;
+    pointer-events: none; user-select: none;
+    filter: drop-shadow(0 1px 2px #000a);
+  }
+</style>
+
+<div id="stage"><canvas id="view" width="16" height="9"></canvas></div>
+<div id="bar">
+  <b id="model">…</b>
+  <span id="job"></span>
+  <span>frame <b id="frame">–</b></span>
+  <span id="count"></span>
+</div>
+<div id="note">waiting for the first frame…</div>
+<img id="mark" src="marp-mark.png" alt="MARP">
+<div id="footer">
+  <span><span class="k">gpu</span> <span class="v" id="gpu">–</span></span>
+  <span><span class="k">net</span> <span class="v" id="net">–</span></span>
+  <span class="sep">|</span>
+  <span><span class="k">project</span> <span class="v" id="project">–</span></span>
+  <span><span class="k">dive</span> <span class="v" id="dive">–</span></span>
+  <span><span class="k">line</span> <span class="v" id="line">–</span></span>
+  <span><span class="k">type</span> <span class="v" id="stype">–</span></span>
+  <span class="sep">|</span>
+  <span><span class="k">video</span> <span class="v" id="video">–</span></span>
+  <span><span class="k">model</span> <span class="v" id="fmodel">–</span></span>
+</div>
+<div id="progress"></div>
+
+<script>
+  const view = document.getElementById('view');
+  const paint = view.getContext('2d');
+  const note = document.getElementById('note');
+
+  // The frame we last finished drawing. The server holds the next one until it
+  // hears this back, so the window can never fall behind the run -- inference
+  // waits for the draw rather than queueing frames the volunteer never sees.
+  let acknowledged = null;
+
+  // Posted once, after the first real draw, as evidence the page rendered
+  // rather than merely loaded. A blank window used to be indistinguishable
+  // from a working one.
+  let proofSent = false;
+
+  // Palette by species. One colour per class name, so every red sea star on
+  // screen is the same colour and a different colour means a different animal.
+  //
+  // This used to key on track id, which gave every individual its own colour:
+  // useful for watching the tracker hold a box, useless for reading a frame.
+  // Somebody watching wants to see at a glance that there are four of one thing
+  // and one of another, and the tracker's identity is already in the label.
+  //
+  // Derived from the name rather than assigned in arrival order, so a species
+  // keeps its colour across frames, across jobs, and across both machines --
+  // order-based assignment gave the same animal a different colour in each
+  // window, which is worse than no colour at all.
+  function colourFor(className) {
+    const name = String(className ?? 'unknown');
+    let hash = 0;
+
+    for (let i = 0; i < name.length; i += 1) {
+      hash = (hash * 31 + name.charCodeAt(i)) >>> 0;
+    }
+
+    // Golden-angle stride over the hash, which spreads neighbouring names far
+    // apart on the wheel instead of into adjacent shades.
+    const hue = (hash * 137.508) % 360;
+
+    // Saturation and lightness are varied slightly, so two species that happen
+    // to land on a similar hue are still told apart.
+    const saturation = 78 + (hash % 3) * 7;
+    const lightness = 58 + ((hash >> 3) % 3) * 6;
+
+    return `hsl(${hue.toFixed(1)} ${saturation}% ${lightness}%)`;
+  }
+
+  function drawTracks(tracks) {
+    paint.lineWidth = Math.max(2, view.width / 480);
+    paint.font = `${Math.max(13, Math.round(view.width / 62))}px "Segoe UI", sans-serif`;
+    paint.textBaseline = 'bottom';
+
+    for (const track of tracks || []) {
+      // bbox_normalized is [centre_x, centre_y, width, height], all 0..1 of
+      // the frame, so it survives any scaling the canvas does.
+      const [cx, cy, w, h] = track.bbox_normalized || [0, 0, 0, 0];
+      const x = (cx - w / 2) * view.width;
+      const y = (cy - h / 2) * view.height;
+      const boxWidth = w * view.width;
+      const boxHeight = h * view.height;
+      const colour = colourFor(track.class_name);
+
+      paint.strokeStyle = colour;
+      paint.strokeRect(x, y, boxWidth, boxHeight);
+
+      const confidence = typeof track.confidence === 'number'
+        ? ` ${track.confidence.toFixed(2)}` : '';
+      const label = `${track.class_name ?? 'unknown'} #${track.track_id}${confidence}`;
+      const textWidth = paint.measureText(label).width;
+      const textHeight = parseInt(paint.font, 10) + 6;
+
+      // Label inside the box when it would otherwise run off the top edge.
+      const labelY = y - 2 < textHeight ? y + boxHeight + textHeight : y - 2;
+      paint.fillStyle = colour;
+      paint.fillRect(x, labelY - textHeight, textWidth + 10, textHeight);
+      paint.fillStyle = '#04070a';
+      paint.fillText(label, x + 5, labelY - 3);
+    }
+  }
+
+  function updateBar(packet) {
+    document.getElementById('model').textContent = packet.model_name || 'inference';
+    document.getElementById('job').textContent = packet.job_id ? `job ${packet.job_id}` : '';
+    document.getElementById('frame').textContent = packet.frame_number;
+    const n = (packet.tracks || []).length;
+    document.getElementById('count').textContent =
+      n === 1 ? '1 detection' : `${n} detections`;
+
+    const { range_start: from, range_end: to } = packet;
+    if (typeof from === 'number' && typeof to === 'number' && to > from) {
+      const done = (packet.frame_number - from) / (to - from);
+      document.getElementById('progress').style.width =
+        `${Math.max(0, Math.min(1, done)) * 100}%`;
+    }
+  }
+
+  async function show(packet) {
+    const image = new Image();
+    // Decoded before drawing so the canvas is never resized around a
+    // half-loaded bitmap, which showed as a one-frame flicker.
+    image.src = `data:${packet.content_type};base64,${packet.image}`;
+    await image.decode();
+
+    if (view.width !== image.naturalWidth || view.height !== image.naturalHeight) {
+      view.width = image.naturalWidth;
+      view.height = image.naturalHeight;
+    }
+    paint.drawImage(image, 0, 0);
+    drawTracks(packet.tracks);
+    updateBar(packet);
+    note.hidden = true;
+
+    if (!proofSent) {
+      proofSent = true;
+      // Best effort: the run must not depend on the proof being accepted.
+      view.toBlob(
+        (blob) => blob && fetch('/render-proof', { method: 'POST', body: blob }).catch(() => {}),
+        'image/jpeg',
+        0.8,
+      );
+    }
+  }
+
+  async function pump() {
+    // One request at a time, forever. `/next` long-polls, so this is not a
+    // spin -- it blocks in the server until there is a frame to hand over.
+    for (;;) {
+      try {
+        const response = await fetch('/next', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ acknowledged_frame: acknowledged }),
+        });
+
+        // 204 is the channel closing: the job has finished or the worker has
+        // detached the display. Say so rather than leaving a frozen frame.
+        if (response.status === 204) {
+          note.textContent = 'the run has finished';
+          note.hidden = false;
+          return;
+        }
+        if (!response.ok) throw new Error(`/next answered ${response.status}`);
+
+        const packet = await response.json();
+        await show(packet);
+        acknowledged = packet.frame_number;
+      } catch (error) {
+        // The server going away is the ordinary end of a job, not a fault
+        // worth a dialog. Stop quietly and leave the last frame up.
+        note.textContent = `display stopped: ${error.message}`;
+        note.hidden = false;
+        return;
+      }
+    }
+  }
+
+  // Where the worker's own API is listening.
+  //
+  // The display server and the worker API are two servers on two ports, so the
+  // page has to be told. `?api=` is passed when the window is launched; 8010 is
+  // the worker's default and the right fallback for a single-worker machine.
+  // CORS on the worker API already allows any loopback origin, which is what
+  // makes this reachable at all.
+  const apiPort = new URLSearchParams(location.search).get('api') || '8010';
+  const apiBase = `http://127.0.0.1:${apiPort}`;
+
+  // The attempt this window belongs to, learned from the first packet. A
+  // machine running several slots has several jobs in `/status`, and the wrong
+  // one's dive name is worse than none.
+  let attemptId = null;
+
+  function setText(id, value) {
+    document.getElementById(id).textContent =
+      value === null || value === undefined || value === '' ? '–' : String(value);
+  }
+
+  // Bytes to something readable at a glance. Decimal units, because network
+  // throughput is quoted that way and this sits beside a network figure.
+  function humanBytes(bytes) {
+    if (typeof bytes !== 'number' || !isFinite(bytes)) return null;
+    const units = ['B', 'kB', 'MB', 'GB', 'TB'];
+    let value = bytes;
+    let unit = 0;
+
+    while (value >= 1000 && unit < units.length - 1) {
+      value /= 1000;
+      unit += 1;
+    }
+
+    return `${value >= 100 || unit === 0 ? Math.round(value) : value.toFixed(1)} ${units[unit]}`;
+  }
+
+  // Refresh the footer from the worker's own API.
+  //
+  // Everything here is decoration, so every failure is swallowed and the field
+  // keeps its last value. A window that stops drawing because a stats call
+  // failed would be a worse bug than a stale megabyte count.
+  async function refreshFooter() {
+    try {
+      const response = await fetch(`${apiBase}/system/resources`, { cache: 'no-store' });
+
+      if (response.ok) {
+        const resources = await response.json();
+        const device = ((resources.nvidia || {}).devices || [])[0];
+
+        if (device && typeof device.memory_used_bytes === 'number') {
+          const used = humanBytes(device.memory_used_bytes);
+          const total = humanBytes(device.memory_total_bytes);
+          const percent = typeof device.memory_percent_used === 'number'
+            ? ` (${Math.round(device.memory_percent_used)}%)` : '';
+          setText('gpu', `${used} / ${total}${percent}`);
+        }
+
+        const network = resources.network || {};
+
+        if (network.available) {
+          // Averages since the previous sample, which is this page's own poll
+          // interval. Null until there have been two readings.
+          const down = humanBytes(network.received_bytes_per_second);
+          const up = humanBytes(network.sent_bytes_per_second);
+          setText('net', down && up ? `${down}/s down · ${up}/s up` : 'measuring…');
+        }
+      }
+    } catch { /* decoration only */ }
+
+    try {
+      const response = await fetch(`${apiBase}/status`, { cache: 'no-store' });
+
+      if (response.ok) {
+        const status = await response.json();
+        const jobs = status.active_jobs || [];
+
+        // Match on the attempt this window is drawing, not simply the first
+        // job: with several slots there are several, and they are different
+        // videos in different sessions.
+        const mine = attemptId === null
+          ? jobs[0]
+          : jobs.find((job) => String(job.attempt_id) === String(attemptId)) || null;
+
+        if (mine) {
+          const context = mine.session_context || {};
+          setText('project', context.project);
+          setText('dive', context.dive);
+          setText('line', context.line);
+          setText('stype', context.type);
+          setText('video', mine.video_source);
+          setText('fmodel', mine.model_name);
+        }
+      }
+    } catch { /* decoration only */ }
+  }
+
+  // Every two seconds. Often enough that a network figure means something,
+  // rare enough that it never competes with the frame channel for the loopback.
+  refreshFooter();
+  setInterval(refreshFooter, 2000);
+
+  pump();
+</script>

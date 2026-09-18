@@ -132,6 +132,37 @@ class ReductionRef(BaseModel):
         return value
 
 
+# SessionContext
+# Where MARP will file this job's observations, in words rather than an id.
+# Every field is optional and the whole object may be absent: the coordinator
+# omits it when the session cannot be resolved, deliberately, because a worker
+# refusing a lease over a missing dive name would be a worse bug than an
+# unlabelled window.
+#
+# `session_id` is null when the spec named a session by
+# `{project_id, dive, line, type}` -- that session does not exist until the
+# ingest creates it, so there is no id yet.
+#
+# **Declared here or it does not exist.** Pydantic drops unknown fields
+# silently, and `runner.py` hands the child `spec.model_dump()`, so a field
+# MARP sends and this model does not name never reaches the engine and never
+# reaches the screen -- with no error on either side.
+class SessionContext(BaseModel):
+
+    # The session's own id, once it has one.
+    session_id: int | None = None
+
+    # Project name, resolved from `project_id` by the coordinator.
+    project: str | None = None
+
+    # Dive and line, echoed from the session.
+    dive: str | None = None
+    line: str | None = None
+
+    # `Fish`, `Invert` and the rest. What routes the ingest to a species list.
+    type: str | None = None
+
+
 # JobSpec
 # One unit of work as the coordinator describes it.
 # Everything an engine needs is here; nothing about MARP's transport is.
@@ -141,6 +172,13 @@ class JobSpec(BaseModel):
     engine: str
 
     # Model to run, with the hash the worker verifies.
+    #
+    # Required for every engine, mock included. This was briefly optional so a
+    # machine with no weights could run `mock`, on the reasoning that an engine
+    # performing no inference has none to name. That case does not exist: mock
+    # is test scaffolding rather than something a volunteer runs, and the
+    # worker's own tests already hand it a model. Isaac settled it -- every
+    # engine takes a model, and mock takes a mock one.
     model: ModelRef
 
     # Video the frames come from.
@@ -155,6 +193,12 @@ class JobSpec(BaseModel):
 
     # Keyframe reduction rule to apply to finished tracks.
     reduction: ReductionRef
+
+    # Where the observations will be filed, for the watch window to show.
+    #
+    # Decoration, not contract: nothing the worker does depends on it, and it is
+    # absent on every lease minted before MARP started sending it.
+    session_context: SessionContext | None = None
 
 
 # AttemptEnvelope

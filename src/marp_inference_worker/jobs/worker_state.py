@@ -70,8 +70,15 @@ class WorkerState:
         # The jobs currently running, as the runner described them.
         self._jobs: list[dict[str, Any]] = []
 
-        # How many job slots this host has.
+        # How many job slots this host has. The ceiling, not the working
+        # number: it is what the machine could grow to if every job stayed
+        # above real time.
         self._slot_count = 0
+
+        # How many the worker has decided it can actually run, from measuring
+        # the jobs it is running. Zero until the runner says, and then the
+        # number `/status` and the poll both mean by "free".
+        self._permitted_slots = 0
 
         # The capabilities snapshot, so /status does not re-read hardware on
         # every request -- NVML queries are not free.
@@ -81,6 +88,15 @@ class WorkerState:
         # cannot reach its coordinator looks identical to an idle one otherwise.
         self._last_error: str | None = None
         self._last_error_at: float | None = None
+
+        # The last thing worth telling the operator that was not a fault.
+        #
+        # Separate from `_last_error` because they are read differently: a
+        # coordinator cancel used to be written into the error field, so
+        # `/status` reported an error long after a job had been stopped
+        # perfectly correctly. An instruction obeyed is not a fault.
+        self._last_notice: str | None = None
+        self._last_notice_at: float | None = None
 
         # When this process started, for an uptime a human can sanity-check.
         self._started_at = time.time()
@@ -106,6 +122,19 @@ class WorkerState:
         with self._lock:
             self._capabilities = capabilities
             self._slot_count = slot_count
+
+    # set_permitted_slots()
+    # Records how many jobs the worker will currently take on.
+    # Inputs: the permitted count.
+    # Output: none.
+    # Use this from the runner whenever its measured count changes. Without it
+    # `/status` reports free slots against the ceiling, so a machine running one
+    # job of a possible four looks like it has three going spare when it has
+    # decided it has none.
+    def set_permitted_slots(self, permitted: int) -> None:
+
+        with self._lock:
+            self._permitted_slots = permitted
 
     # set_jobs()
     # Records the currently running jobs.
@@ -170,6 +199,18 @@ class WorkerState:
             self._last_error = message
             self._last_error_at = time.time()
 
+    # note()
+    # Records something the operator should see that is not a fault.
+    # Inputs: the message.
+    # Output: none.
+    # Use this for instructions obeyed -- a cancel, a pause -- so they are
+    # visible without reading as breakage.
+    def note(self, message: str) -> None:
+
+        with self._lock:
+            self._last_notice = message
+            self._last_notice_at = time.time()
+
     # describe()
     # Returns what is actually true about this worker.
     # Inputs: none.
@@ -201,15 +242,24 @@ class WorkerState:
                 "screen_mode": self._screen_mode,
                 "version": worker_version(),
                 "uptime_s": round(time.time() - self._started_at, 1),
+                # `total` is the ceiling this machine will ever grow to;
+                # `permitted` is what it has decided it can actually run at
+                # real time, which is the number that means anything. Free is
+                # computed from `permitted`, because reporting `total - busy`
+                # advertised three free slots on a machine that had worked out
+                # it had none -- two true numbers, only one of them useful.
                 "slots": {
                     "total": self._slot_count,
+                    "permitted": self._permitted_slots or self._slot_count,
                     "busy": len(self._jobs),
-                    "free": max(0, self._slot_count - len(self._jobs)),
+                    "free": max(0, (self._permitted_slots or self._slot_count) - len(self._jobs)),
                 },
                 "active_jobs": self._jobs,
                 "capabilities": self._capabilities,
                 "last_error": self._last_error,
                 "last_error_at": self._last_error_at,
+                "last_notice": self._last_notice,
+                "last_notice_at": self._last_notice_at,
             }
 
 

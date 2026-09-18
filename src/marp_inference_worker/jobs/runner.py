@@ -104,8 +104,12 @@ _UPDATE_CHECK_INTERVAL_S = 60.0
 # event stream alongside it.
 def _failure_reason(outcome: str, payload: dict[str, Any]) -> str | None:
 
-    # A success has nothing to explain.
-    if outcome == "succeeded":
+    # A success has nothing to explain, and neither does a yield: the operator
+    # stopped it, which `completed_through_frame` already says better than a
+    # sentence could. Filling the column anyway put "the worker reported
+    # yielded" on the attempt row of every ordinary stop -- a failure reason
+    # reading as a failure, on something that is not one.
+    if outcome in ("succeeded", "yielded"):
         return None
 
     # Prefer what the engine actually said.
@@ -116,6 +120,122 @@ def _failure_reason(outcome: str, payload: dict[str, Any]) -> str | None:
         parts = [f"the worker reported {outcome}"]
 
     return " | ".join(parts)[:2000]
+
+
+# Roughly what one running job costs on the GPU, in bytes.
+#
+# Measured, not guessed: a 4500-frame tracking job held 941 MiB on an 8 GB 5060
+# and the same order on a 16 GB 4080. Rounded up to 1.5 GiB so the estimate is
+# wrong in the safe direction -- a model with a larger input size or a busier
+# frame costs more, and over-committing a card is worse than leaving it idle.
+_VRAM_PER_JOB_BYTES = 1536 * 1024 * 1024
+
+
+# The most slots derived capacity will offer on its own.
+#
+# VRAM says a 16 GB card could hold ten jobs. Throughput says otherwise: two
+# concurrent jobs measured 1.7x one job, not 2x, on a card at 14% utilisation,
+# so something contends well before the GPU does -- today the watch display's
+# per-frame handshake, and under it the CPU-side decode and tracking. A machine
+# that accepts ten jobs and runs all ten badly is worse than one that takes four
+# and finishes them, because the pool cannot tell the difference and neither can
+# the volunteer.
+#
+# Raise this when there is a measurement that supports it, not before.
+_MAX_DERIVED_SLOTS = 4
+
+
+# The frame rate MARP fixes video time at, and so what "real time" means here.
+#
+# A watched window below this is playing the dive in slow motion. The same 25
+# is `ASSUMED_FPS` in marp-api and was confirmed by measuring `framenum`
+# against `mediaPosition` across all ten videos this corpus holds: 25.01-25.05.
+_REAL_TIME_FPS = 25.0
+
+
+# How far above real time every job must be before another is taken on.
+#
+# Adding a job slows the ones already running, so growing at exactly real time
+# would immediately drop all of them below it and shed the slot again. The
+# margin is what stops that oscillation.
+_SLOT_GROWTH_MARGIN = 1.35
+
+
+# How far below real time is worth giving up a slot for.
+#
+# Not 1.0. A machine that settles at 24 f/s against a 25 f/s target is playing
+# the dive at a speed nobody can tell from live, and shedding a slot for it
+# costs a quarter of the machine's throughput to fix a rounding error. This
+# worker settled at 0.95x with four slots and would have thrown three of them
+# away chasing the last 4%.
+_SLOT_SHED_MARGIN = 0.9
+
+
+# How long between slot decisions, in seconds.
+#
+# **The reason this exists is a bug it caused.** The count was recomputed on
+# every poll, so one slow reading shed a slot on every pass through the loop --
+# four slots to one in a few seconds, before a single job had a chance to speed
+# up in response. A decision has to be followed by enough running time to
+# measure its effect, or it is a ratchet rather than a controller.
+_SLOT_DECISION_INTERVAL_S = 45.0
+
+
+# How long a job is left alone before its rate means anything, in seconds.
+#
+# Loading a model and opening a video take most of the first minute and produce
+# a rate near zero. Reacting to that would shed every slot at the start of
+# every run and never take them back.
+_SLOT_WARMUP_S = 60.0
+
+
+# derive_slot_count()
+# The most jobs this machine will ever be asked to run at once.
+# Inputs: none; reads the machine.
+# Output: at least 1.
+#
+# **A ceiling, not a target.** The worker starts at one job and grows only
+# while every running job stays above real time, so this number is the limit
+# that growth stops at rather than the number of jobs taken on. That matters
+# because hardware has predicted capacity badly every time it has been asked:
+#
+#   RTX 4080 SUPER 16 GiB   VRAM divisor said 4   measured ~3
+#   RTX 5060 Laptop  8 GiB  VRAM divisor said 4   measured 1
+#
+# The 5060 ran a single job at 0.45x real time while using 941 MiB of 8146 and
+# 9-18% of the card. Nothing about its memory or its core count predicted that;
+# only running it did. Both figures are from 2026-09-18, on Windows, on two
+# discrete Nvidia cards -- which is the whole of the evidence, and a machine
+# with no CUDA device at all has never been measured.
+#
+# Three limits, and the smallest wins:
+#   * GPU memory, at a measured cost per job
+#   * physical CPU cores, because decode and tracking are CPU-side and a job
+#     starved of cores is slower without using less GPU
+#   * a ceiling, because measured throughput stops scaling before memory does
+#
+# A machine with no CUDA device still gets one slot, so it can run a CPU job
+# that explicitly asked for CPU -- that much of the old behaviour was right.
+def derive_slot_count() -> int:
+
+    devices = device_module.describe_cuda_devices()
+
+    if not devices:
+        return 1
+
+    # Total memory across the cards, since a slot is pinned to a device by
+    # `resolve_device(slot_index)` and the work spreads over what is there.
+    total_vram = sum(int(device.get("total_memory_bytes") or 0) for device in devices)
+
+    by_vram = int(total_vram // _VRAM_PER_JOB_BYTES) if total_vram else 1
+
+    # Leave the machine usable. A volunteer donating a GPU is still typing on
+    # the same computer, and taking every core to feed the card is how donated
+    # hardware stops being donated.
+    physical = os.cpu_count() or 2
+    by_cpu = max(1, physical // 4)
+
+    return max(1, min(by_vram, by_cpu, _MAX_DERIVED_SLOTS))
 
 
 # JobRunner
@@ -148,14 +268,60 @@ class JobRunner:
         self._workspace_root = state_dir / "jobs"
         self._inflight_path = state_dir / "in-flight.json"
 
+        # Results the coordinator would not take. Held here, written into the
+        # in-flight record and retried at the next start.
+        #
+        # Without this a refused result vanished: the slot was freed, the
+        # in-flight record was rewritten without the job, and the only trace was
+        # a line in `last_error`. The attempt stayed leased upstream until the
+        # lease and then the 24h cap decided for it, and nothing ever reported
+        # it again. That is how an operator stop lost its work for weeks.
+        self._unreported: list[dict[str, Any]] = []
+
         # The object the FastAPI app reads for /status and writes for pause.
         self._state = worker_state
         self._state.set_screen_mode(screen_mode)
 
-        # One job per GPU slot. A machine with no GPU still gets one slot, so
-        # it can run a CPU job that explicitly asked for CPU.
-        discovered = device_module.cuda_device_count()
-        self._slot_count = slot_count if slot_count is not None else max(1, discovered)
+        # How many jobs this machine will run at once.
+        #
+        # This used to be the number of CUDA devices, which meant a single-card
+        # machine ran exactly one job however large the card was -- and measuring
+        # it showed the card was never the constraint. A 16 GB 4080 running one
+        # job sat at 14% utilisation and under 1 GB of VRAM; a second concurrent
+        # job on the same card raised combined throughput from 28 to 47 frames
+        # per second. So capacity here is about how much of the machine is free,
+        # not how many GPUs are in it.
+        self._slot_count = slot_count if slot_count is not None else derive_slot_count()
+
+        # How many of those slots are actually in use, which is the measured
+        # answer rather than the derived one. Starts at the full count and is
+        # adjusted by `_live_slot_count()` from how fast the jobs are going.
+        # The configured count stays the ceiling and the window layout, so the
+        # tiles do not reshuffle every time a slot is shed or taken back.
+        # **Starts at one and grows, rather than starting at the ceiling and
+        # shedding.** Both directions converge on the same answer, but only one
+        # of them is wrong quietly on the way: a machine that starts at four and
+        # needs one spends minutes running four jobs badly, and every one of
+        # those jobs is real work going at a quarter speed on somebody's donated
+        # computer. Starting at one costs a fast machine a few minutes of ramp
+        # and costs a slow machine nothing.
+        #
+        # Measured rather than predicted, which is the lesson of the evening:
+        # `cuda_device_count` gave a machine with no GPU a slot it could not
+        # use, the slot index as a device index failed seven jobs, and the VRAM
+        # divisor said four for a 5060 that measures one. The machine says what
+        # it can do if it is allowed to run once.
+        self._effective_slots = 1 if slot_count is None else self._slot_count
+
+        # When a slot decision was last made. Zero so the first measurement
+        # counts immediately; after that, one decision per interval so each is
+        # followed by enough running time to see its effect.
+        self._last_slot_decision_at = 0.0
+
+        # Publish the starting figure straight away. Left until the first
+        # decision, `/status` fell back to the ceiling and reported three free
+        # slots on a worker that had not yet agreed to take more than one.
+        self._state.set_permitted_slots(self._effective_slots)
 
         # Slot index -> the job running on it. A slot absent from this mapping
         # is free.
@@ -282,7 +448,35 @@ class JobRunner:
                 # worker from coming back up; the lease will expire instead.
                 pass
 
-        # Clear it either way, so the same job is not reported lost forever.
+        # Then the results the coordinator refused last time, re-sent exactly
+        # as they were. These are not losses: the work finished and MARP would
+        # not take the answer, so the answer is offered again rather than
+        # rewritten into something MARP prefers. The `yielded` mismatch is the
+        # case this exists for -- once the coordinator learned the word, every
+        # stop a worker had been unable to report becomes reportable, and
+        # without this they were already gone.
+        for owed in record.get("unreported", []):
+            try:
+                self._client.report_result(
+                    attempt_id=str(owed["attempt_id"]),
+                    worker_id=str(owed["worker_id"]),
+                    lease_epoch=int(owed["lease_epoch"]),
+                    outcome=str(owed["outcome"]),
+                    artifacts=owed.get("artifacts") or [],
+                    failure_reason=owed.get("failure_reason"),
+                    completed_through_frame=owed.get("completed_through_frame"),
+                )
+            except CoordinatorError as error:
+                # Still refused. Say so where the operator can see it, rather
+                # than only in a coordinator event they cannot read.
+                self._state.note_error(
+                    f"still cannot report {owed.get('outcome')} for attempt "
+                    f"{owed.get('attempt_id')}: {error}"
+                )
+
+        # Clear it either way, so the same job is not reported forever. A
+        # result refused twice is dropped deliberately: retrying a permanent
+        # refusal at every start is a loop, and `last_error` now carries it.
         self._inflight_path.unlink(missing_ok=True)
 
     # _write_inflight()
@@ -293,9 +487,11 @@ class JobRunner:
     # launched, so a crash in between still leaves the record.
     def _write_inflight(self) -> None:
 
-        # An empty set of jobs means no record at all, which is what a clean
-        # idle worker should leave behind.
-        if not self._jobs_by_slot:
+        # Nothing running and nothing owed means no record at all, which is
+        # what a clean idle worker should leave behind. A refused result counts
+        # as owed: the file has to outlive the job it belongs to, or the retry
+        # at the next start has nothing to read.
+        if not self._jobs_by_slot and not self._unreported:
             self._inflight_path.unlink(missing_ok=True)
             return
 
@@ -312,7 +508,8 @@ class JobRunner:
                             "progress": job.current_progress(),
                         }
                         for job in self._jobs_by_slot.values()
-                    ]
+                    ],
+                    "unreported": self._unreported,
                 },
                 indent=2,
             ),
@@ -329,7 +526,63 @@ class JobRunner:
         # being offered work without needing a separate coordinator concept.
         if self._state.is_paused():
             return 0
-        return self._slot_count - len(self._jobs_by_slot)
+        return self._live_slot_count() - len(self._jobs_by_slot)
+
+    # _live_slot_count()
+    # How many jobs to run at once, given how fast they are actually going.
+    # Inputs: none; reads the running jobs.
+    # Output: between 1 and the configured slot count.
+    #
+    # **Measured, not derived.** The slot count from `derive_slot_count()` is a
+    # guess from VRAM and cores, and both told this machine 4 when the honest
+    # answer depends on the model, the video and the card. What can be observed
+    # is how fast each running job is going, and the goal is a plain one: every
+    # watched window should play at least at real time, because a screen saver
+    # running at 0.7x is a machine that looks broken to the person donating it.
+    #
+    # So: if the slowest running job is below real time, take one fewer job
+    # next time. If every job is comfortably above it, allow one more, up to
+    # what was configured. Warming jobs are ignored -- a model load and a video
+    # open make the first seconds meaningless, and reacting to them would shed
+    # slots at the start of every run.
+    def _live_slot_count(self) -> int:
+
+        # One decision per interval. This is called from the poll, which runs
+        # several times a second; acting every time turned one slow reading into
+        # a slide from four slots to one before any job could respond.
+        now = time.monotonic()
+
+        if now - self._last_slot_decision_at < _SLOT_DECISION_INTERVAL_S:
+            return self._effective_slots
+
+        rates = [
+            progress["done"] / progress["elapsed_s"]
+            for progress in (job.current_progress() for job in self._jobs_by_slot.values())
+            if progress.get("elapsed_s", 0) > _SLOT_WARMUP_S and progress.get("done")
+        ]
+
+        # Nothing measurable yet: trust what was configured, and do not start
+        # the clock -- a decision needs a measurement behind it.
+        if not rates:
+            return self._effective_slots
+
+        self._last_slot_decision_at = now
+        slowest = min(rates)
+
+        if slowest < _REAL_TIME_FPS * _SLOT_SHED_MARGIN and self._effective_slots > 1:
+            self._effective_slots -= 1
+            self._state.note_error(
+                f"slowest job {slowest:.1f} f/s; taking {self._effective_slots} at a time "
+                f"so each stays at real time"
+            )
+        elif slowest > _REAL_TIME_FPS * _SLOT_GROWTH_MARGIN and self._effective_slots < self._slot_count:
+            self._effective_slots += 1
+
+        # Publish it, so `/status` reports free slots against what the worker
+        # will actually take rather than against the ceiling.
+        self._state.set_permitted_slots(self._effective_slots)
+
+        return self._effective_slots
 
     # _next_free_slot()
     # Returns the lowest free slot index.
@@ -356,7 +609,13 @@ class JobRunner:
         # A paused worker has nothing free, however many slots it has.
         if self._state.is_paused():
             return []
-        return [index for index in range(self._slot_count) if index not in self._jobs_by_slot]
+
+        # Bounded by the live count, not the configured one, so a worker that
+        # has shed a slot to keep its windows at real time does not immediately
+        # offer it back on the next poll.
+        live = self._live_slot_count()
+
+        return [index for index in range(live) if index not in self._jobs_by_slot]
 
     # stop()
     # Asks the loop to finish after the current iteration.
@@ -587,8 +846,22 @@ class JobRunner:
         # still learns nothing about MARP or the coordinator.
         spec = envelope.spec.model_dump(mode="json")
         spec["params"] = prepared_params
+        # Either side can ask for a display, and one asking is enough.
+        #
+        # This used to need BOTH the machine's mode and the job's `watch` flag,
+        # which made the screen saver opt-in per job: a volunteer running in
+        # window mode saw nothing unless whoever queued the work had remembered
+        # a flag they had no reason to set. Now the volunteer's mode is enough
+        # on its own, and a job that asks is enough on its own.
         screen_mode = self._state.screen_mode()
-        if screen_mode != "off" and prepared_params.get("watch") is True:
+
+        # A job asking to be watched on a machine with no mode set gets the
+        # ordinary window. Fullscreen is only ever the volunteer's choice --
+        # nothing queued remotely should be able to take over the screen.
+        if screen_mode == "off" and prepared_params.get("watch") is True:
+            screen_mode = "window"
+
+        if screen_mode != "off":
             spec["params"]["_watch_screen_mode"] = screen_mode
 
         # Create and launch the child.
@@ -628,6 +901,12 @@ class JobRunner:
         # Tell the engine which slot it is pinned to, so device resolution can
         # map it to a GPU (R6).
         params["slot_index"] = slot_index
+        # The number of windows there will actually be, not the ceiling this
+        # machine might grow to. Tiling by the ceiling gave a single running
+        # job a quarter of a screen while the other three quarters sat empty,
+        # because the layout was answering "how many could there be" when the
+        # question is "how many are there".
+        params["slot_count"] = max(1, self._effective_slots)
         params["_job_id"] = envelope.job_id
 
         # Fetch the model and verify it. A job spec's model always carries a
@@ -681,11 +960,22 @@ class JobRunner:
             # Send progress up and read the instruction that comes back. The
             # event batch rides along with it, so logging is not per-line HTTP.
             try:
+                events = job.take_events()
+
+                # A child's warning has to reach the operator, not only MARP.
+                #
+                # Everything a job says travels to the coordinator's event
+                # stream and stopped there, which a volunteer cannot read. The
+                # watch window is what proved how bad that is: it failed to
+                # start on every machine for the life of the feature, said so
+                # in a warning, and every local surface reported healthy.
+                self._surface_warnings(events)
+
                 self._client.post_events(
                     attempt_id=job.attempt_id,
                     worker_id=job.worker_id,
                     lease_epoch=job.lease_epoch,
-                    events=job.take_events(),
+                    events=events,
                 )
                 response = self._client.heartbeat(
                     attempt_id=job.attempt_id,
@@ -713,7 +1003,11 @@ class JobRunner:
 
             # Cancel and abandon both stop this job.
             if is_stop_action(action) and not job.stop_requested:
-                self._state.note_error(f"{action} received for {job.attempt_id}")
+                # A notice, not an error. The coordinator telling a worker to
+                # stop is the control channel working; recording it as an error
+                # left `/status` reporting a fault for the rest of the session
+                # over a job that was cancelled exactly as intended.
+                self._state.note(f"{action} received for {job.attempt_id}")
                 job.request_stop()
 
             # A job that was asked to stop and has not is killed once the grace
@@ -732,6 +1026,28 @@ class JobRunner:
         # is most of what R15's report is for.
         if self._jobs_by_slot:
             self._write_inflight()
+
+    # _surface_warnings()
+    # Puts a child's warnings where the operator can see them.
+    # Inputs: the events taken from one job this pass.
+    # Output: none.
+    # Use this before the batch is posted upstream. A warning is not a fault --
+    # the job carries on -- so it lands in the notice rather than the error.
+    def _surface_warnings(self, events: list[dict[str, Any]]) -> None:
+
+        for event in events:
+            if event.get("kind") != "log":
+                continue
+
+            # The child's `log` events carry their level in the payload the
+            # context wrote; anything below a warning is ordinary chatter and
+            # would drown the one line worth reading.
+            if str(event.get("level", "info")).lower() not in ("warning", "error"):
+                continue
+
+            message = str(event.get("message") or "").strip()
+            if message:
+                self._state.note(message)
 
     # _finish_job()
     # Reports one finished job's outcome and frees its slot.
@@ -852,7 +1168,21 @@ class JobRunner:
         except CoordinatorError as error:
             self._state.note_error(f"could not report result for {job.attempt_id}: {error}")
 
-        # Free the slot and clear the in-flight record.
+            # Keep everything needed to say the same thing again. The outcome
+            # is kept as it was -- a refused yield is retried as a yield, not
+            # downgraded to a failure, because the coordinator refusing a word
+            # today does not make the run a failure.
+            self._unreported.append({
+                "attempt_id": job.attempt_id,
+                "worker_id": job.worker_id,
+                "lease_epoch": job.lease_epoch,
+                "outcome": outcome,
+                "artifacts": delivered,
+                "failure_reason": _failure_reason(outcome, payload),
+                "completed_through_frame": completed_through_frame,
+            })
+
+        # Free the slot and rewrite the in-flight record.
         self._jobs_by_slot.pop(slot_index, None)
         self._write_inflight()
         self._state.set_jobs(self._describe_jobs())
@@ -950,10 +1280,17 @@ class JobRunner:
         return [
             {
                 "attempt_id": job.attempt_id,
+                "job_id": job.spec.get("_job_id"),
                 "slot_index": job.slot_index,
                 "engine": job.spec.get("engine"),
                 "range": job.spec.get("range"),
                 "video_source": (job.spec.get("video") or {}).get("source_name"),
+                # What this piece of work is, in the terms a person would know
+                # it by. The coordinator resolves it at lease time and sends it
+                # on the spec; the worker only passes it along, which is the
+                # same boundary as everything else about a session.
+                "model_name": (job.spec.get("model") or {}).get("name"),
+                "session_context": job.spec.get("session_context"),
                 "progress": job.current_progress(),
                 "stop_requested": job.stop_requested,
                 "yield_requested": job.yield_requested,

@@ -56,6 +56,15 @@ marp-worker = "marp_inference_worker.worker_main:main"
 marp-worker-activate = "marp_inference_worker.installation.activation:main"
 marp-worker-launcher = "marp_inference_worker.installation.launcher:main"
 
+# The watch window's page is part of the package, not a build artifact.
+#
+# It used to be expected in the installer's staged player directory and was
+# never put in one, so `WatchDisplay.start()` refused on every machine and the
+# window had never opened. Shipping it with the module that serves it means no
+# build step can leave it out.
+[tool.setuptools.package-data]
+"marp_inference_worker.watch" = ["live.html", "marp-mark.png"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 

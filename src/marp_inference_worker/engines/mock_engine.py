@@ -79,6 +79,7 @@ class MockEngine(BaseEngine, FrameInferenceCapable):
 
         # Says plainly that it needs no GPU, so a coordinator can route to it
         # on a machine that has none.
+        #
         return {
             "engine": self.engine_name,
             "pipeline": "none",

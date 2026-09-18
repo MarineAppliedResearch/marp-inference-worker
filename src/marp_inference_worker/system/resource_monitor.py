@@ -17,6 +17,10 @@ import shutil
 # sys provides Python runtime version and executable metadata.
 import sys
 
+# Monotonic clock for the network rate, which needs an interval rather than a
+# wall-clock time that can jump.
+import time
+
 # Path provides cross-platform filesystem path handling.
 from pathlib import Path
 
@@ -48,10 +52,68 @@ def get_system_resources() -> dict[str, Any]:
         "python": _get_python_resources(),
         "torch": _get_torch_resources(),
         "nvidia": _get_nvidia_resources(),
+        "network": _get_network_resources(),
         "job_pressure": _get_empty_job_pressure(),
     }
 
     return resources
+
+
+# Bytes sent and received at the last sample, and when it was taken.
+#
+# Module state, because a rate needs two readings and callers ask one at a time.
+# `net_io_counters` is a running total since boot, so a single reading says
+# nothing about now.
+_last_network_sample: dict[str, float] | None = None
+
+
+# Collect network throughput, averaged since the previous call.
+# Inputs: none.
+# Outputs: totals since boot plus a rate covering the interval between calls.
+#
+# A worker pulls video over the network and pushes artifacts back, and on a
+# volunteer's connection that is the resource they will notice before the GPU.
+# The first call has nothing to compare against and reports null rates rather
+# than zero -- zero would read as "no traffic" when it means "no baseline yet".
+def _get_network_resources() -> dict[str, Any]:
+
+    global _last_network_sample
+
+    try:
+        counters = psutil.net_io_counters()
+    except Exception:
+        return {"available": False}
+
+    now = time.monotonic()
+    sent = int(counters.bytes_sent)
+    received = int(counters.bytes_recv)
+
+    sent_per_second: float | None = None
+    received_per_second: float | None = None
+
+    if _last_network_sample is not None:
+        elapsed = now - _last_network_sample["at"]
+
+        # A counter that went backwards means an interface was reset; report no
+        # rate rather than a negative one.
+        if elapsed > 0:
+            sent_delta = sent - _last_network_sample["sent"]
+            received_delta = received - _last_network_sample["received"]
+
+            if sent_delta >= 0 and received_delta >= 0:
+                sent_per_second = sent_delta / elapsed
+                received_per_second = received_delta / elapsed
+
+    _last_network_sample = {"at": now, "sent": sent, "received": received}
+
+    return {
+        "available": True,
+        "bytes_sent": sent,
+        "bytes_received": received,
+        "sent_bytes_per_second": sent_per_second,
+        "received_bytes_per_second": received_per_second,
+    }
+
 
 # Collect NVIDIA GPU telemetry through NVML when available.
 # Inputs: none.

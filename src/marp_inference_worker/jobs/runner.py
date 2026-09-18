@@ -122,6 +122,64 @@ def _failure_reason(outcome: str, payload: dict[str, Any]) -> str | None:
     return " | ".join(parts)[:2000]
 
 
+# Roughly what one running job costs on the GPU, in bytes.
+#
+# Measured, not guessed: a 4500-frame tracking job held 941 MiB on an 8 GB 5060
+# and the same order on a 16 GB 4080. Rounded up to 1.5 GiB so the estimate is
+# wrong in the safe direction -- a model with a larger input size or a busier
+# frame costs more, and over-committing a card is worse than leaving it idle.
+_VRAM_PER_JOB_BYTES = 1536 * 1024 * 1024
+
+
+# The most slots derived capacity will offer on its own.
+#
+# VRAM says a 16 GB card could hold ten jobs. Throughput says otherwise: two
+# concurrent jobs measured 1.7x one job, not 2x, on a card at 14% utilisation,
+# so something contends well before the GPU does -- today the watch display's
+# per-frame handshake, and under it the CPU-side decode and tracking. A machine
+# that accepts ten jobs and runs all ten badly is worse than one that takes four
+# and finishes them, because the pool cannot tell the difference and neither can
+# the volunteer.
+#
+# Raise this when there is a measurement that supports it, not before.
+_MAX_DERIVED_SLOTS = 4
+
+
+# derive_slot_count()
+# Decides how many jobs this machine will run at once.
+# Inputs: none; reads the machine.
+# Output: at least 1.
+#
+# Three limits, and the smallest wins:
+#   * GPU memory, at a measured cost per job
+#   * physical CPU cores, because decode and tracking are CPU-side and a job
+#     starved of cores is slower without using less GPU
+#   * a ceiling, because measured throughput stops scaling before memory does
+#
+# A machine with no CUDA device still gets one slot, so it can run a CPU job
+# that explicitly asked for CPU -- that much of the old behaviour was right.
+def derive_slot_count() -> int:
+
+    devices = device_module.describe_cuda_devices()
+
+    if not devices:
+        return 1
+
+    # Total memory across the cards, since a slot is pinned to a device by
+    # `resolve_device(slot_index)` and the work spreads over what is there.
+    total_vram = sum(int(device.get("total_memory_bytes") or 0) for device in devices)
+
+    by_vram = int(total_vram // _VRAM_PER_JOB_BYTES) if total_vram else 1
+
+    # Leave the machine usable. A volunteer donating a GPU is still typing on
+    # the same computer, and taking every core to feed the card is how donated
+    # hardware stops being donated.
+    physical = os.cpu_count() or 2
+    by_cpu = max(1, physical // 4)
+
+    return max(1, min(by_vram, by_cpu, _MAX_DERIVED_SLOTS))
+
+
 # JobRunner
 # The worker's outbound loop.
 # One instance per worker process. It is single-threaded on purpose: the only
@@ -166,10 +224,16 @@ class JobRunner:
         self._state = worker_state
         self._state.set_screen_mode(screen_mode)
 
-        # One job per GPU slot. A machine with no GPU still gets one slot, so
-        # it can run a CPU job that explicitly asked for CPU.
-        discovered = device_module.cuda_device_count()
-        self._slot_count = slot_count if slot_count is not None else max(1, discovered)
+        # How many jobs this machine will run at once.
+        #
+        # This used to be the number of CUDA devices, which meant a single-card
+        # machine ran exactly one job however large the card was -- and measuring
+        # it showed the card was never the constraint. A 16 GB 4080 running one
+        # job sat at 14% utilisation and under 1 GB of VRAM; a second concurrent
+        # job on the same card raised combined throughput from 28 to 47 frames
+        # per second. So capacity here is about how much of the machine is free,
+        # not how many GPUs are in it.
+        self._slot_count = slot_count if slot_count is not None else derive_slot_count()
 
         # Slot index -> the job running on it. A slot absent from this mapping
         # is free.
@@ -1060,10 +1124,17 @@ class JobRunner:
         return [
             {
                 "attempt_id": job.attempt_id,
+                "job_id": job.spec.get("_job_id"),
                 "slot_index": job.slot_index,
                 "engine": job.spec.get("engine"),
                 "range": job.spec.get("range"),
                 "video_source": (job.spec.get("video") or {}).get("source_name"),
+                # What this piece of work is, in the terms a person would know
+                # it by. The coordinator resolves it at lease time and sends it
+                # on the spec; the worker only passes it along, which is the
+                # same boundary as everything else about a session.
+                "model_name": (job.spec.get("model") or {}).get("name"),
+                "session_context": job.spec.get("session_context"),
                 "progress": job.current_progress(),
                 "stop_requested": job.stop_requested,
                 "yield_requested": job.yield_requested,

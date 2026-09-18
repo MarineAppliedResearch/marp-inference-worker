@@ -74,10 +74,11 @@ action that silently loses work.
       job and only the guard moves. `gpu_jobs.published_attempt_id` must also
       stop being one-shot: its `publishedAttemptId === null` check would let only
       the first segment of a requeued job publish.
-- [ ] **A6 · environment · blocking** — this worker cannot enrol with a
-      hand-minted application token, so bring-up needs an activation code from
-      the coordinator. Requested from the desktop session; not a design question,
-      just a credential I do not have yet.
+- [x] **A6 · environment · blocking** — answered 2026-09-17: an activation code,
+      exchanged at `POST /api/v2/gpu/workers/activate` for a per-machine
+      credential. A hand-minted application token cannot enrol and has not been
+      able to since `MARP_API#190`. Worker 898 enrolled this way against the
+      desktop coordinator and has run three real jobs.
 
 
 ## Decisions
@@ -140,18 +141,28 @@ G3. Not written.
 
 ## Status
 
-- **Gate:** design
-- **Notes:** Issue #20 filed. Branch cut from `develop` at 56cdcff. Nothing
-  implemented. A1, A2 and A3 are answered; A4 and A5 answered. A6 open — waiting on an
-  activation code from the desktop; the token it minted returns 403 on enrol.
-  Worker started once against the live coordinator and was stopped again; it
-  left nothing listening. Token held in `.marp/local/coordinator.md`, verified
-  against the live pool: `GET /api/v2/gpu/workers` answers 200 and shows the
-  desktop's worker. Local venv proven — torch 2.11.0+cu128, CUDA on the RTX
-  5060. The desktop's
-  API is reachable from this network at the address Isaac gave — 200 on root,
-  401 on the GPU family, so the forward and the auth gate are both proven. The
-  family is mounted under `/api/v2/gpu`, not the `/api/gpu` its `path:` fields
-  declare; `registerVersionedRoute` rewrites it. No worker token yet. Networking to the desktop's API
-  is arranged but not yet proven — no live round trip has been run from this
-  machine.
+- **Gate:** verifying
+- **Notes:** All six assumptions answered. Implemented and committed on
+  `20-stop-reports-refused-outcome`; nothing pushed, no PR.
+
+  **Done:** the watch display is decidable by either side (R-watch, Isaac's
+  instruction); engines declare `requires_model` and the mock engine no longer
+  needs weights; `model` and `reduction` are optional on a job spec; `live.html`
+  ships with the package and Chromium falls back to an installed browser;
+  `failure_reason` is null on a yield (R1); the stop path is tested (R5); a
+  refused result survives to be retried at the next start (R3).
+
+  **R2 needs no worker change** — `runner.py` already sends
+  `completed_through_frame`, and a resumed lease already carries the moved
+  `start_frame`. Proven live rather than argued: the desktop stopped a job at
+  400 and the next lease began at exactly 400 with 2600 to go.
+
+  **Not done:** R4's remaining half. A refused result now reaches `/status`
+  through `last_error`, but a watch-display failure happens in the child process
+  and still only reaches the coordinator's event stream. That was the shape that
+  hid the missing page for the life of the feature, and it deserves its own fix
+  rather than being folded in here.
+
+  **Verified live**, two machines on two networks, coordinator at the desktop:
+  three `marp_tracking` jobs on worker 898, weights streamed from MARP, and the
+  watch window drawing boxes over real dive video.

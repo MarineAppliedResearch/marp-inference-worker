@@ -1741,3 +1741,91 @@ def test_a_childs_warning_reaches_the_operator_not_only_the_coordinator(tmp_path
         {"seq": 3, "kind": "log", "level": "info", "message": "frame 400"},
     ])
     assert state.describe()["last_notice"] == "Chromium is missing at C:/x"
+
+
+# test_slots_are_shed_when_a_window_falls_below_real_time()
+# Verifies the live-slot heuristic.
+# Inputs: none.
+# Output: pytest pass/fail result.
+#
+# The derived slot count is a guess from VRAM and cores, and both said 4 on a
+# machine whose honest answer depended on the model and the video. What can be
+# observed is how fast the running jobs are going, and the goal is that every
+# watched window plays at least at real time -- a screen saver at 0.7x is a
+# machine that looks broken to whoever donated it.
+def test_slots_are_shed_when_a_window_falls_below_real_time() -> None:
+    from marp_inference_worker.jobs import runner as runner_module
+
+    class FakeJob:
+        def __init__(self, rate: float) -> None:
+            self._rate = rate
+
+        def current_progress(self):
+            # Past the warm-up, so the rate counts.
+            elapsed = 120.0
+            return {"done": int(self._rate * elapsed), "elapsed_s": elapsed}
+
+    class FakeState:
+        def is_paused(self):
+            return False
+
+        def note_error(self, _message):
+            pass
+
+    live = runner_module.JobRunner.__new__(runner_module.JobRunner)
+    live._slot_count = 4
+    live._effective_slots = 4
+    live._state = FakeState()
+
+    # Four jobs, one of them below real time. One slot is given up.
+    live._jobs_by_slot = {0: FakeJob(30), 1: FakeJob(28), 2: FakeJob(18), 3: FakeJob(26)}
+    assert live._live_slot_count() == 3
+
+    # Still slow: keep shedding, but never below one -- a worker that took no
+    # work at all would be worse than a slow one.
+    live._jobs_by_slot = {0: FakeJob(10)}
+    live._effective_slots = 1
+    assert live._live_slot_count() == 1
+
+    # Comfortably above real time, so another job is allowed. The margin
+    # matters: growing at exactly real time would slow everything below it
+    # again and shed the slot straight back.
+    live._effective_slots = 2
+    live._jobs_by_slot = {0: FakeJob(60), 1: FakeJob(55)}
+    assert live._live_slot_count() == 3
+
+    # Above real time but inside the margin: hold, do not grow.
+    live._effective_slots = 2
+    live._jobs_by_slot = {0: FakeJob(28), 1: FakeJob(27)}
+    assert live._live_slot_count() == 2
+
+
+# test_a_warming_job_does_not_shed_a_slot()
+# Verifies the warm-up guard.
+# Inputs: none.
+# Output: pytest pass/fail result.
+#
+# Loading a model and opening a video take most of the first minute and report
+# a rate near zero. Without this the worker would shed every slot at the start
+# of every run and never take them back.
+def test_a_warming_job_does_not_shed_a_slot() -> None:
+    from marp_inference_worker.jobs import runner as runner_module
+
+    class Warming:
+        def current_progress(self):
+            return {"done": 3, "elapsed_s": 5.0}
+
+    class FakeState:
+        def is_paused(self):
+            return False
+
+        def note_error(self, _message):
+            pass
+
+    live = runner_module.JobRunner.__new__(runner_module.JobRunner)
+    live._slot_count = 4
+    live._effective_slots = 4
+    live._state = FakeState()
+    live._jobs_by_slot = {0: Warming(), 1: Warming()}
+
+    assert live._live_slot_count() == 4

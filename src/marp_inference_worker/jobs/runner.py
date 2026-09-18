@@ -145,6 +145,30 @@ _VRAM_PER_JOB_BYTES = 1536 * 1024 * 1024
 _MAX_DERIVED_SLOTS = 4
 
 
+# The frame rate MARP fixes video time at, and so what "real time" means here.
+#
+# A watched window below this is playing the dive in slow motion. The same 25
+# is `ASSUMED_FPS` in marp-api and was confirmed by measuring `framenum`
+# against `mediaPosition` across all ten videos this corpus holds: 25.01-25.05.
+_REAL_TIME_FPS = 25.0
+
+
+# How far above real time every job must be before another is taken on.
+#
+# Adding a job slows the ones already running, so growing at exactly real time
+# would immediately drop all of them below it and shed the slot again. The
+# margin is what stops that oscillation.
+_SLOT_GROWTH_MARGIN = 1.35
+
+
+# How long a job is left alone before its rate means anything, in seconds.
+#
+# Loading a model and opening a video take most of the first minute and produce
+# a rate near zero. Reacting to that would shed every slot at the start of
+# every run and never take them back.
+_SLOT_WARMUP_S = 60.0
+
+
 # derive_slot_count()
 # Decides how many jobs this machine will run at once.
 # Inputs: none; reads the machine.
@@ -234,6 +258,13 @@ class JobRunner:
         # per second. So capacity here is about how much of the machine is free,
         # not how many GPUs are in it.
         self._slot_count = slot_count if slot_count is not None else derive_slot_count()
+
+        # How many of those slots are actually in use, which is the measured
+        # answer rather than the derived one. Starts at the full count and is
+        # adjusted by `_live_slot_count()` from how fast the jobs are going.
+        # The configured count stays the ceiling and the window layout, so the
+        # tiles do not reshuffle every time a slot is shed or taken back.
+        self._effective_slots = self._slot_count
 
         # Slot index -> the job running on it. A slot absent from this mapping
         # is free.
@@ -438,7 +469,49 @@ class JobRunner:
         # being offered work without needing a separate coordinator concept.
         if self._state.is_paused():
             return 0
-        return self._slot_count - len(self._jobs_by_slot)
+        return self._live_slot_count() - len(self._jobs_by_slot)
+
+    # _live_slot_count()
+    # How many jobs to run at once, given how fast they are actually going.
+    # Inputs: none; reads the running jobs.
+    # Output: between 1 and the configured slot count.
+    #
+    # **Measured, not derived.** The slot count from `derive_slot_count()` is a
+    # guess from VRAM and cores, and both told this machine 4 when the honest
+    # answer depends on the model, the video and the card. What can be observed
+    # is how fast each running job is going, and the goal is a plain one: every
+    # watched window should play at least at real time, because a screen saver
+    # running at 0.7x is a machine that looks broken to the person donating it.
+    #
+    # So: if the slowest running job is below real time, take one fewer job
+    # next time. If every job is comfortably above it, allow one more, up to
+    # what was configured. Warming jobs are ignored -- a model load and a video
+    # open make the first seconds meaningless, and reacting to them would shed
+    # slots at the start of every run.
+    def _live_slot_count(self) -> int:
+
+        rates = [
+            progress["done"] / progress["elapsed_s"]
+            for progress in (job.current_progress() for job in self._jobs_by_slot.values())
+            if progress.get("elapsed_s", 0) > _SLOT_WARMUP_S and progress.get("done")
+        ]
+
+        # Nothing measurable yet: trust what was configured.
+        if not rates:
+            return self._effective_slots
+
+        slowest = min(rates)
+
+        if slowest < _REAL_TIME_FPS and self._effective_slots > 1:
+            self._effective_slots -= 1
+            self._state.note_error(
+                f"slowed to {slowest:.1f} f/s; running {self._effective_slots} job(s) at once "
+                f"so each stays at real time"
+            )
+        elif slowest > _REAL_TIME_FPS * _SLOT_GROWTH_MARGIN and self._effective_slots < self._slot_count:
+            self._effective_slots += 1
+
+        return self._effective_slots
 
     # _next_free_slot()
     # Returns the lowest free slot index.
@@ -465,7 +538,13 @@ class JobRunner:
         # A paused worker has nothing free, however many slots it has.
         if self._state.is_paused():
             return []
-        return [index for index in range(self._slot_count) if index not in self._jobs_by_slot]
+
+        # Bounded by the live count, not the configured one, so a worker that
+        # has shed a slot to keep its windows at real time does not immediately
+        # offer it back on the next poll.
+        live = self._live_slot_count()
+
+        return [index for index in range(live) if index not in self._jobs_by_slot]
 
     # stop()
     # Asks the loop to finish after the current iteration.

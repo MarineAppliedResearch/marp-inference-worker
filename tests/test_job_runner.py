@@ -1883,3 +1883,50 @@ def test_a_warming_job_does_not_shed_a_slot() -> None:
     live._jobs_by_slot = {0: Warming(), 1: Warming()}
 
     assert live._live_slot_count() == 4
+
+
+# test_a_worker_starts_at_one_job_and_grows_into_the_machine()
+# Verifies the ramp direction.
+# Inputs: none.
+# Output: pytest pass/fail result.
+#
+# Both directions converge, but only one is wrong quietly on the way. A machine
+# that starts at its derived ceiling and needs fewer spends minutes running
+# every job at a fraction of speed -- real work, on somebody's donated
+# computer, going slowly for no reason. Starting at one costs a fast machine a
+# short ramp and costs a slow machine nothing.
+#
+# An explicit --slots is believed immediately and does not ramp: somebody who
+# named a number has already decided.
+def test_a_worker_starts_at_one_job_and_grows_into_the_machine(monkeypatch) -> None:
+    from marp_inference_worker.jobs import runner as runner_module
+
+    monkeypatch.setattr(runner_module, "derive_slot_count", lambda: 4)
+
+    derived = runner_module.JobRunner.__new__(runner_module.JobRunner)
+    derived._slot_count = runner_module.derive_slot_count()
+    derived._effective_slots = 1
+
+    # The ceiling is what was derived; the starting point is one.
+    assert derived._slot_count == 4
+    assert derived._effective_slots == 1
+
+    class Fast:
+        def current_progress(self):
+            return {"done": 7200, "elapsed_s": 120.0}   # 60 f/s, far above real time
+
+    class FakeState:
+        def is_paused(self):
+            return False
+
+        def note_error(self, _message):
+            pass
+
+    derived._state = FakeState()
+    derived._jobs_by_slot = {0: Fast()}
+    derived._last_slot_decision_at = 0.0
+
+    # Grows one step at a time, never in a jump, and stops at the ceiling.
+    for expected in (2, 3, 4, 4):
+        derived._last_slot_decision_at = 0.0
+        assert derived._live_slot_count() == expected

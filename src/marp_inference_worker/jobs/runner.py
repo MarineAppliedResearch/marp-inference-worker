@@ -190,9 +190,23 @@ _SLOT_WARMUP_S = 60.0
 
 
 # derive_slot_count()
-# Decides how many jobs this machine will run at once.
+# The most jobs this machine will ever be asked to run at once.
 # Inputs: none; reads the machine.
 # Output: at least 1.
+#
+# **A ceiling, not a target.** The worker starts at one job and grows only
+# while every running job stays above real time, so this number is the limit
+# that growth stops at rather than the number of jobs taken on. That matters
+# because hardware has predicted capacity badly every time it has been asked:
+#
+#   RTX 4080 SUPER 16 GiB   VRAM divisor said 4   measured ~3
+#   RTX 5060 Laptop  8 GiB  VRAM divisor said 4   measured 1
+#
+# The 5060 ran a single job at 0.45x real time while using 941 MiB of 8146 and
+# 9-18% of the card. Nothing about its memory or its core count predicted that;
+# only running it did. Both figures are from 2026-09-18, on Windows, on two
+# discrete Nvidia cards -- which is the whole of the evidence, and a machine
+# with no CUDA device at all has never been measured.
 #
 # Three limits, and the smallest wins:
 #   * GPU memory, at a measured cost per job
@@ -284,7 +298,20 @@ class JobRunner:
         # adjusted by `_live_slot_count()` from how fast the jobs are going.
         # The configured count stays the ceiling and the window layout, so the
         # tiles do not reshuffle every time a slot is shed or taken back.
-        self._effective_slots = self._slot_count
+        # **Starts at one and grows, rather than starting at the ceiling and
+        # shedding.** Both directions converge on the same answer, but only one
+        # of them is wrong quietly on the way: a machine that starts at four and
+        # needs one spends minutes running four jobs badly, and every one of
+        # those jobs is real work going at a quarter speed on somebody's donated
+        # computer. Starting at one costs a fast machine a few minutes of ramp
+        # and costs a slow machine nothing.
+        #
+        # Measured rather than predicted, which is the lesson of the evening:
+        # `cuda_device_count` gave a machine with no GPU a slot it could not
+        # use, the slot index as a device index failed seven jobs, and the VRAM
+        # divisor said four for a 5060 that measures one. The machine says what
+        # it can do if it is allowed to run once.
+        self._effective_slots = 1 if slot_count is None else self._slot_count
 
         # When a slot decision was last made. Zero so the first measurement
         # counts immediately; after that, one decision per interval so each is

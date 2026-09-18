@@ -1,145 +1,128 @@
 ---
-task: MarineAppliedResearch/marp-inference-worker#32
+task: MarineAppliedResearch/marp-inference-worker#31
 repos: [marp-inference-worker]
-status: implementing
+status: verifying
 needs: []
 ---
 
 ## Goal
 
-A volunteer on Linux can enrol their machine. Today they cannot: the worker encrypts its
-credential with Windows DPAPI and raises on any other platform, so activation reaches the
-coordinator, receives a credential, and then dies writing it to disk. The machine is left
-holding a local id and nothing that can authenticate, and the single-use activation code is
-already spent. No Linux worker has ever reached the job loop, and none can until the
-credential has somewhere to live.
+A volunteer running the worker on Linux sees the watch window — the model's annotations drawn
+live over the video it is working on — exactly as a Windows volunteer does. Today they see
+nothing: the browser search looks only for `chrome.exe` under Windows `Program Files`, so
+`_find_chromium()` returns `None`, `start()` raises, and the window has never opened on any
+Linux machine. The window is how a volunteer can tell the worker is doing something real,
+and it is how a wrong model was noticed by eye the one time it happened.
 
 ## Requirements
 
-- **R1** — On a non-Windows platform the worker stores its credential in the state
-  directory with owner-only permissions (0600), and reads it back.
-- **R2** — Windows behaviour is unchanged. DPAPI remains the path on `win32`; this adds a
-  branch rather than replacing one.
-- **R3** — `protect()` states its own threat model in words: what the filesystem protects
-  against, what it does not, and that the reduction from DPAPI is deliberate.
-- **R4** — A credential file created by this path is not readable by another user on the
-  machine, and the permissions are set before the secret reaches the file rather than
-  after.
-- **R5** — A round trip through `save()` and `load()` returns the credential unchanged, and
-  `load()` on a machine that has never activated returns `None` rather than raising.
+- **R1** — On Linux the worker finds a Chromium-family browser and opens the watch window.
+- **R2** — Discovery is **bundled first, system second**, matching Windows, so a packaged
+  build and a development machine take the same path rather than two.
+- **R3** — A browser found through a multi-call wrapper is launched by the name it was found
+  under, not by the target of its symlink.
+- **R4** — Window geometry comes from the real display on Linux, with the single-screen
+  fallback retained for when it cannot be read.
+- **R5** — A finished or killed job closes its own window on Linux, matching on the
+  attempt's profile directory so it can never reach the volunteer's own browser.
+- **R6** — Windows behaviour is unchanged throughout.
 
 ## Open assumptions
 
-- [x] **A1 · security/permissions · blocking** — answered 2026-09-18: how should a Linux
-  worker hold its credential at rest, given Linux has no DPAPI equivalent? **0600 file
-  permissions in the state directory.** Isaac's decision, confirmed directly and relayed
-  through MARP-DESKTOP-DEV. The alternatives were Secret Service/libsecret and a key
-  derived from `/etc/machine-id`. libsecret is the closest analogue to DPAPI but needs an
-  unlocked keyring, which a headless autologin machine does not have — demonstrated on this
-  box today, where GDM autologin left the login keyring locked. *An option that fails on
-  the target hardware is not the more secure option, it is the one that does not ship.* The
-  machine-id derivation was rejected as obfuscation: anything that can read the credential
-  can read `/etc/machine-id`. Isaac attached a condition — the threat model goes in the
-  code, not left implied. That condition is R3.
+- [x] **A1 · environment · blocking** — answered 2026-09-18 by Isaac: this machine had no
+  Chromium-family browser at all, so #31 could not be demonstrated. **Install a system
+  Chromium**, explicitly as an interim measure. His words: *"I don't want a volunteer to have
+  to install fucking things to get this working!!!!! but for now have it go ahead and install
+  the damned chromium browser, but we have to make sure later that we package up everything
+  the user needs."* So the shipped answer is the bundled-snapshot pattern that
+  `packaging/chromium-windows-x64.lock.json` already implements for Windows, pointed at
+  `Linux_x64/<snapshot>/chrome-linux.zip`. That is **not in this branch** — see *Not in
+  scope*.
 
-- [x] **A2 · architectural · blocking** — answered 2026-09-18: does this replace DPAPI or
-  sit alongside it? **Alongside.** A `sys.platform` branch. Windows keeps DPAPI exactly as
-  it is. Confirmed by MARP-DESKTOP-DEV in the issue.
-
-- [x] **A3 · security/permissions · blocking** — answered 2026-09-18 by Isaac: **option 3,
-  weaken it to the round trip only.** Asked twice and confirmed, so it is a decision rather
-  than a slip. The test is renamed `test_credential_round_trip`, because a test named for an
-  assertion it no longer makes is worse than no test — and a comment above it records what
-  was dropped and where the replacement lives.
-
-  Recorded because both I and MARP-DESKTOP-DEV recommended option 2 and were overruled: the
-  cost is that **no test now asserts DPAPI encrypts anything on Windows**. The Linux mode
-  assertion in `tests/test_credential_store.py` does not substitute for it — different
-  guarantee, different platform. If Windows coverage is revisited, that is the gap.
-
-  The question, as originally raised during G2:
-  `tests/test_installed_worker.py:50` is `test_dpapi_credential_round_trip_is_not_plaintext`,
-  and line 56 asserts `secret.encode("utf-8") not in path.read_bytes()` — *the credential is
-  never plaintext on disk*. That is an existing test asserting the exact property A1
-  deliberately gives up on Linux, so on this platform it cannot pass. **What should happen
-  to it?**
-
-  It already fails on `develop` here, before any change of mine, because `protect()` raised
-  rather than returned — so this is not a regression I introduced. But it stops being a
-  platform gap and starts being a contradiction the moment 0600 lands, and it should be
-  settled deliberately rather than left red.
-
-  Three ways, and the choice is a statement about what the test is for:
-  1. **Mark it `skipif(sys.platform != "win32")`.** The function is named for DPAPI and is
-     testing DPAPI; on a platform without DPAPI it is not applicable. Cuts against the
-     testing doctrine's *a skipped suite looks green*, though what is skipped here is
-     genuinely absent rather than merely unavailable.
-  2. **Split it in two** — keep the not-plaintext assertion for `win32`, and assert the
-     0600 property off it. Costs a little duplication with
-     `tests/test_credential_store.py`, which already asserts the Linux half.
-  3. **Weaken the assertion to the round trip only**, dropping the not-plaintext check.
-     Cheapest, and the worst: it silently removes the assertion that DPAPI is doing
-     anything at all on Windows, which is the one thing that test exists to prove.
-
-  My read is **2**, because it keeps the Windows guarantee asserted rather than skipped,
-  and 3 would quietly delete a real security assertion on the platform where it still
-  holds. Not acting on that read — it is a security assertion and the call is Isaac's.
+- [x] **A2 · product/UI · blocking** — answered 2026-09-18 by Isaac: the only display here is
+  a 5120x2880 panel rotated left, so the desktop is 2880x5120 portrait. Is a landscape window
+  on a portrait screen acceptable rather than a reason to hold? **Yes.** So R4 is about
+  reading the real geometry, not about laying out differently for portrait.
 
 ## Decisions
 
-- **2026-09-18** — 0600 file permissions on non-Windows, DPAPI retained on Windows. The
-  threat model is stated in `protect()` rather than implied. Durable enough to promote to a
-  decision record if the credential store is revisited; left here for now because it
-  records one platform branch rather than an architecture.
+- **2026-09-18** — browser discovery asks `PATH` via `shutil.which` before falling back to
+  fixed paths. Linux has no `Program Files` equivalent and a volunteer's browser may be a
+  distribution package, a vendor `.deb`, a snap or a flatpak. The fixed paths remain for a
+  worker started from a service with a minimal environment, where `PATH` is not the whole
+  answer.
 
-- **2026-09-18** — the file is opened with `O_CREAT | O_EXCL` and mode `0o600` so the
-  permissions exist before the secret does. Writing then `chmod`-ing leaves a window where
-  the credential is on disk world-readable, which on a multi-user box is the whole of the
-  defence missing for as long as it takes to run the next line.
+- **2026-09-18** — `_find_chromium()` no longer resolves a candidate whose resolved basename
+  differs from the name it was found under. `/snap/bin/chromium` is a symlink to
+  `/usr/bin/snap`, which reads `argv[0]` to decide which snap to run: resolving it launches
+  the snap tool with Chromium's arguments and nothing appears. This was found by running it,
+  not by reading it — the first attempt returned `/usr/bin/snap` and opened no window.
+
+- **2026-09-18** — window cleanup on Linux is `pkill -f <profile path>`. Matching the profile
+  directory rather than the process name is what keeps it off the volunteer's own browser,
+  and that matters more here than on Windows because the system Chromium the worker borrows
+  may be the browser they are reading the instructions in.
+
+- **2026-09-18** — raising the window and idle detection are left as no-ops on Linux, as
+  advised. They are polish and they are not worth blocking the port on.
 
 ## Plan
 
-1. Branch `32-linux-credential-store` off `develop` at `1d0f50f`. *(done)*
-2. Add the non-Windows branch to `protect()` and `unprotect()`, with the threat model
-   written into `protect()`.
-3. Make `save()` create the file with 0600 from the moment it exists, not after.
-4. Tests at the tier that can see it: a round trip, the permission bits, `load()` on a
-   machine that never activated, and that the Windows path is untouched.
-5. Report to MARP-DESKTOP-DEV before activating — worker 1081 holds this machine's
-   `local_id`, so a fresh activation returns 409 until that row is cleared.
+1. Branch **from `32-linux-credential-store`, not `develop`** — stacked deliberately. Without
+   #32 a Linux worker cannot read its credential at startup, so a `develop`-based branch
+   could not be run at all on the machine this was developed and tested on. *(done)*
+2. Linux browser discovery in `_find_chromium()`, bundled first. *(done)*
+3. Stop resolving multi-call wrappers. *(done)*
+4. `xrandr --listmonitors` branch in `_monitors()`, ahead of the existing fallback. *(done)*
+5. Linux branch in `_kill_by_profile()`. *(done)*
+6. Tests for each. *(done)*
 
 ## Acceptance criteria
 
-- `marp-worker-activate` completes on Linux and leaves a credential the worker can read.
-- The credential file is `-rw-------`.
-- `unprotect(protect(x)) == x` on Linux.
-- `load()` returns `None`, not an exception, before first activation.
-- No change to behaviour on `win32`.
+- The watch window opens on Linux during a real job. **Met** — observed on attempt 5043,
+  with `browser-render-proof.jpg` written and Chromium running as pid 20041.
+- `_find_chromium()` returns a launchable path on a snap-based Ubuntu. **Met** — returns
+  `/snap/bin/chromium`, not `/usr/bin/snap`.
+- `_monitors()` reports the real desktop. **Met** — `[(0, 0, 2880, 5120)]` on the rotated 5K
+  panel, where the fallback would have said 1920x1080.
+- A finished job leaves no window. **Not directly observed** — see below.
+- Windows unchanged. **Not executable here.**
 
 ## Test plan
 
-Filled at G3. Targeted at `tests/` for the credential store only — not the whole suite,
-per the testing doctrine. The Windows path cannot be executed here, so R2 is covered by
-asserting the branch is not taken rather than by running DPAPI, and that limit is stated
-rather than left to look like coverage.
+`tests/test_watch_display.py`, six added tests, run as a file rather than as a suite:
+browser found on `PATH`; a multi-call wrapper not resolved; `xrandr` parsed into rectangles;
+the fallback when `xrandr` is absent; `pkill` invoked with the profile path; and nothing
+invoked when there is no profile. 24 passed, up from 18.
+
+**What these do not prove**, stated rather than left to look like coverage:
+- **R5 is proven at the wrong tier.** The test asserts `pkill` is *called with* the profile
+  path. It does not assert a window actually disappeared, because that needs a real window
+  and a real desktop. The failure mode #29 describes could still exist here.
+- **R6 is not proven at all.** Windows cannot be executed on this machine. Every change is a
+  `sys.platform` branch that returns before the Windows code, but the Windows path has not
+  been run.
+
+## Not in scope
+
+- **The bundled Chromium snapshot for Linux**, which is the actual answer to A1 and is the
+  difference between this working for a developer and working for a volunteer. Needs a
+  `chromium-linux-x64.lock.json` alongside the Windows one.
+- **Snap confinement is untested and may matter.** The browser used here is the Chromium
+  snap, which is AppArmor-confined. It rendered the page from the package directory under
+  `$HOME` and it worked, but a confined snap is a poor stand-in for the bundled build, and
+  it could pass here and fail for a volunteer, or the reverse.
+- **Raising and idle detection**, left as no-ops by decision.
+- **#29**, orphaned windows from a previous run, which is `marp-laptop`'s branch.
 
 ## Status
 
-- **Gate:** implementing (A3 answered; R1–R5 complete)
-- **Notes:** R1–R5 are implemented and committed on this branch, and
-  `tests/test_credential_store.py` is 8/8 green. Proven red first: 7 of those 8 fail against
-  the original module, the eighth being `load()` before activation, which never reaches the
-  DPAPI call and passes either way.
+- **Gate:** verifying
+- **Notes:** written **after** implementation rather than before it, which is not the order
+  the harness asks for. Both assumptions had been answered by Isaac beforehand, so no
+  blocking assumption was open while the code was written, but the spec did not exist at
+  G1 and this note is here rather than left for someone to notice.
 
-  **A3** turned up during G2, went back to Isaac, and is answered. The contradicting test is
-  weakened to the round trip and renamed. `tests/test_installed_worker.py` now runs 11 passed
-  where it ran 3 failed, 2 passed on `develop`.
-
-  Not verified end to end: activation cannot be retested until MARP-DESKTOP-DEV clears
-  worker 1081 and mints a new code — the previous one is spent. So the first acceptance
-  criterion is unproven, and the tests here cover the store rather than the enrolment.
-
-  Found and left alone, in `tests/test_installed_worker.py` and pre-dating this branch:
-  `test_update_is_verified_and_staged_beside_the_active_release` and
-  `test_update_rejects_path_traversal` both fail on `develop` here. Unrelated to the
-  credential store and not investigated.
+  Found and left alone: `test_slots_fill_the_monitors_before_they_are_subdivided` is defined
+  twice in `tests/test_watch_display.py`, at lines 318 and 660. The second shadows the first,
+  so one of them has never run. Pre-dates this branch.

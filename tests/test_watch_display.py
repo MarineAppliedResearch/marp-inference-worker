@@ -869,3 +869,154 @@ def test_closing_kills_the_browser_even_when_the_launched_process_has_gone(
     # volunteer's browser or another slot's window.
     query = next(" ".join(call) for call in calls if "Win32_Process" in " ".join(call))
     assert "chromium-profile" in query
+
+
+# Verifies that a Linux volunteer's browser is found.
+# Inputs: pytest monkeypatch.
+# Output: pytest pass/fail result.
+#
+# _find_chromium() looked only for chrome.exe under Windows Program Files, so on
+# Linux it returned None and the watch window never opened at all. Refs #31.
+def test_find_chromium_finds_a_linux_browser_on_path(monkeypatch, tmp_path) -> None:
+    from marp_inference_worker.watch import display as display_module
+
+    browser = tmp_path / "chromium"
+    browser.write_text("#!/bin/sh\n")
+
+    monkeypatch.delenv("MARP_CHROMIUM_PATH", raising=False)
+    monkeypatch.setattr(display_module.sys, "platform", "linux")
+    monkeypatch.setattr(
+        display_module.shutil,
+        "which",
+        lambda name: str(browser) if name == "chromium" else None,
+    )
+
+    assert display_module.WatchDisplay._find_chromium() == browser
+
+
+# Verifies a snap wrapper is launched by the name it was found under.
+# Inputs: pytest monkeypatch, tmp_path.
+# Output: pytest pass/fail result.
+#
+# /snap/bin/chromium is a symlink to /usr/bin/snap, which reads argv[0] to decide
+# which snap to run. Resolving it hands Chromium's arguments to the snap tool and
+# nothing opens. This is the real layout on an Ubuntu box with the chromium snap,
+# and it is the difference between a window and silence. Refs #31.
+def test_find_chromium_does_not_resolve_a_multi_call_wrapper(monkeypatch, tmp_path) -> None:
+    from marp_inference_worker.watch import display as display_module
+
+    real_tool = tmp_path / "snap"
+    real_tool.write_text("#!/bin/sh\n")
+    wrapper = tmp_path / "chromium"
+    wrapper.symlink_to(real_tool)
+
+    monkeypatch.delenv("MARP_CHROMIUM_PATH", raising=False)
+    monkeypatch.setattr(display_module.sys, "platform", "linux")
+    monkeypatch.setattr(
+        display_module.shutil,
+        "which",
+        lambda name: str(wrapper) if name == "chromium" else None,
+    )
+
+    found = display_module.WatchDisplay._find_chromium()
+
+    assert found == wrapper
+    assert found.name == "chromium"
+
+
+# Verifies the monitor geometry comes from xrandr on Linux.
+# Inputs: pytest monkeypatch.
+# Output: pytest pass/fail result.
+#
+# Without this the fallback assumed one 1920x1080 screen, which on the rotated
+# 2880x5120 desktop this was first run on sized every window for the wrong
+# display. Refs #31.
+def test_monitors_reads_xrandr_on_linux(monkeypatch) -> None:
+    from marp_inference_worker.watch import display as display_module
+
+    listing = (
+        "Monitors: 2\n"
+        " 0: +*HDMI-3 2880/600x5120/340+0+0  HDMI-3\n"
+        " 1: +DP-1 1920/520x1080/290+2880+0  DP-1\n"
+    )
+    monkeypatch.setattr(display_module.sys, "platform", "linux")
+    monkeypatch.setattr(
+        display_module.subprocess,
+        "run",
+        lambda *a, **k: SimpleNamespace(stdout=listing, stderr="", returncode=0),
+    )
+
+    assert display_module._monitors() == [
+        (0, 0, 2880, 5120),
+        (2880, 0, 1920, 1080),
+    ]
+
+
+# Verifies a worker still draws when the displays cannot be enumerated.
+# Inputs: pytest monkeypatch.
+# Output: pytest pass/fail result.
+#
+# A pure Wayland session with no XWayland has no xrandr to answer. Showing a
+# window on an assumed screen beats showing nothing. Refs #31.
+def test_monitors_falls_back_to_one_screen_when_xrandr_is_absent(monkeypatch) -> None:
+    from marp_inference_worker.watch import display as display_module
+
+    def explode(*a, **k):
+        raise FileNotFoundError("xrandr")
+
+    monkeypatch.setattr(display_module.sys, "platform", "linux")
+    monkeypatch.setattr(display_module.subprocess, "run", explode)
+
+    assert display_module._monitors() == [(0, 0, 1920, 1080)]
+
+
+# Verifies a finished job's window is closed on Linux.
+# Inputs: pytest monkeypatch, tmp_path.
+# Output: pytest pass/fail result.
+#
+# The cleanup shelled out to powershell.exe and taskkill and returned early off
+# Windows, which was correct only while no window could open there. Matching on
+# the attempt's own profile directory rather than the process name is what keeps
+# it off the volunteer's own browser -- which on Linux may be the very Chromium
+# the worker borrowed. Refs #31, and the fault #29 describes.
+def test_kill_by_profile_closes_the_window_on_linux(monkeypatch, tmp_path) -> None:
+    from marp_inference_worker.watch import display as display_module
+
+    profile = tmp_path / "chromium-profile"
+    profile.mkdir()
+    calls = []
+
+    monkeypatch.setattr(display_module.sys, "platform", "linux")
+    monkeypatch.setattr(
+        display_module.subprocess,
+        "run",
+        lambda args, **k: calls.append(args) or SimpleNamespace(returncode=0),
+    )
+
+    display_module.WatchDisplay._kill_by_profile(
+        SimpleNamespace(_profile_dir=profile)
+    )
+
+    assert calls == [["pkill", "-f", str(profile)]]
+
+
+# Verifies the cleanup does nothing when there is no profile to match.
+# Inputs: pytest monkeypatch, tmp_path.
+# Output: pytest pass/fail result.
+#
+# A bare `pkill -f` with an empty needle would match far too much, so the guard
+# that returns early matters more than it looks. Refs #31.
+def test_kill_by_profile_does_nothing_without_a_profile(monkeypatch) -> None:
+    from marp_inference_worker.watch import display as display_module
+
+    calls = []
+    monkeypatch.setattr(display_module.sys, "platform", "linux")
+    monkeypatch.setattr(
+        display_module.subprocess,
+        "run",
+        lambda args, **k: calls.append(args) or SimpleNamespace(returncode=0),
+    )
+
+    display_module.WatchDisplay._kill_by_profile(SimpleNamespace(_profile_dir=None))
+
+    assert calls == []

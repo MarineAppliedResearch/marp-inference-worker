@@ -4,6 +4,9 @@ import base64
 import json
 import math
 import os
+# shutil.which finds a volunteer's browser on PATH, which is how Linux answers
+# the question Program Files answers on Windows.
+import shutil
 import subprocess
 import sys
 import threading
@@ -93,6 +96,51 @@ def _monitors() -> list[tuple[int, int, int, int]]:
             # Any failure here falls through to the single-screen assumption.
             # A worker must not refuse to draw because it could not enumerate
             # displays.
+            pass
+
+    # Linux, via xrandr. Answers under X and under XWayland, which is most
+    # desktops; a pure Wayland session with no XWayland will not, and falls
+    # through to the single screen below.
+    #
+    # `--listmonitors` reports each monitor as `WIDTH/mm x HEIGHT/mm + X + Y`,
+    # already in the rotated logical geometry rather than the panel's native
+    # mode -- which is what tiling wants, since a rotated 5120x2880 screen is a
+    # 2880x5120 desktop.
+    if sys.platform.startswith("linux"):
+        try:
+            listing = subprocess.run(
+                ["xrandr", "--listmonitors"],
+                capture_output=True, text=True, timeout=10, check=False,
+            )
+            found: list[tuple[int, int, int, int]] = []
+            for line in (listing.stdout or "").splitlines():
+                parts = line.split()
+                # A monitor line is ` 0: +*HDMI-3 2880/600x5120/340+0+0  HDMI-3`;
+                # the geometry is the field carrying both an `x` and a `+`.
+                geometry = next(
+                    (p for p in parts if "x" in p and "+" in p and "/" in p), None
+                )
+                if geometry is None:
+                    continue
+                size, _, offsets = geometry.partition("+")
+                width_text, _, height_text = size.partition("x")
+                offset_x, _, offset_y = offsets.partition("+")
+                try:
+                    found.append((
+                        int(offset_x),
+                        int(offset_y),
+                        int(width_text.split("/")[0]),
+                        int(height_text.split("/")[0]),
+                    ))
+                except ValueError:
+                    continue
+
+            if found:
+                return sorted(found, key=lambda rect: (rect[0], rect[1]))
+
+        except Exception:
+            # Same rule as the Windows branch: never refuse to draw because the
+            # displays could not be enumerated.
             pass
 
     # One screen, conservative size. Wrong on a large display only in that the
@@ -851,7 +899,40 @@ class WatchDisplay:
             candidate = Path(configured).resolve()
             return candidate if candidate.is_file() else None
 
-        candidates = [WatchDisplay._install_root() / "chromium" / "chrome.exe"]
+        # The bundled copy first on every platform, so a packaged build and a
+        # development machine take the same path rather than two.
+        candidates = [
+            WatchDisplay._install_root() / "chromium" / "chrome.exe",
+            WatchDisplay._install_root() / "chromium" / "chrome",
+        ]
+
+        # Linux has no equivalent of Program Files, and a volunteer's browser can
+        # be a distribution package, a vendor .deb or a snap. Ask PATH rather than
+        # guessing directories, then fall back to the paths PATH misses when the
+        # worker runs from a service with a minimal environment.
+        if sys.platform.startswith("linux"):
+            for name in (
+                "chromium",
+                "chromium-browser",
+                "google-chrome",
+                "google-chrome-stable",
+                "microsoft-edge",
+                "brave-browser",
+            ):
+                found = shutil.which(name)
+                if found:
+                    candidates.append(Path(found))
+
+            candidates.extend(
+                Path(p)
+                for p in (
+                    "/usr/bin/chromium",
+                    "/usr/bin/chromium-browser",
+                    "/usr/bin/google-chrome",
+                    "/snap/bin/chromium",
+                    "/var/lib/flatpak/exports/bin/org.chromium.Chromium",
+                )
+            )
 
         if sys.platform == "win32":
             program_files = [
@@ -864,8 +945,17 @@ class WatchDisplay:
                 candidates.append(Path(base) / "Microsoft" / "Edge" / "Application" / "msedge.exe")
 
         for candidate in candidates:
-            if candidate.is_file():
-                return candidate.resolve()
+            if not candidate.is_file():
+                continue
+
+            # Resolving is right for a plain symlink and wrong for a multi-call
+            # wrapper. `/snap/bin/chromium` is a symlink to `/usr/bin/snap`, which
+            # reads argv[0] to decide which snap to run -- so the resolved path
+            # launches the snap tool with Chromium's arguments and fails, while
+            # the unresolved one launches Chromium. Keep the name we found it by
+            # whenever resolving would change it.
+            resolved = candidate.resolve()
+            return resolved if resolved.name == candidate.name else candidate
         return None
 
     def start(self) -> bool:
@@ -1076,7 +1166,32 @@ class WatchDisplay:
     # a window that will not die must not stop a job being reported.
     def _kill_by_profile(self) -> None:
 
-        if sys.platform != "win32" or self._profile_dir is None:
+        if self._profile_dir is None:
+            return
+
+        # Same rule as the Windows branch below, by the only mechanism Linux has:
+        # match the command line on this attempt's own profile directory. Matching
+        # on the process name instead would kill the volunteer's own browser, and
+        # on a Linux box that is more likely than on Windows -- the system
+        # Chromium the worker borrows may be the one they are reading in.
+        #
+        # Without this a finished job leaves its window on screen, which is the
+        # fault #29 describes on Windows and would arrive here the moment
+        # _find_chromium() learned Linux.
+        if sys.platform.startswith("linux"):
+            try:
+                subprocess.run(
+                    ["pkill", "-f", str(self._profile_dir)],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    timeout=20, check=False,
+                )
+            except Exception:
+                # Cleanup is best effort. A worker must not fail a job because it
+                # could not tidy a window.
+                pass
+            return
+
+        if sys.platform != "win32":
             return
 
         # Matched on the profile path, which is this attempt's own directory, so

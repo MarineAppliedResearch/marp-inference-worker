@@ -80,16 +80,10 @@ class MockEngine(BaseEngine, FrameInferenceCapable):
         # Says plainly that it needs no GPU, so a coordinator can route to it
         # on a machine that has none.
         #
-        # And no model. This engine performs no inference, so weights are not
-        # merely unnecessary, there are none to name -- the runner used to fetch
-        # and verify one regardless, which made the engine whose whole purpose
-        # is proving the round trip on a bare machine the one engine a bare
-        # machine could not run.
         return {
             "engine": self.engine_name,
             "pipeline": "none",
             "requires_gpu": False,
-            "requires_model": False,
             "purpose": "contract and runner testing; performs no inference",
         }
 

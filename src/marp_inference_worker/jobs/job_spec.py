@@ -142,11 +142,13 @@ class JobSpec(BaseModel):
 
     # Model to run, with the hash the worker verifies.
     #
-    # Optional because an engine that performs no inference has no weights to
-    # name. Required in practice for every engine that does, and the runner
-    # still refuses a model without a sha256 -- this only stops a `mock` job
-    # being rejected at parse time for lacking something it cannot have.
-    model: ModelRef | None = None
+    # Required for every engine, mock included. This was briefly optional so a
+    # machine with no weights could run `mock`, on the reasoning that an engine
+    # performing no inference has none to name. That case does not exist: mock
+    # is test scaffolding rather than something a volunteer runs, and the
+    # worker's own tests already hand it a model. Isaac settled it -- every
+    # engine takes a model, and mock takes a mock one.
+    model: ModelRef
 
     # Video the frames come from.
     video: VideoRef
@@ -159,10 +161,7 @@ class JobSpec(BaseModel):
     params: dict[str, Any] = Field(default_factory=dict)
 
     # Keyframe reduction rule to apply to finished tracks.
-    #
-    # Optional for the same reason as `model`: an engine producing no tracks has
-    # nothing to reduce.
-    reduction: ReductionRef | None = None
+    reduction: ReductionRef
 
 
 # AttemptEnvelope

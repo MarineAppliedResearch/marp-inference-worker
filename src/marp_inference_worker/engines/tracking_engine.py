@@ -105,7 +105,6 @@ class TrackingEngine(BaseEngine):
             "ultralytics_version": UltralyticsEngine.ultralytics_version(),
             "tracker": "bytetrack",
             "requires_gpu": True,
-            "requires_model": True,
             "reductions": keyframe_reduction.available_reductions(),
         }
 

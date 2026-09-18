@@ -25,7 +25,6 @@ import json
 import time
 
 # Path types the state directory.
-import typing
 from pathlib import Path
 
 # Any types the fake coordinator's payloads.
@@ -1057,21 +1056,9 @@ def test_worker_never_receives_a_push_address(tmp_path: Path) -> None:
         assert not (set(model.model_fields) & forbidden), model.__name__
 
     # Nor in the nested models the spec is built from.
-    #
-    # `model` and `reduction` are optional -- an engine that performs no
-    # inference names neither -- so their annotation is a union and the real
-    # model has to be unwrapped out of it. Unwrapped rather than skipped: an
-    # optional field is exactly as capable of carrying a callback url as a
-    # required one, and skipping it would quietly stop checking two of the four.
-    def nested_model(field_name: str) -> type:
-        annotation = JobSpec.model_fields[field_name].annotation
-        for arg in typing.get_args(annotation) or (annotation,):
-            if arg is not type(None):
-                return arg
-        raise AssertionError(f"{field_name} has no model behind it")
-
     for nested in ("model", "video", "range", "reduction"):
-        assert not (set(nested_model(nested).model_fields) & forbidden), nested
+        annotation = JobSpec.model_fields[nested].annotation
+        assert not (set(annotation.model_fields) & forbidden), nested
 
     # There are exactly two urls in the whole contract and both are outbound
     # fetches: where the worker GOES to get a model artifact, and where it GOES
@@ -1080,10 +1067,10 @@ def test_worker_never_receives_a_push_address(tmp_path: Path) -> None:
     # a callback address could. This allowance was widened from one url to two
     # when A8 moved video resolution to the coordinator; it must not be widened
     # again without the same argument about direction.
-    model_ref = nested_model("model")
+    model_ref = JobSpec.model_fields["model"].annotation
     assert "url" in model_ref.model_fields
 
-    video_ref = nested_model("video")
+    video_ref = JobSpec.model_fields["video"].annotation
     assert "url" in video_ref.model_fields
 
     urls_elsewhere = [
@@ -1096,8 +1083,8 @@ def test_worker_never_receives_a_push_address(tmp_path: Path) -> None:
 
     # And nowhere else at all: those two are the only ones.
     for nested in ("range", "reduction"):
-        fields = nested_model(nested).model_fields
-        assert not [name for name in fields if "url" in name.lower()], nested
+        annotation = JobSpec.model_fields[nested].annotation
+        assert not [name for name in annotation.model_fields if "url" in name.lower()], nested
 
     # The video's url is the only one it may carry -- a second url field there
     # would be somewhere to hide a callback address.

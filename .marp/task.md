@@ -32,17 +32,16 @@ action that silently loses work.
 
 ## Open assumptions
 
-- [ ] **A1 · API contract · blocking** — what does a worker report when an
-      operator stops a job mid-run?
-      **(a)** the coordinator's vocabulary grows a fourth outcome, `yielded` — a
-      run stopped early with real work in it is a distinct thing from a cancel,
-      and ingest keys on it directly; or
-      **(b)** the worker reports `cancelled`, and the partial-work signal is
-      carried entirely by `completed_through_frame`.
-      Either answer requires `completed_through_frame` to be read and stored, and
-      the ingest condition to stop keying on `succeeded` alone — both on the
-      `MARP_API` side, both a migration. Settled before implementation, not
-      during it.
+- [x] **A1 · API contract · blocking** — answered 2026-09-17: **(a)**. The
+      coordinator's vocabulary grows a fourth outcome, `yielded`. A run stopped
+      early with real work in it is a distinct thing from a cancel, and ingest
+      keys on it directly rather than on a nullable frame number. Rejected: (b),
+      reporting `cancelled` and carrying the whole signal in
+      `completed_through_frame` — `cancelled` already means "called off, nothing
+      to keep", and overloading it makes the ingest condition depend on a number
+      rather than on what happened. → ADR in the umbrella before this merges; it
+      spans two repositories.
+
 - [ ] **A2 · cross-repository · blocking** — R3 changes what a worker does with
       an attempt the coordinator refused. If it keeps the in-flight record and
       reports it at restart, the coordinator sees a second result call for an
@@ -52,6 +51,11 @@ action that silently loses work.
 
 ## Decisions
 
+- **2026-09-17** — A stop reports `yielded`, a fourth outcome, rather than
+  reusing `cancelled`. Isaac's call, answering A1. The point of no return is
+  `MARP_API`'s migration: the check constraint on `gpu_job_attempts.outcome`
+  spells its vocabulary out, so adding the word is a migration and removing it
+  later is another one.
 - **2026-09-17** — Worker side and API side are split: this branch changes
   `runner.py`, `operator_control.py`, `worker_state.py` and `watch/` only. The
   outcome vocabulary, the `completed_through_frame` column and the ingest
@@ -62,7 +66,14 @@ action that silently loses work.
 
 ## Plan
 
-Not started — A1 is open and blocking, and it decides what R1 and R2 are.
+A1 is settled, A2 is not. Ordered, and the first two are the whole of R1/R2 here:
+
+1. `runner.py` reports `yielded` only once `MARP_API` accepts it — the two land
+   together or the worker is broken against a coordinator that has not shipped.
+2. Send `completed_through_frame` as it already computes it, and assert it.
+3. R3: keep the in-flight record when the result call is refused, so the attempt
+   is reported at restart instead of expiring. Blocked on A2.
+4. R4: surface a refused stop to the operator.
 
 ## Acceptance criteria
 
@@ -82,6 +93,6 @@ G3. Not written.
 
 - **Gate:** design
 - **Notes:** Issue #20 filed. Branch cut from `develop` at 56cdcff. Nothing
-  implemented; A1 and A2 are open and blocking. Networking to the desktop's API
+  implemented. A1 is answered; A2 is open and blocking. Networking to the desktop's API
   is arranged but not yet proven — no live round trip has been run from this
   machine.

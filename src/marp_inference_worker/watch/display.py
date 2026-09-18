@@ -323,6 +323,7 @@ def _bring_to_front(process_id: int, attempts: int = 40) -> None:
         return
 
     handle = found[0]
+
     try:
         # Shown, not maximised.
         #
@@ -333,11 +334,53 @@ def _bring_to_front(process_id: int, attempts: int = 40) -> None:
         # only the last one visible. The geometry is already the whole monitor
         # when there is a screen per slot, which is what maximising was for.
         user32.ShowWindow(handle, 1)          # SW_SHOWNORMAL
-        user32.SetForegroundWindow(handle)
+
+        # **`SetForegroundWindow` alone does not work from here, and silently.**
+        #
+        # Windows refuses it from a process that does not already own the
+        # foreground -- which a background worker never does -- and the refusal
+        # is a `False` return nobody was reading. The windows were tiled
+        # correctly and sat behind whatever the volunteer had open, which is
+        # the same as not opening them.
+        #
+        # Two mechanisms together, because either alone leaves a case:
+        #
+        #  1. Z-order. `HWND_TOPMOST` then `HWND_NOTOPMOST` lifts the window
+        #     above every ordinary window without leaving it permanently on
+        #     top -- a screen saver that could never be covered would be worse
+        #     than one that is hard to find.
+        #  2. Focus. Attaching this thread's input queue to the foreground
+        #     window's thread makes Windows treat the call as coming from the
+        #     active application, which is what lifts the restriction. Detached
+        #     again immediately; leaving them attached couples the two threads'
+        #     input state for the life of the process.
+        HWND_TOPMOST = -1
+        HWND_NOTOPMOST = -2
+        SWP_NOMOVE = 0x0002
+        SWP_NOSIZE = 0x0001
+        SWP_NOACTIVATE = 0x0010
+        flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE
+
+        user32.SetWindowPos(handle, HWND_TOPMOST, 0, 0, 0, 0, flags)
+        user32.SetWindowPos(handle, HWND_NOTOPMOST, 0, 0, 0, 0, flags)
         user32.BringWindowToTop(handle)
+
+        foreground = user32.GetForegroundWindow()
+        our_thread = ctypes.windll.kernel32.GetCurrentThreadId()
+        their_thread = user32.GetWindowThreadProcessId(foreground, None)
+
+        if their_thread and their_thread != our_thread:
+            user32.AttachThreadInput(our_thread, their_thread, True)
+            try:
+                user32.SetForegroundWindow(handle)
+            finally:
+                user32.AttachThreadInput(our_thread, their_thread, False)
+        else:
+            user32.SetForegroundWindow(handle)
+
     except Exception:
-        # Windows refuses SetForegroundWindow from a process that does not own
-        # the foreground. The window is still placed and still there.
+        # Best effort throughout. A window that will not raise is worth less
+        # than the job it is showing, so nothing here may raise.
         pass
 
 

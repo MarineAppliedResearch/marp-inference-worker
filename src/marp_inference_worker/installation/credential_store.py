@@ -119,7 +119,14 @@ def save(path: Path, credential: str) -> None:
     # means we never write into a file somebody else made and left readable.
     #
     # The mode is ignored on Windows, where DPAPI is the protection and this is just a file.
-    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    #
+    # O_BINARY is required on Windows and does not exist elsewhere, hence the getattr.
+    # Without it `os.open` gives a text-mode descriptor, which translates every 0x0A on the
+    # way out to 0x0D 0x0A -- and DPAPI ciphertext is binary, so the credential is corrupted
+    # on write and CryptUnprotectData fails at startup with "The data is invalid". Found by
+    # running the Windows suite, not by reading this: 010a020a0a03 came back 010d0a020d0a0d0a03.
+    binary = getattr(os, "O_BINARY", 0)
+    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | binary, 0o600)
     try:
         os.write(descriptor, protect(credential))
     finally:

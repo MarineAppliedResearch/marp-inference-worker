@@ -65,14 +65,21 @@ def test_credential_is_never_briefly_world_readable(credential_path, monkeypatch
     def recording_open(path, flags, mode=0o777, *args, **kwargs):
         if str(path).endswith(".tmp"):
             observed["mode"] = mode
-            observed["exclusive"] = bool(flags & os.O_EXCL)
+            observed["flags"] = flags
         return real_open(path, flags, mode, *args, **kwargs)
 
     monkeypatch.setattr(os, "open", recording_open)
     credential_store.save(credential_path, CREDENTIAL)
 
     assert observed["mode"] == 0o600
-    assert observed["exclusive"] is True
+    assert observed["flags"] & os.O_EXCL
+
+    # The full set, so dropping a flag is a failure rather than a silent change.
+    # O_BINARY is the one that matters and is the one this platform cannot see: it is 0
+    # off Windows, where a text-mode descriptor would translate 0x0A to 0x0D 0x0A and
+    # corrupt DPAPI ciphertext on write. Only the Windows suite can observe that.
+    expected = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
+    assert observed["flags"] == expected
 
 
 # R1 -- re-activating replaces the credential rather than refusing, and the replacement is

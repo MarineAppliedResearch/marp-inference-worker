@@ -45,8 +45,12 @@ cd MARP_API && npm run dev                    # port 3000, branch checked out
 # an activation code, from a signed-in user (not a service token):
 #   POST /api/v2/gpu/worker-activation-codes
 cd ../marp-inference-worker
-MARP_COORDINATOR_URL=http://localhost:3000   ./.venv312/Scripts/python.exe -m marp_inference_worker.worker_main   --activate-code-file <file holding the code>
-MARP_COORDINATOR_URL=http://localhost:3000   ./.venv312/Scripts/python.exe -m marp_inference_worker.worker_main
+MARP_COORDINATOR_URL=http://localhost:3000 \
+  ./.venv312/Scripts/python.exe -m marp_inference_worker.worker_main \
+  --activate-code-file <file holding the code>
+# then, with no token in the environment at all:
+MARP_COORDINATOR_URL=http://localhost:3000 \
+  ./.venv312/Scripts/python.exe -m marp_inference_worker.worker_main
 ```
 
 **Activation, not a hand-minted token, and this is not a preference.** An
@@ -68,7 +72,9 @@ environment at all** -- the worker loads its own. The token script is still
 right for a service consumer that only reads.
 
 The worker's own loopback API is on `127.0.0.1:8010`. Confirm enrolment with
-`GET /api/v2/gpu/workers` using the token.
+`GET /api/v2/gpu/workers` as a signed-in user. Note that reading the pool and
+enrolling into it are gated differently -- this line used to say "using the
+token", which is what made a minted token look like it worked.
 
 ## What is proven
 
@@ -95,9 +101,10 @@ All four were invisible with one computer.
 
 ## What is NOT proven — start here
 
-1. **The job round trip.** lease → progress → cancel → result → artifact has
-   never run. The `mock` engine needs no GPU, so this is the cheapest next step
-   and it exercises nine of the twelve routes.
+1. ~~**The job round trip.**~~ **Done, 17 Sep 2026**, and it took a second
+   machine -- see *What is proven* above. The `mock` engine was meant to be the
+   cheap first step and could not run at all: the runner fetched and verified a
+   model for every job, including the one engine that needs none.
 2. ~~**Real YOLO over a real Jellyfin video.**~~ **Done, 9 Sep 2026**, coordinator
    excluded — see *Results — real model over real video* in
    `.marp/verification.md`. Stock `yolov8n` over a CAMPA2021 clip, driven

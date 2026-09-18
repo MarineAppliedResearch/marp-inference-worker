@@ -105,45 +105,31 @@ def _monitors() -> list[tuple[int, int, int, int]]:
 # Inputs: this slot's index, and how many slots the worker runs.
 # Output: (x, y, width, height).
 #
-# The rule Isaac asked for: fill the monitors first, and only start subdividing
-# when there are more windows than screens.
+# **Fill the screens before dividing any of them.**
 #
-#   slots <= monitors : one window per monitor, filling it
-#   slots  > monitors : slots shared out over the monitors, then gridded
-#                       within each one
+#   one window                -> one whole monitor
+#   two windows, two monitors -> a whole monitor each
+#   n windows, n monitors     -> a whole monitor each
+#   more windows than screens -> shared out, then gridded within each screen
 #
-# A grid rather than a cascade because these are watched, not clicked: a
-# volunteer glancing across the room wants to see every running job at once, and
-# overlapping windows hide all but the top one.
+# A configured `MARP_WATCH_WINDOW_POSITION` chooses which monitor is *first*,
+# not which monitor is the only one used. An earlier version confined every
+# window to the anchored screen, which turned four slots on two monitors into a
+# cramped 2x2 on one while the other sat empty. The anchor answers "where does
+# the first window go"; the rule above answers the rest.
 def _tile(slot_index: int, slot_count: int) -> tuple[int, int, int, int]:
 
-    monitors = _monitors()
+    monitors = _ordered_monitors()
     count = max(1, slot_count)
     index = max(0, slot_index) % count
 
-    # A configured position names the watching screen, not just a coordinate.
-    #
-    # `MARP_WATCH_WINDOW_POSITION` exists because windows kept opening on the
-    # monitor somebody was working on. A tiler that then helpfully fills every
-    # monitor puts them straight back. So when a position is set, every slot is
-    # tiled inside the monitor that position falls on and the others are left
-    # alone -- the person has said which screen is for watching.
-    anchor = _window_position()
-
-    if anchor:
-        x_text, y_text = anchor.split(",")
-        anchor_point = (int(x_text), int(y_text))
-        chosen = _monitor_containing(anchor_point, monitors)
-
-        return _grid_within(chosen, index, count)
-
-    # Fewer windows than screens: one each, filling the monitor.
+    # A screen each, whole, while there are screens to go round.
     if count <= len(monitors):
         return monitors[index]
 
     # More windows than screens. Share them out as evenly as possible, giving
-    # the earlier monitors the extra one when it does not divide -- the primary
-    # is usually the larger and the one being looked at.
+    # the earlier monitors the extra one when it does not divide -- the first
+    # monitor is the one chosen for watching.
     per_monitor = [count // len(monitors)] * len(monitors)
 
     for spare in range(count % len(monitors)):
@@ -160,6 +146,28 @@ def _tile(slot_index: int, slot_count: int) -> tuple[int, int, int, int]:
         local_index -= share
 
     return _grid_within(monitors[monitor_index], local_index, per_monitor[monitor_index])
+
+
+# _ordered_monitors()
+# The monitors, with the configured watching screen first.
+# Inputs: none; reads `MARP_WATCH_WINDOW_POSITION`.
+# Output: the monitor rectangles, at least one.
+# Use this so a single window lands on the screen somebody chose rather than on
+# whichever one the driver enumerated first. The order is the only thing the
+# anchor decides -- every monitor is still used once there are enough windows
+# to need them.
+def _ordered_monitors() -> list[tuple[int, int, int, int]]:
+
+    monitors = _monitors()
+    anchor = _window_position()
+
+    if not anchor:
+        return monitors
+
+    x_text, y_text = anchor.split(",")
+    chosen = _monitor_containing((int(x_text), int(y_text)), monitors)
+
+    return [chosen] + [rect for rect in monitors if rect != chosen]
 
 
 # _monitor_containing()

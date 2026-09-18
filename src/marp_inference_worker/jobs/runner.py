@@ -318,6 +318,11 @@ class JobRunner:
         # followed by enough running time to see its effect.
         self._last_slot_decision_at = 0.0
 
+        # Publish the starting figure straight away. Left until the first
+        # decision, `/status` fell back to the ceiling and reported three free
+        # slots on a worker that had not yet agreed to take more than one.
+        self._state.set_permitted_slots(self._effective_slots)
+
         # Slot index -> the job running on it. A slot absent from this mapping
         # is free.
         self._jobs_by_slot: dict[int, JobProcess] = {}
@@ -572,6 +577,10 @@ class JobRunner:
             )
         elif slowest > _REAL_TIME_FPS * _SLOT_GROWTH_MARGIN and self._effective_slots < self._slot_count:
             self._effective_slots += 1
+
+        # Publish it, so `/status` reports free slots against what the worker
+        # will actually take rather than against the ceiling.
+        self._state.set_permitted_slots(self._effective_slots)
 
         return self._effective_slots
 
@@ -892,7 +901,12 @@ class JobRunner:
         # Tell the engine which slot it is pinned to, so device resolution can
         # map it to a GPU (R6).
         params["slot_index"] = slot_index
-        params["slot_count"] = self._slot_count
+        # The number of windows there will actually be, not the ceiling this
+        # machine might grow to. Tiling by the ceiling gave a single running
+        # job a quarter of a screen while the other three quarters sat empty,
+        # because the layout was answering "how many could there be" when the
+        # question is "how many are there".
+        params["slot_count"] = max(1, self._effective_slots)
         params["_job_id"] = envelope.job_id
 
         # Fetch the model and verify it. A job spec's model always carries a

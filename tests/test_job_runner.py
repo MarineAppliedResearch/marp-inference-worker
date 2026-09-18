@@ -1772,6 +1772,9 @@ def test_slots_are_shed_when_a_window_falls_below_real_time() -> None:
         def note_error(self, _message):
             pass
 
+        def set_permitted_slots(self, _permitted):
+            pass
+
     live = runner_module.JobRunner.__new__(runner_module.JobRunner)
     live._slot_count = 4
     live._effective_slots = 4
@@ -1837,6 +1840,9 @@ def test_one_slot_decision_per_interval_not_one_per_poll() -> None:
         def note_error(self, _message):
             pass
 
+        def set_permitted_slots(self, _permitted):
+            pass
+
     live = runner_module.JobRunner.__new__(runner_module.JobRunner)
     live._slot_count = 4
     live._effective_slots = 4
@@ -1873,6 +1879,9 @@ def test_a_warming_job_does_not_shed_a_slot() -> None:
             return False
 
         def note_error(self, _message):
+            pass
+
+        def set_permitted_slots(self, _permitted):
             pass
 
     live = runner_module.JobRunner.__new__(runner_module.JobRunner)
@@ -1920,6 +1929,15 @@ def test_a_worker_starts_at_one_job_and_grows_into_the_machine(monkeypatch) -> N
             return False
 
         def note_error(self, _message):
+            pass
+
+        def set_permitted_slots(self, _permitted):
+            pass
+
+        def set_permitted_slots(self, _permitted):
+            pass
+
+        def set_permitted_slots(self, _permitted):
             pass
 
     derived._state = FakeState()

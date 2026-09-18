@@ -79,7 +79,11 @@ def test_status_reflects_a_running_job() -> None:
     assert body["active_jobs"][0]["attempt_id"] == "attempt-1"
 
     # Slot accounting is derived from the job list, so it cannot disagree.
-    assert body["slots"] == {"total": 2, "busy": 1, "free": 1}
+    # `permitted` is what the worker has decided it can run at real time, and
+    # `free` is counted against it rather than against the ceiling. Reporting
+    # `total - busy` advertised spare capacity on a machine that had worked out
+    # it had none. Unset, it falls back to the ceiling, which is this case.
+    assert body["slots"] == {"total": 2, "permitted": 2, "busy": 1, "free": 1}
 
     # Reset so the next test starts clean.
     WORKER_STATE.set_jobs([])

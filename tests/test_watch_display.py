@@ -782,3 +782,45 @@ def test_a_vanished_pid_is_not_our_browser(monkeypatch, tmp_path) -> None:
     monkeypatch.setattr(display_module.Path, "read_bytes", gone)
 
     assert display_module.WatchDisplay._still_our_browser(display) is False
+
+
+# test_orphaned_windows_are_closed_at_startup(monkeypatch, tmp_path)
+# Verifies a worker cleans up windows its previous run left behind.
+# Inputs: pytest monkeypatch and temporary directory.
+# Output: pytest pass/fail result.
+#
+# `close()` runs only in the process that owns the display, so a worker killed
+# by a crash, a reaper or a closed terminal leaves its windows with nothing left
+# to close them. They sit there frozen on the last frame they drew — labels and
+# all — so a window from a coral model goes on naming corals while the machine
+# runs rockfish, and somebody looking at the screen sees a wrong label with no
+# way to tell it is a ghost.
+def test_orphaned_windows_are_closed_at_startup(monkeypatch, tmp_path: Path) -> None:
+    from marp_inference_worker.watch import display as display_module
+
+    calls: list[list[str]] = []
+
+    def record(args, **_kwargs):
+        calls.append(list(args))
+        return SimpleNamespace(stdout="311\n412\n", returncode=0)
+
+    monkeypatch.setattr(display_module.sys, "platform", "win32")
+    monkeypatch.setattr(display_module.subprocess, "run", record)
+
+    stopped = display_module.close_orphaned_windows(tmp_path / "jobs")
+
+    assert stopped == 2
+    killed = {call[2] for call in calls if call and call[0] == "taskkill"}
+    assert killed == {"311", "412"}
+
+    # Scoped to this worker's own workspace root, so it can never reach the
+    # volunteer's browser or a second worker's windows on the same machine.
+    query = next(" ".join(call) for call in calls if "Win32_Process" in " ".join(call))
+    assert str((tmp_path / "jobs").resolve()).replace("\\", "\\\\") in query
+
+    # A machine with nothing left over is left alone.
+    calls.clear()
+    monkeypatch.setattr(display_module.subprocess, "run",
+                        lambda args, **_k: calls.append(list(args)) or SimpleNamespace(stdout="", returncode=0))
+    assert display_module.close_orphaned_windows(tmp_path / "jobs") == 0
+    assert not [c for c in calls if c and c[0] == "taskkill"]

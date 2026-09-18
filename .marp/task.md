@@ -97,6 +97,19 @@ credential has somewhere to live.
   the credential is on disk world-readable, which on a multi-user box is the whole of the
   defence missing for as long as it takes to run the next line.
 
+- **2026-09-18** — `O_BINARY` is included in the open flags via `getattr(os, "O_BINARY", 0)`,
+  because the constant does not exist off Windows. **This was a regression introduced by the
+  decision above and caught by Windows verification, not by reasoning.** `os.open` without it
+  gives a text-mode descriptor on Windows, which translates every `0x0A` written to
+  `0x0D 0x0A`; DPAPI ciphertext is binary, so the credential was corrupted on write and
+  `CryptUnprotectData` failed at startup with *The data is invalid*. Demonstrated rather than
+  argued: `010a020a0a03` came back as `010d0a020d0a0d0a03`.
+
+  Worth recording because of its shape. A Windows worker would have activated successfully,
+  written a corrupted credential, and failed to authenticate later — the same failure that
+  opened this issue, arriving from the opposite platform. The tests written here are what
+  caught it; the original code never went near `os.open`.
+
 ## Plan
 
 1. Branch `32-linux-credential-store` off `develop` at `1d0f50f`. *(done)*

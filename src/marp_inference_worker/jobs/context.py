@@ -170,6 +170,7 @@ class ChildJobContext:
         total: int | None,
         unit: str,
         phase: str | None = None,
+        tracks: int | None = None,
     ) -> None:
 
         # Preserve the current phase when callers report only a new counter.
@@ -188,9 +189,16 @@ class ChildJobContext:
             self._progress_phase = phase
 
         # The parent keeps only the latest of these and sends it on heartbeat.
+        # `tracks` is how many distinct animals this job has seen, not how many
+        # are on the current frame: the parent keeps only the latest progress
+        # event, so a per-frame number would be whatever the last event happened
+        # to carry and could not be added up.
         self._emit(
             "progress",
-            {"done": done, "total": total, "unit": unit, "phase": next_phase},
+            {
+                "done": done, "total": total, "unit": unit, "phase": next_phase,
+                "tracks": tracks,
+            },
         )
 
     # report_metrics()

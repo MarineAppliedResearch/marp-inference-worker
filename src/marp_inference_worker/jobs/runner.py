@@ -909,6 +909,13 @@ class JobRunner:
         params["slot_count"] = max(1, self._effective_slots)
         params["_job_id"] = envelope.job_id
 
+        # And the attempt, so a watch window can tell which of several running
+        # jobs is its own. Without it every window on a multi-slot machine
+        # matched the first job in `/status` and showed that job's dive, line
+        # and video -- wrong data, confidently displayed, with nothing to
+        # suggest it was wrong.
+        params["_attempt_id"] = envelope.attempt_id
+
         # Fetch the model and verify it. A job spec's model always carries a
         # sha256, so this always verifies -- unlike the frame routes, where the
         # hash is optional.
@@ -1181,6 +1188,12 @@ class JobRunner:
                 "failure_reason": _failure_reason(outcome, payload),
                 "completed_through_frame": completed_through_frame,
             })
+
+        # Bank this job's tracks before its row goes: the running total is
+        # finished jobs plus live ones, and a job that vanished without being
+        # banked would take its share of the count with it.
+        self._state.retire_job_tracks(
+            (job.current_progress() or {}).get("tracks") or 0)
 
         # Free the slot and rewrite the in-flight record.
         self._jobs_by_slot.pop(slot_index, None)

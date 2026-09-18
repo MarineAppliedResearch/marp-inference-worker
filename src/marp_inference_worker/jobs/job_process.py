@@ -84,6 +84,7 @@ class JobProcess:
             "total": max(0, end_frame - start_frame),
             "unit": "frames",
             "phase": "starting",
+            "tracks": 0,
         }
 
         # Events not yet forwarded to the coordinator, drained in batches.
@@ -219,6 +220,12 @@ class JobProcess:
                     "total": event.get("total"),
                     "unit": event.get("unit", "frames"),
                     "phase": event.get("phase", self.progress.get("phase")),
+                    # Carried forward when an event omits it, so a progress
+                    # report from a phase that tracks nothing does not appear to
+                    # reset the count to zero.
+                    "tracks": (event.get("tracks")
+                               if event.get("tracks") is not None
+                               else self.progress.get("tracks", 0)),
                 }
                 return
 

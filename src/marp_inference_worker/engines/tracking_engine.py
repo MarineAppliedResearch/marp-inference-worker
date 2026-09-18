@@ -219,6 +219,7 @@ class TrackingEngine(BaseEngine):
                 workspace=ctx.checkpoint_dir.parent,
                 warn=lambda message: ctx.log(message, level="warning"),
                 job_id=str(params.get("_job_id") or "") or None,
+                attempt_id=str(params.get("_attempt_id") or "") or None,
                 model_name=str((spec.get("model") or {}).get("name") or "") or None,
                 species_names=species_names,
                 # So the window can be tiled beside its siblings rather than
@@ -240,6 +241,16 @@ class TrackingEngine(BaseEngine):
         observations_written = 0
         detections_seen = 0
         stopped_early = False
+
+        # Distinct tracks this job has seen -- one per animal, however many
+        # frames it was visible for.
+        #
+        # Ids rather than a running sum: a track lives across frames, so adding
+        # up per-frame counts would count one fish once for every frame it
+        # appeared on. `set` because the tracker hands back the same id each
+        # frame it holds the animal, and ids are unique within a job because the
+        # tracker is built fresh for each range.
+        track_ids_seen: set[Any] = set()
         live_track_metadata: dict[int, dict[str, Any]] = {}
 
         try:
@@ -288,6 +299,8 @@ class TrackingEngine(BaseEngine):
                         live_track_metadata=live_track_metadata,
                     )
 
+                    track_ids_seen.update(track["track_id"] for track in live_tracks)
+
                     if watch is not None and not watch.present(
                         frame,
                         frame.index,
@@ -314,7 +327,8 @@ class TrackingEngine(BaseEngine):
 
                     # Report progress and check for a stop on the same cadence.
                     if frames_processed % _PROGRESS_EVERY_FRAMES == 0:
-                        ctx.report_progress(frames_processed, expected_frames, "frames")
+                        ctx.report_progress(frames_processed, expected_frames, "frames",
+                                            tracks=len(track_ids_seen))
                         ctx.report_metrics(
                             step=frame.index,
                             phase="inference",

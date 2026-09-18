@@ -234,6 +234,16 @@ def test_the_watch_page_ships_with_the_package() -> None:
     assert "/next" in markup
     assert "acknowledged_frame" in markup
 
+    # The frame rates are read from the worker's own progress, not from frames
+    # drawn: the display shows the most recent frame and skips the rest, so
+    # counting draws would measure how fast the window paints and label it
+    # inference. Asserted here because nothing else in the suite can see the
+    # page, and a rate measured from the wrong source would look plausible.
+    assert "RATE_WINDOW_MS" in markup
+    assert 'id="fps"' in markup
+    assert 'id="fpsall"' in markup
+    assert "/status" in markup
+
 
 # test_chromium_is_found_from_configuration_or_an_installed_browser()
 # Verifies the browser search honours configuration and tolerates a bare machine.
@@ -566,6 +576,16 @@ def test_the_watch_page_ships_with_the_package() -> None:
     assert "/next" in markup
     assert "acknowledged_frame" in markup
 
+    # The frame rates are read from the worker's own progress, not from frames
+    # drawn: the display shows the most recent frame and skips the rest, so
+    # counting draws would measure how fast the window paints and label it
+    # inference. Asserted here because nothing else in the suite can see the
+    # page, and a rate measured from the wrong source would look plausible.
+    assert "RATE_WINDOW_MS" in markup
+    assert 'id="fps"' in markup
+    assert 'id="fpsall"' in markup
+    assert "/status" in markup
+
 
 # test_chromium_is_found_from_configuration_or_an_installed_browser()
 # Verifies the browser search honours configuration and tolerates a bare machine.
@@ -743,3 +763,30 @@ def test_a_window_re_tiles_when_the_worker_takes_another_job(monkeypatch) -> Non
             bx, by, bw, bh = tiles[second_index]
             overlaps = ax < bx + bw and bx < ax + aw and ay < by + bh and by < ay + ah
             assert not overlaps, f"{tiles[first_index]} overlaps {tiles[second_index]}"
+
+
+# test_a_frame_packet_says_which_attempt_it_belongs_to()
+# Verifies the window can tell its own job from the others on the machine.
+# Inputs: none.
+# Output: pytest pass/fail result.
+#
+# `live.html` declared `attemptId` with a comment saying it was learned from the
+# first packet, and nothing ever assigned it -- the packet did not carry one. So
+# every window fell back to the first job in `/status`, which is correct on a
+# one-slot machine and wrong on every other: four windows all showed the first
+# slot's dive, line and video, with nothing to suggest they were wrong.
+def test_a_frame_packet_says_which_attempt_it_belongs_to(tmp_path: Path) -> None:
+    import numpy as np
+
+    display = WatchDisplay(
+        "window", tmp_path / "jobs" / "77", lambda _message: None,
+        job_id="4659", attempt_id="3170",
+    )
+    published: list[dict] = []
+    display._channel.publish = lambda packet, **_: published.append(packet) or True
+
+    frame = SimpleNamespace(image=np.zeros((8, 8, 3), dtype=np.uint8))
+    assert display.present(frame, 100, [], range_start=0, range_end=200) is True
+
+    assert published[0]["attempt_id"] == "3170"
+    assert published[0]["job_id"] == "4659"

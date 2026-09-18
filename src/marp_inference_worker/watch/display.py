@@ -720,6 +720,7 @@ class WatchDisplay:
         workspace: Path,
         warn: Callable[[str], None],
         job_id: str | None = None,
+        attempt_id: str | None = None,
         model_name: str | None = None,
         species_names: list[str] | None = None,
         slot_index: int = 0,
@@ -737,6 +738,7 @@ class WatchDisplay:
         self._workspace = workspace.resolve()
         self._warn = warn
         self._job_id = job_id
+        self._attempt_id = attempt_id
         self._model_name = model_name
         self._species_names = list(species_names or [])
         self._channel = _FrameChannel()
@@ -983,6 +985,7 @@ class WatchDisplay:
             "range_start": int(range_start) if range_start is not None else None,
             "range_end": int(range_end) if range_end is not None else None,
             "job_id": self._job_id,
+            "attempt_id": self._attempt_id,
             "model_name": self._model_name,
             "species_names": self._species_names,
             "content_type": "image/jpeg",

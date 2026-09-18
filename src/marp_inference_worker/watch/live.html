@@ -49,6 +49,10 @@
   }
   #bar b { font-weight: 600; color: #fff; }
   #bar span { color: #9fb0c0; }
+  /* The whole-machine rate is the quieter of the two: this window's own rate is
+     what somebody watching this window wants first. */
+  #bar .all { color: #7f8fa0; }
+  #bar .all b { color: #c9d6e2; font-weight: 500; }
   #count { color: #7ee787; font-variant-numeric: tabular-nums; }
   #frame { font-variant-numeric: tabular-nums; }
   #note {
@@ -88,7 +92,8 @@
 
 <div id="stage"><canvas id="view" width="16" height="9"></canvas></div>
 <div id="bar">
-  <b id="model">…</b>
+  <span><b id="fps">–</b> fps</span>
+  <span class="all"><b id="fpsall">–</b> fps all slots</span>
   <span id="job"></span>
   <span>frame <b id="frame">–</b></span>
   <span id="count"></span>
@@ -190,7 +195,8 @@
   }
 
   function updateBar(packet) {
-    document.getElementById('model').textContent = packet.model_name || 'inference';
+    // The model name is not here: it is in the footer, and repeating it at the
+    // top cost the space the frame rates now use.
     document.getElementById('job').textContent = packet.job_id ? `job ${packet.job_id}` : '';
     document.getElementById('frame').textContent = packet.frame_number;
     const n = (packet.tracks || []).length;
@@ -218,6 +224,9 @@
     }
     paint.drawImage(image, 0, 0);
     drawTracks(packet.tracks);
+    // Which job this window is drawing. Declared far above and, until now,
+    // never assigned -- so every window matched the first job in `/status`.
+    if (packet.attempt_id) attemptId = packet.attempt_id;
     updateBar(packet);
     note.hidden = true;
 
@@ -279,6 +288,56 @@
   // machine running several slots has several jobs in `/status`, and the wrong
   // one's dive name is worse than none.
   let attemptId = null;
+
+  // Frames-per-second, measured over a window rather than between two polls.
+  //
+  // Read from `/status`, not from frames drawn here: the display shows only the
+  // most recent frame and skips the rest, so counting draws would report how
+  // fast the window paints and call it inference. `progress.done` is frames the
+  // engine actually finished.
+  //
+  // Ten seconds of history, because a two-second delta swings several f/s on
+  // nothing -- a model load, a seek, a garbage collection -- and a number that
+  // jumps is a number nobody can read.
+  const RATE_WINDOW_MS = 10000;
+  const rateHistory = [];
+
+  // Inputs: the `/status` jobs array. Output: {mine, all} in frames per second,
+  // either null until there is enough history to divide by.
+  function frameRates(jobs) {
+    const now = Date.now();
+    const done = {};
+
+    for (const job of jobs) done[String(job.attempt_id)] = Number(job.progress.done) || 0;
+    rateHistory.push({ at: now, done });
+
+    while (rateHistory.length > 1 && now - rateHistory[0].at > RATE_WINDOW_MS) rateHistory.shift();
+
+    const oldest = rateHistory[0];
+    const seconds = (now - oldest.at) / 1000;
+
+    // Under a second of history divides by almost nothing and produces a wild
+    // number. Wait rather than show one.
+    if (seconds < 1) return { mine: null, all: null };
+
+    let all = 0;
+    let mine = null;
+
+    for (const [attempt, finished] of Object.entries(done)) {
+      const before = oldest.done[attempt];
+
+      // A slot that started since the oldest sample has no baseline, and one
+      // whose counter went backwards has rolled onto a new job -- its frames
+      // belong to a different range and counting them would invent progress.
+      if (before === undefined || finished < before) continue;
+
+      const rate = (finished - before) / seconds;
+      all += rate;
+      if (String(attempt) === String(attemptId)) mine = rate;
+    }
+
+    return { mine, all };
+  }
 
   function setText(id, value) {
     document.getElementById(id).textContent =
@@ -347,6 +406,10 @@
         const mine = attemptId === null
           ? jobs[0]
           : jobs.find((job) => String(job.attempt_id) === String(attemptId)) || null;
+
+        const rates = frameRates(jobs);
+        setText('fps', rates.mine === null ? null : rates.mine.toFixed(1));
+        setText('fpsall', rates.all === null ? null : rates.all.toFixed(1));
 
         if (mine) {
           const context = mine.session_context || {};

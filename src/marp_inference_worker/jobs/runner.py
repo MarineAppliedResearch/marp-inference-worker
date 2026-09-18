@@ -909,6 +909,13 @@ class JobRunner:
         params["slot_count"] = max(1, self._effective_slots)
         params["_job_id"] = envelope.job_id
 
+        # And the attempt, so a watch window can tell which of several running
+        # jobs is its own. Without it every window on a multi-slot machine
+        # matched the first job in `/status` and showed that job's dive, line
+        # and video -- wrong data, confidently displayed, with nothing to
+        # suggest it was wrong.
+        params["_attempt_id"] = envelope.attempt_id
+
         # Fetch the model and verify it. A job spec's model always carries a
         # sha256, so this always verifies -- unlike the frame routes, where the
         # hash is optional.

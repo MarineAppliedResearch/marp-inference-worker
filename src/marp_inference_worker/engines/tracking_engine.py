@@ -219,6 +219,7 @@ class TrackingEngine(BaseEngine):
                 workspace=ctx.checkpoint_dir.parent,
                 warn=lambda message: ctx.log(message, level="warning"),
                 job_id=str(params.get("_job_id") or "") or None,
+                attempt_id=str(params.get("_attempt_id") or "") or None,
                 model_name=str((spec.get("model") or {}).get("name") or "") or None,
                 species_names=species_names,
                 # So the window can be tiled beside its siblings rather than

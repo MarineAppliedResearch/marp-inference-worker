@@ -772,7 +772,11 @@ class JobRunner:
 
             # Cancel and abandon both stop this job.
             if is_stop_action(action) and not job.stop_requested:
-                self._state.note_error(f"{action} received for {job.attempt_id}")
+                # A notice, not an error. The coordinator telling a worker to
+                # stop is the control channel working; recording it as an error
+                # left `/status` reporting a fault for the rest of the session
+                # over a job that was cancelled exactly as intended.
+                self._state.note(f"{action} received for {job.attempt_id}")
                 job.request_stop()
 
             # A job that was asked to stop and has not is killed once the grace

@@ -1678,3 +1678,31 @@ def test_a_refused_result_survives_to_be_reported_at_the_next_start(tmp_path: Pa
     # `failed` on the way out: MARP refusing a word today does not make the run
     # a failure, and rewriting it would put a wrong answer in the record.
     assert resent["outcome"] == "succeeded"
+
+
+# test_a_coordinator_cancel_is_a_notice_not_an_error(tmp_path)
+# Verifies an instruction obeyed does not report as a fault.
+# Inputs: pytest temporary directory.
+# Output: pytest pass/fail result.
+#
+# A coordinator cancel was written into `last_error`, so `/status` reported an
+# error for the rest of the session over a job that had been stopped exactly as
+# intended -- and a real fault arriving later was indistinguishable from it.
+def test_a_coordinator_cancel_is_a_notice_not_an_error(tmp_path: Path) -> None:
+
+    offer = _job_for(tmp_path, "attempt-cancelled", frames=200, frame_delay_s=0.05)
+    coordinator = FakeCoordinator(offers=[offer])
+    coordinator.heartbeat_action = "cancel"
+    runner, state = _runner(coordinator, tmp_path)
+    runner.ensure_enrolled()
+
+    assert runner._poll_once() is True
+    job = runner._jobs_by_slot[0]
+    assert _wait_until(runner, lambda: job.stop_requested)
+
+    described = state.describe()
+    assert described["last_error"] is None, described["last_error"]
+    assert "cancel" in (described["last_notice"] or "")
+
+    job.kill(grace_s=1)
+    runner._service_running_jobs()

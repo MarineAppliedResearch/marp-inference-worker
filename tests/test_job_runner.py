@@ -687,10 +687,17 @@ def test_paused_worker_reports_no_free_slots(tmp_path: Path) -> None:
     assert runner.free_slots() == 2
 
 
-def test_watch_display_requires_both_the_machine_policy_and_job_request(tmp_path: Path) -> None:
+def test_watch_display_is_decidable_by_either_side(tmp_path: Path) -> None:
+    # Both middle cases used to assert None, because the old gate needed the
+    # machine AND the job to agree. Either one is now enough: a volunteer in a
+    # display mode is running a screen saver and did not ask per job, and a job
+    # that asks is honoured on a machine that set no mode. Only the first case
+    # -- nobody asking -- draws nothing. Fullscreen stays the volunteer's own
+    # choice, so a job asking on an `off` machine gets a window, not the screen.
     cases = [
-        ("off", True, None),
-        ("fullscreen", False, None),
+        ("off", False, None),
+        ("off", True, "window"),
+        ("fullscreen", False, "fullscreen"),
         ("fullscreen", True, "fullscreen"),
     ]
 

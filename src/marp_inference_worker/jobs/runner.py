@@ -587,8 +587,22 @@ class JobRunner:
         # still learns nothing about MARP or the coordinator.
         spec = envelope.spec.model_dump(mode="json")
         spec["params"] = prepared_params
+        # Either side can ask for a display, and one asking is enough.
+        #
+        # This used to need BOTH the machine's mode and the job's `watch` flag,
+        # which made the screen saver opt-in per job: a volunteer running in
+        # window mode saw nothing unless whoever queued the work had remembered
+        # a flag they had no reason to set. Now the volunteer's mode is enough
+        # on its own, and a job that asks is enough on its own.
         screen_mode = self._state.screen_mode()
-        if screen_mode != "off" and prepared_params.get("watch") is True:
+
+        # A job asking to be watched on a machine with no mode set gets the
+        # ordinary window. Fullscreen is only ever the volunteer's choice --
+        # nothing queued remotely should be able to take over the screen.
+        if screen_mode == "off" and prepared_params.get("watch") is True:
+            screen_mode = "window"
+
+        if screen_mode != "off":
             spec["params"]["_watch_screen_mode"] = screen_mode
 
         # Create and launch the child.

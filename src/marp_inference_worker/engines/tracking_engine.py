@@ -190,8 +190,12 @@ class TrackingEngine(BaseEngine):
         data_type = str(params.get("data_type", "Fish"))
 
         watch = None
+        # `_watch_screen_mode` is the whole decision. The runner sets it only
+        # when the machine is in a display mode, so a second check against the
+        # job's own `watch` flag would put the veto back where it does not
+        # belong -- with whoever queued the work rather than with the volunteer.
         screen_mode = str(params.get("_watch_screen_mode", "off"))
-        wants_watch = params.get("watch") is True and screen_mode in {"window", "fullscreen"}
+        wants_watch = screen_mode in {"window", "fullscreen"}
 
         # Open the video and read its geometry once.
         ctx.report_progress(0, expected_frames, "frames", phase="opening_video")

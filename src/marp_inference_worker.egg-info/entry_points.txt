@@ -1,0 +1,2 @@
+[console_scripts]
+marp-worker = marp_inference_worker.worker_main:main

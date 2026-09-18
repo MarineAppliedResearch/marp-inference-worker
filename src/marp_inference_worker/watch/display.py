@@ -19,6 +19,30 @@ import cv2
 _FRAME_ACK_TIMEOUT_S = 60.0
 
 
+# _window_position()
+# Where the watch window opens, as Chromium's `x,y`.
+# Inputs: none; reads `MARP_WATCH_WINDOW_POSITION`.
+# Output: a coordinate string.
+# Use this rather than a literal. Negative values are legitimate -- a monitor
+# to the left of the primary one has negative coordinates in Windows.
+def _window_position() -> str:
+
+    configured = (os.environ.get("MARP_WATCH_WINDOW_POSITION") or "").strip()
+
+    if configured:
+        parts = configured.split(",")
+
+        if len(parts) == 2:
+            try:
+                return f"{int(parts[0].strip())},{int(parts[1].strip())}"
+            except ValueError:
+                pass
+
+    # The old literal, and still the right default: the primary display, where
+    # a disconnected second monitor cannot hide the window.
+    return "50,50"
+
+
 def _chromium_args(chromium: Path, url: str, profile: Path, mode: str) -> list[str]:
     args = [
         str(chromium),
@@ -30,9 +54,13 @@ def _chromium_args(chromium: Path, url: str, profile: Path, mode: str) -> list[s
         # otherwise leave the app window stuck on its raw 127.0.0.1 URL.
         "--no-proxy-server",
         "--proxy-bypass-list=<-loopback>",
-        # New per-job profiles have no saved bounds. Pin the initial window to
-        # the primary display so disconnected monitors cannot hide it.
-        "--window-position=50,50",
+        # New per-job profiles have no saved bounds, so the window is pinned
+        # rather than left to Chromium. `MARP_WATCH_WINDOW_POSITION` as `x,y`
+        # moves it: a volunteer with two monitors wants the screen saver on the
+        # one they are not working on, and without this every job opens on top
+        # of whatever they are doing. Malformed values fall back rather than
+        # raise -- a bad coordinate must not cost somebody their job.
+        f"--window-position={_window_position()}",
         "--disable-background-timer-throttling",
         "--disable-backgrounding-occluded-windows",
         "--disable-renderer-backgrounding",

@@ -191,3 +191,33 @@ def test_chromium_is_found_from_configuration_or_an_installed_browser(monkeypatc
     monkeypatch.delenv("MARP_CHROMIUM_PATH", raising=False)
     found = WatchDisplay._find_chromium()
     assert found is None or found.is_file()
+
+
+# test_the_watch_window_can_be_pinned_to_another_monitor(monkeypatch)
+# Verifies the window position is configurable and never fatal.
+# Inputs: pytest monkeypatch.
+# Output: pytest pass/fail result.
+#
+# Every job used to open at 50,50 on the primary display, on top of whatever
+# the volunteer was doing. A screen saver belongs on the monitor they are not
+# working on.
+def test_the_watch_window_can_be_pinned_to_another_monitor(monkeypatch) -> None:
+    from marp_inference_worker.watch.display import _window_position
+
+    monkeypatch.delenv("MARP_WATCH_WINDOW_POSITION", raising=False)
+    assert _window_position() == "50,50"
+
+    monkeypatch.setenv("MARP_WATCH_WINDOW_POSITION", "2560,0")
+    assert _window_position() == "2560,0"
+
+    # Negative is legitimate: a monitor to the left of the primary one has
+    # negative coordinates in Windows, and rejecting them would rule out half
+    # the two-monitor arrangements there are.
+    monkeypatch.setenv("MARP_WATCH_WINDOW_POSITION", "-1920, 200")
+    assert _window_position() == "-1920,200"
+
+    # A bad value falls back rather than raising. The display is decoration;
+    # a typo in an environment variable must not cost somebody their job.
+    for bad in ("nonsense", "1,2,3", "", "x,0"):
+        monkeypatch.setenv("MARP_WATCH_WINDOW_POSITION", bad)
+        assert _window_position() == "50,50", bad

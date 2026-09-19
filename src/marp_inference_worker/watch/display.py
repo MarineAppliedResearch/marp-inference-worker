@@ -616,10 +616,33 @@ def _bring_to_front(process_id: int, attempts: int = 40) -> None:
 # profile paths.
 def close_orphaned_windows(workspace_root: Path) -> int:
 
-    if sys.platform != "win32":
-        return 0
+    root = str(Path(workspace_root).resolve())
 
-    needle = str(Path(workspace_root).resolve()).replace("\\", "\\\\").replace("'", "''")
+    if sys.platform != "win32":
+        # Matched on the profile path, not the process name. That is what keeps
+        # this off the volunteer's own browser -- and it matters more here than
+        # on Windows, because the Chromium a Linux worker borrows is often the
+        # one the volunteer is reading this in.
+        #
+        # `pkill` and not a window manager, deliberately. Snap Chromium runs
+        # natively on Wayland, where `xdotool`, `wmctrl` and that family return
+        # success, move nothing and log nothing against a window that is
+        # plainly on screen. `pkill` matches a command line, so it is unaffected
+        # by which window system is in play. See #31.
+        try:
+            found = subprocess.run(
+                ["pkill", "-f", root],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                timeout=20, check=False,
+            )
+        except Exception:
+            return 0
+
+        # pkill exits 0 when it signalled something, 1 when it matched nothing.
+        # There is no count, so this reports "some" rather than inventing one.
+        return 1 if found.returncode == 0 else 0
+
+    needle = root.replace("\\", "\\\\").replace("'", "''")
     query = (
         "SELECT ProcessId FROM Win32_Process WHERE Name = 'chrome.exe' "
         f"AND CommandLine LIKE '%{needle}%'"

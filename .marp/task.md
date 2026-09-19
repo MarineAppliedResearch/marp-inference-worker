@@ -149,6 +149,21 @@ the hand-built dev worker 1079, which has its own state directory and is untouch
 Answered `/health` and `/status` in about 10 seconds, idle, enrolled, 1 slot free,
 accepting jobs, on Python 3.12.14.
 
+**The full chain, one host, one unbroken sequence.** marp-laptop-install-test built at
+`a6b2aa1` with no `-BuildPython`, on the only machine in the fleet with no `py` launcher,
+and installed the result over its own worker: fallback resolver found the managed
+`cpython-3.12.14` unaided → build → upgrade install → **zero leaked lines across the whole
+run** → stage 7 named worker 1187 → banner named the runtime, the worker and the CUDA
+kernel. On-disk 10.21 GB, unchanged across three installs, so upgrading does not duplicate.
+
+**What that chain does not cover, kept here rather than only in the gaps list.** All three
+of that machine's installs ran inside the Claude desktop app's MSIX container, which is why
+`os error 448` appears at stage 4 every time and is not our defect. The chain proves the
+resolver, the build, the upgrade path, the transcript and the enrolment. It does **not**
+prove a volunteer's launch conditions. An unbroken sequence reads stronger than it is if
+that caveat is allowed to drop off in the retelling, which is why it is attached to the
+chain and not filed three sections away.
+
 ### Four defects found by running it, and fixed
 
 marp-laptop-install-test read its own transcript and could not tell a healthy install from
@@ -198,6 +213,12 @@ Both machines report the worker answering in **about 10 seconds** — VP1 on a G
 marp-laptop-install-test on an RTX 5060 Laptop. The faster card did not help, which it
 would have if the wait were compute. Loading PyTorch is dominated by reading roughly 2.5 GB
 of DLLs and initialising the runtime, and the GPU contributes nothing to that.
+
+A third sample sharpens it: the same laptop, rebuilt and reinstalled on a **warm uv cache**,
+also answered in about 10 seconds. The cache changes what the download and install steps
+cost and moved this number not at all, so the wait is not sized by anything the cache
+touches — it is the runtime cost of importing PyTorch and initialising CUDA, paid fresh on
+every start. Three samples across two GPU generations and two cache states, all ~10s.
 
 So the 180s deadline has headroom against *these two machines' SSDs* and nothing is known
 about its headroom on a spinning disk, which is the volunteer most likely to strain it.
@@ -261,6 +282,13 @@ above is asking for.
   run. What the second machine proves is that the transcript is clean and the upgrade path
   is intact on a different GPU architecture — which is what it was for.
 - **The stage 8 deadline against slow storage**, per the section above.
+
+**Three of these are one procurement, not three problems.** The VC++ install-and-elevate
+path, the Inno GUI wizard, and a genuine double-click-from-Explorer run are all blocked on
+the same missing thing: a clean Windows machine that has never held a worker, with an MSVC
+runtime older than the 14.44 we ship, driven by hand rather than by an agent. One such box
+closes all three in a single sitting. Stated here so it reads as one thing to arrange
+rather than three things to keep deferring.
 - **The CPU path** cannot be meaningfully tested until marp-laptop's PR #42 merges; until
   then R2 is delivered by the installer and defeated by the worker.
 - **Repeated clean installs accumulate orphaned workers** coordinator-side, because a fresh

@@ -1026,3 +1026,58 @@ def test_kill_by_profile_does_nothing_without_a_profile(monkeypatch) -> None:
     display_module.WatchDisplay._kill_by_profile(SimpleNamespace(_profile_dir=None))
 
     assert calls == []
+
+
+# Verifies the close path will not signal a pid that is no longer our browser.
+# Inputs: pytest monkeypatch, tmp_path.
+# Output: pytest pass/fail result.
+#
+# /snap/bin/chromium is a symlink to /usr/bin/snap, which execs and exits, so the
+# launched pid belongs to a wrapper that is gone within seconds and whose number
+# Linux then recycles. Terminating it raised PermissionError on seven attempts --
+# and that was the lucky case: EPERM only occurs when the new owner is another
+# user. Recycled to a signalable process, this would have killed a volunteer's own
+# program silently. Refs #39, and the same lesson as #28 on Windows.
+def test_close_does_not_signal_a_recycled_pid(monkeypatch, tmp_path) -> None:
+    from marp_inference_worker.watch import display as display_module
+
+    profile = tmp_path / "chromium-profile"
+    profile.mkdir()
+
+    display = SimpleNamespace(_process=SimpleNamespace(pid=4242), _profile_dir=profile)
+
+    # A pid whose command line does not mention our profile is not our browser,
+    # whatever it is.
+    monkeypatch.setattr(
+        display_module.Path, "read_bytes", lambda self: b"/usr/bin/something-else\x00"
+    )
+    assert display_module.WatchDisplay._still_our_browser(display) is False
+
+    # And one that does name it, is.
+    monkeypatch.setattr(
+        display_module.Path,
+        "read_bytes",
+        lambda self: b"chrome\x00--user-data-dir=" + str(profile).encode() + b"\x00",
+    )
+    assert display_module.WatchDisplay._still_our_browser(display) is True
+
+
+# Verifies a vanished pid is treated as not ours rather than raising.
+# Inputs: pytest monkeypatch, tmp_path.
+# Output: pytest pass/fail result.
+#
+# The common case: the wrapper has exited and /proc/<pid> no longer exists. That
+# must be "not ours" and not an exception, because it happens on every job. Refs #39.
+def test_a_vanished_pid_is_not_our_browser(monkeypatch, tmp_path) -> None:
+    from marp_inference_worker.watch import display as display_module
+
+    profile = tmp_path / "chromium-profile"
+    profile.mkdir()
+    display = SimpleNamespace(_process=SimpleNamespace(pid=999999), _profile_dir=profile)
+
+    def gone(self):
+        raise FileNotFoundError("/proc/999999/cmdline")
+
+    monkeypatch.setattr(display_module.Path, "read_bytes", gone)
+
+    assert display_module.WatchDisplay._still_our_browser(display) is False

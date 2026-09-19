@@ -1,0 +1,390 @@
+#!/bin/sh
+# bootstrap-linux.sh
+# Created: 2026-09-18
+# Author: Isaac Travers
+#
+# Turns a Linux computer with an NVIDIA GPU into a MARP volunteer worker.
+#
+# The POSIX counterpart of bootstrap-windows.ps1, and deliberately the same shape:
+# the same stages in the same order, the same lock files with url/size/sha256, the
+# same refusal to proceed on an unverified download. Where the two differ, it is
+# because the platform forced it, and each of those is commented.
+#
+# This is a *downloader*, not a bundle. It carries locks, the worker source and the
+# enrolment code; it fetches the Python runtime, the wheels and Chromium. That was
+# chosen deliberately: bundling would mean MARP serving several gigabytes per
+# volunteer per release, where this serves a few megabytes and lets PyPI, Astral
+# and Google serve the rest.
+#
+# /bin/sh rather than bash: a volunteer's machine may not have bash, and nothing
+# here needs it.
+
+set -eu
+
+# ---------------------------------------------------------------------------
+# Build-time inputs. `build-linux.sh` replaces these at package time; they are
+# never committed with real values. The enrolment code in particular must not
+# reach the repository -- MARP_API#208 makes that a requirement rather than a
+# preference.
+# ---------------------------------------------------------------------------
+COORDINATOR_URL="${MARP_COORDINATOR_URL:-@MARP_COORDINATOR_URL@}"
+ENROLMENT_CODE="${MARP_ACTIVATION_CODE:-@MARP_ENROLMENT_CODE@}"
+
+# Everything lives under one directory so uninstalling is `rm -rf`, and so nothing
+# needs root. A volunteer should never be asked for a password to donate compute.
+INSTALL_ROOT="${MARP_INSTALL_ROOT:-$HOME/.local/share/marp-worker}"
+STATE_DIR="$INSTALL_ROOT/state"
+VENV="$INSTALL_ROOT/venv"
+DOWNLOADS="$INSTALL_ROOT/downloads"
+LOCKS="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+LOG="$INSTALL_ROOT/install.log"
+
+# Enough for the venv (~7 GB), Chromium (~600 MB unpacked) and headroom.
+REQUIRED_FREE_MB=12000
+
+TOTAL_STAGES=8
+stage_number=0
+
+# --check-only answers "will this work on my computer?" without committing to a
+# multi-gigabyte download. Worth having for its own sake: a volunteer whose driver
+# is missing should find out in two seconds rather than after twenty minutes of
+# downloading, and it is the difference between them fixing it and giving up.
+CHECK_ONLY=no
+for arg in "$@"; do
+    case "$arg" in
+        --check-only) CHECK_ONLY=yes ;;
+        --help|-h)
+            printf '%s\n' \
+                "MARP volunteer worker setup" \
+                "" \
+                "  (no options)   install and start the worker" \
+                "  --check-only   check this computer is suitable, change nothing" \
+                "  --help         this message" \
+                "" \
+                "Environment overrides:" \
+                "  MARP_INSTALL_ROOT   where to install (default ~/.local/share/marp-worker)"
+            exit 0 ;;
+        *) printf 'Unknown option: %s (try --help)\n' "$arg" >&2; exit 2 ;;
+    esac
+done
+
+
+# say()
+# One line to the volunteer and to the log.
+# Inputs: the message.
+# Output: none.
+say() {
+    printf '%s\n' "$*"
+    printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >> "$LOG" 2>/dev/null || true
+}
+
+
+# stage()
+# Announce a numbered stage, so a volunteer watching a long install can see it is
+# progressing rather than hung. The Windows script does the same.
+stage() {
+    stage_number=$((stage_number + 1))
+    say ""
+    say "[$stage_number/$TOTAL_STAGES] $*"
+}
+
+
+# fail()
+# Stop with a message a volunteer can act on.
+# Inputs: the explanation, then optionally what to do about it.
+# Output: exits 1.
+#
+# Every failure path in this script goes through here. An installer that dies on an
+# unhandled error teaches the volunteer that the project is broken, when usually
+# they are one missing thing away from working.
+fail() {
+    say ""
+    say "MARP setup stopped."
+    say ""
+    for line in "$@"; do say "  $line"; done
+    say ""
+    say "  Nothing was left running. Fix the above and run this installer again --"
+    say "  it continues from where it stopped rather than starting over."
+    say ""
+    say "  Full log: $LOG"
+    exit 1
+}
+
+
+# need()
+# Assert a command exists, with a distribution-neutral hint when it does not.
+need() {
+    command -v "$1" >/dev/null 2>&1 || fail \
+        "This installer needs '$1', which is not on this computer." \
+        "Install it with your system's package manager, then run this again." \
+        "  Debian/Ubuntu:  sudo apt install $2" \
+        "  Fedora:         sudo dnf install $2" \
+        "  Arch:           sudo pacman -S $2"
+}
+
+
+# fetch()
+# Download a locked artifact and refuse anything that does not match its hash.
+# Inputs: the lock file name, and the destination path.
+# Output: none; the file exists and is verified, or the script exits.
+#
+# Resumable, because a volunteer on a domestic connection downloading 236 MB of
+# Chromium will sometimes lose it halfway, and starting over is how people give up.
+# Verified, because an unverified download is an arbitrary-code-execution bug with
+# extra steps.
+fetch() {
+    lock="$LOCKS/$1"
+    dest="$2"
+    [ -f "$lock" ] || fail "Missing lock file: $1" "This installer package is incomplete."
+
+    url=$(sed -n 's/.*"url"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$lock")
+    want=$(sed -n 's/.*"sha256"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$lock")
+    name=$(sed -n 's/.*"name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$lock")
+
+    [ -n "$url" ] && [ -n "$want" ] || fail "Lock file $1 is malformed."
+
+    # Already have it and it verifies: nothing to do. This is what makes re-running
+    # after a failure cheap instead of a full re-download.
+    if [ -f "$dest" ] && [ "$(sha256sum "$dest" | cut -d' ' -f1)" = "$want" ]; then
+        say "    $name already downloaded and verified"
+        return 0
+    fi
+
+    attempt=1
+    while [ "$attempt" -le 3 ]; do
+        say "    downloading $name (attempt $attempt of 3)"
+        # -C - resumes a partial file; --retry covers transient DNS and 5xx.
+        if curl -fL -C - --retry 3 --retry-delay 2 --progress-bar -o "$dest" "$url"; then
+            got=$(sha256sum "$dest" | cut -d' ' -f1)
+            if [ "$got" = "$want" ]; then
+                say "    $name verified"
+                return 0
+            fi
+            # A resumed download onto a corrupt partial file can never verify, so
+            # throw it away rather than resuming onto the same wreckage.
+            say "    checksum mismatch, discarding and retrying"
+            rm -f "$dest"
+        fi
+        attempt=$((attempt + 1))
+    done
+
+    fail "Could not download $name after 3 attempts." \
+         "Check this computer's internet connection and run the installer again."
+}
+
+
+mkdir -p "$INSTALL_ROOT" "$DOWNLOADS" "$STATE_DIR"
+
+say "MARP volunteer worker setup"
+say "Installing into $INSTALL_ROOT"
+say "Nothing here needs administrator rights."
+
+# ---------------------------------------------------------------------------
+stage "Checking this computer..."
+# ---------------------------------------------------------------------------
+need curl curl
+need sha256sum coreutils
+need tar tar
+need unzip unzip
+
+# The one thing a Linux package genuinely cannot carry. A GPU driver is a kernel
+# module; no user-space installer can ship it. Windows can lean on the vendor
+# installer already being present, so this stage is a hard asymmetry rather than an
+# omission -- say so plainly instead of failing obscurely later.
+command -v nvidia-smi >/dev/null 2>&1 || fail \
+    "No NVIDIA driver was found on this computer." \
+    "MARP needs an NVIDIA graphics card and its driver to run models." \
+    "" \
+    "  Ubuntu/Debian:  sudo ubuntu-drivers autoinstall   (then restart)" \
+    "  Fedora:         enable RPM Fusion, then sudo dnf install akmod-nvidia" \
+    "  Arch:           sudo pacman -S nvidia" \
+    "" \
+    "  After the driver is installed and the computer restarted, run this again."
+
+CAPABILITY=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d ' ')
+[ -n "$CAPABILITY" ] || fail \
+    "An NVIDIA driver is present but no GPU answered." \
+    "This can happen if the driver was updated without restarting." \
+    "Restart the computer and run this installer again."
+
+GPU_NAME=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1)
+say "    GPU: $GPU_NAME (compute capability $CAPABILITY)"
+
+# Same rule as bootstrap-windows.ps1:92-102, and it must stay the same rule:
+# consumer Blackwell reports 12.x and needs kernels built with CUDA 12.8.
+CUDA_MAJOR=${CAPABILITY%%.*}
+if [ "$CUDA_MAJOR" -ge 12 ] 2>/dev/null; then
+    TORCH_BACKEND=cu128
+else
+    TORCH_BACKEND=cu126
+fi
+say "    selected CUDA runtime: $TORCH_BACKEND"
+
+FREE_MB=$(df -Pm "$INSTALL_ROOT" | awk 'NR==2 {print $4}')
+[ "$FREE_MB" -ge "$REQUIRED_FREE_MB" ] 2>/dev/null || fail \
+    "Not enough free disk space." \
+    "MARP needs about $((REQUIRED_FREE_MB / 1000)) GB free and this disk has $((FREE_MB / 1000)) GB." \
+    "Free some space and run this installer again."
+say "    disk: $((FREE_MB / 1000)) GB free"
+
+if [ "$CHECK_ONLY" = yes ]; then
+    say ""
+    say "This computer can run MARP."
+    say "  Run this installer without --check-only to set it up."
+    exit 0
+fi
+
+say "    ready"
+
+# ---------------------------------------------------------------------------
+stage "Downloading the verified setup tools..."
+# ---------------------------------------------------------------------------
+fetch uv-linux-x64.lock.json "$DOWNLOADS/uv.tar.gz"
+rm -rf "$INSTALL_ROOT/uv" && mkdir -p "$INSTALL_ROOT/uv"
+tar -xzf "$DOWNLOADS/uv.tar.gz" -C "$INSTALL_ROOT/uv" --strip-components=1
+UV="$INSTALL_ROOT/uv/uv"
+[ -x "$UV" ] || fail "The setup tool did not unpack correctly."
+
+# ---------------------------------------------------------------------------
+stage "Installing the managed Python 3.12 runtime..."
+# ---------------------------------------------------------------------------
+# 3.12 deliberately, matching pyproject.toml's floor and ceiling: torch and
+# ultralytics wheels lag new Python releases. A volunteer's system Python is not
+# used at all, so a distribution shipping 3.13 or 3.14 does not matter.
+UV_PYTHON_INSTALL_DIR="$INSTALL_ROOT/python"; export UV_PYTHON_INSTALL_DIR
+"$UV" python install 3.12 >> "$LOG" 2>&1 || fail "Could not install the Python runtime."
+
+# ---------------------------------------------------------------------------
+stage "Creating an isolated MARP environment..."
+# ---------------------------------------------------------------------------
+# Reuse an existing environment rather than recreating it. `uv venv` refuses a
+# directory that already holds one, and its suggested `--clear` would delete
+# several gigabytes of already-installed packages -- so a volunteer whose first
+# attempt died during the long download would pay for the whole thing again.
+# Re-running this installer has to be cheap or nobody re-runs it.
+if [ -x "$VENV/bin/python" ] && "$VENV/bin/python" -c '' 2>/dev/null; then
+    say "    reusing the existing environment"
+else
+    rm -rf "$VENV"
+    "$UV" venv --python 3.12 "$VENV" >> "$LOG" 2>&1 || fail \
+        "Could not create the MARP environment." \
+        "See the log for what the environment tool reported."
+fi
+
+# ---------------------------------------------------------------------------
+stage "Installing the MARP worker..."
+# ---------------------------------------------------------------------------
+say "    this is the long part -- several GB, and it only happens once"
+SOURCE_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)/worker"
+[ -d "$SOURCE_DIR" ] || fail "This installer package is missing the worker source."
+
+"$UV" pip install --python "$VENV/bin/python" \
+    --extra-index-url "https://download.pytorch.org/whl/$TORCH_BACKEND" \
+    --index-strategy unsafe-best-match \
+    --constraint "$LOCKS/requirements-linux-$TORCH_BACKEND.lock.txt" \
+    "$SOURCE_DIR" >> "$LOG" 2>&1 || fail \
+    "Could not install the MARP worker." \
+    "This is usually a network problem partway through a large download." \
+    "Running the installer again will resume rather than start over."
+
+# Prove the GPU actually works before telling anybody it does. An install that
+# reports success and then cannot see the card is the worst outcome, because the
+# volunteer has no way to tell whether they are contributing.
+"$VENV/bin/python" -c "
+import sys, torch
+if not torch.cuda.is_available():
+    sys.exit('torch installed but no CUDA device is visible')
+print('    torch', torch.__version__, '/', torch.cuda.get_device_name(0))
+" || fail \
+    "MARP installed but could not use the graphics card." \
+    "The driver may be older than the CUDA runtime MARP needs." \
+    "Update the NVIDIA driver, restart, and run this installer again."
+
+# ---------------------------------------------------------------------------
+stage "Installing the video display..."
+# ---------------------------------------------------------------------------
+# Chromium is bundled rather than borrowed so a volunteer needs no browser, and so
+# the packaged build and a development machine take the same path. _find_chromium()
+# looks here before anything on the system.
+if [ ! -x "$INSTALL_ROOT/chromium/chrome" ]; then
+    fetch chromium-linux-x64.lock.json "$DOWNLOADS/chromium.zip"
+    rm -rf "$INSTALL_ROOT/chromium"
+    unzip -q "$DOWNLOADS/chromium.zip" -d "$INSTALL_ROOT/tmp-chromium"
+    mv "$INSTALL_ROOT/tmp-chromium/chrome-linux" "$INSTALL_ROOT/chromium"
+    rmdir "$INSTALL_ROOT/tmp-chromium" 2>/dev/null || true
+    chmod +x "$INSTALL_ROOT/chromium/chrome" 2>/dev/null || true
+fi
+[ -x "$INSTALL_ROOT/chromium/chrome" ] || fail "The video display did not unpack correctly."
+say "    video display ready"
+
+# ---------------------------------------------------------------------------
+stage "Connecting this computer to MARP..."
+# ---------------------------------------------------------------------------
+# MARP_WORKER_STATE_DIR is set explicitly here AND in the service below, because
+# activation and the job loop have different defaults. Getting this wrong spends the
+# enrolment and then reports "this worker is not activated", which reads as a
+# credential fault and is a path fault. MARP_API#208 records what it cost.
+MARP_WORKER_STATE_DIR="$STATE_DIR"; export MARP_WORKER_STATE_DIR
+MARP_COORDINATOR_URL="$COORDINATOR_URL"; export MARP_COORDINATOR_URL
+
+if [ -f "$STATE_DIR/worker-credential.dpapi" ]; then
+    say "    this computer is already connected to MARP"
+else
+    MARP_ACTIVATION_CODE="$ENROLMENT_CODE"; export MARP_ACTIVATION_CODE
+    "$VENV/bin/marp-worker-activate" >> "$LOG" 2>&1 || fail \
+        "Could not connect this computer to MARP." \
+        "The coordinator may be unreachable, or this installer's enrolment code may" \
+        "have been revoked. Check your internet connection and try again; if it keeps" \
+        "failing, the installer needs updating."
+    say "    connected"
+fi
+
+# ---------------------------------------------------------------------------
+stage "Starting MARP..."
+# ---------------------------------------------------------------------------
+# A user service rather than a boot service: the watch window needs a graphical
+# session, and systemd lingering would start the worker with no display at all --
+# so the window would silently never open, which on this platform is the failure
+# that looks like success.
+UNIT_DIR="$HOME/.config/systemd/user"
+mkdir -p "$UNIT_DIR"
+cat > "$UNIT_DIR/marp-worker.service" <<UNIT
+[Unit]
+Description=MARP inference worker
+After=graphical-session.target
+PartOf=graphical-session.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+WorkingDirectory=$INSTALL_ROOT
+Environment=MARP_COORDINATOR_URL=$COORDINATOR_URL
+Environment=MARP_WORKER_STATE_DIR=$STATE_DIR
+Environment=MARP_CHROMIUM_PATH=$INSTALL_ROOT/chromium/chrome
+ExecStart=$VENV/bin/marp-worker --screen window
+Restart=always
+RestartSec=15
+
+[Install]
+WantedBy=graphical-session.target
+UNIT
+
+if command -v systemctl >/dev/null 2>&1 && systemctl --user show-environment >/dev/null 2>&1; then
+    systemctl --user daemon-reload
+    systemctl --user enable --now marp-worker.service >> "$LOG" 2>&1 || true
+    say "    MARP will now start automatically when you log in"
+else
+    # A machine without a systemd user session is unusual but not broken. Say how to
+    # start it by hand rather than failing an otherwise complete install.
+    say "    this system does not use systemd; start MARP with:"
+    say "      $VENV/bin/marp-worker --screen window"
+fi
+
+say ""
+say "Done. This computer is now a MARP volunteer worker."
+say ""
+say "  It runs in the background and shows a window while it is working."
+say "  Stop it:    systemctl --user stop marp-worker"
+say "  Start it:   systemctl --user start marp-worker"
+say "  Remove it:  systemctl --user disable --now marp-worker; rm -rf $INSTALL_ROOT"
+say ""

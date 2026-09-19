@@ -149,7 +149,7 @@ the hand-built dev worker 1079, which has its own state directory and is untouch
 Answered `/health` and `/status` in about 10 seconds, idle, enrolled, 1 slot free,
 accepting jobs, on Python 3.12.14.
 
-### Three reporting defects found by running it, and fixed
+### Four defects found by running it, and fixed
 
 marp-laptop-install-test read its own transcript and could not tell a healthy install from
 a dead one without reading the source. A volunteer cannot do that, so this was a real
@@ -165,11 +165,29 @@ defect even though the install had worked.
   something is listening. The deadline also became 180s wall-clock instead of 60 iterations
   of a probe whose length was set by its own timeout, which was a loop count, not a deadline.
 - **Stage 4 leaked `TerminatingError(): "The pipeline has been stopped."`** from
-  `Select-Object -First 1` ending a pipeline early. Fixing it exposed a second, worse bug
-  in the same pipeline: `Sort-Object Name -Descending` is a **string** sort, so it ranked
-  `cpython-3.12.9` above `cpython-3.12.14` and would have built the runtime on the older
-  interpreter on any machine holding both. Same trap that nearly picked the wrong CUDA
-  runtime when `2.9.1` sorted above `2.14.0`.
+  `Select-Object -First 1` ending a pipeline early — cosmetic, and fixed by collecting
+  into an array and indexing it.
+
+- **Stage 4 built the runtime on the wrong Python.** `Sort-Object Name -Descending` is a
+  **string** sort, so it ranked `cpython-3.12.9` above `cpython-3.12.14` and picked the
+  older interpreter on any machine holding both. Reproduced on two machines with real
+  directories rather than argued:
+
+      OLD  string sort + Select-Object -First 1  ->  cpython-3.12.9   WRONG
+      NEW  numeric sort on parsed patch, index   ->  cpython-3.12.14  correct
+
+  It now sorts on the parsed patch number, and rejects a directory that matches the name
+  but holds no `python.exe`. Same trap that nearly picked the wrong CUDA runtime when
+  `2.9.1` sorted above `2.14.0` — twice in this codebase now, so `Sort-Object` on anything
+  version-shaped is worth checking on sight.
+
+**How that last one was found is the part worth keeping.** It is the only defect here that
+fails silently: the three reporting defects produced a confusing transcript, while this one
+produces a wrong runtime and reports success. Nobody was looking for it. It was found
+because the cosmetic noise line immediately above it dragged somebody's eye to the pipeline
+that emitted it. **The cosmetic bug was the symptom that led to the correctness bug** — which
+is an argument for fixing transcript noise on sight rather than filing it as polish, since
+noise is where a reader's attention goes and quiet wrong answers are what survive review.
 
 The banner now names what was checked rather than asserting readiness, and says "a CUDA
 kernel ran" rather than claiming the card is proven for production.

@@ -73,6 +73,44 @@ $Cases = @(
     @{ Name = 'Blackwell never gets cu126';     Cap = '12.0'; Driver = '600.00'; Smi = $true;  Expect = 'cu128' }
 )
 
+# The fabricated cases above prove the rule does correct arithmetic on numbers
+# somebody typed. They do NOT prove the bootstrap reads those numbers correctly
+# off a real card -- a distinction worth keeping, because "11 cases pass" read
+# as "sm_120 is verified" when nobody had run it on a Blackwell.
+#
+# So this case asks the machine it is running on. It has no fixed expectation:
+# it reads what nvidia-smi actually reports, puts those readings through the
+# same rule, and asserts only that a variant comes back and that a machine with
+# a working CUDA card is not quietly sent to the CPU build.
+#
+# Everything it prints goes through Write-Host: a PowerShell function returns
+# everything it emits, so a bare string here would become part of the return
+# value and vanish from the output instead of being shown.
+function Test-ThisMachine {
+
+    if (-not (Get-Command nvidia-smi.exe -ErrorAction SilentlyContinue)) {
+        Write-Host "  SKIP  this machine has no nvidia-smi; the no-GPU case above covers it"
+        return $true
+    }
+
+    $Capability = (& nvidia-smi.exe --query-gpu=compute_cap --format=csv,noheader,nounits | Select-Object -First 1).Trim()
+    $Driver = (& nvidia-smi.exe --query-gpu=driver_version --format=csv,noheader | Select-Object -First 1).Trim()
+    $Name = (& nvidia-smi.exe --query-gpu=name --format=csv,noheader | Select-Object -First 1).Trim()
+    $Chosen = Select-VariantFor $Capability $Driver $true
+
+    Write-Host ("  LIVE  {0} reports capability {1}, driver {2} -> {3}" -f $Name, $Capability, $Driver, $Chosen)
+
+    if (-not $Chosen) {
+        Write-Host "  FAIL  no variant was selected for a real card"
+        return $false
+    }
+    if ($Chosen -eq 'cpu') {
+        Write-Host "  FAIL  a working NVIDIA card was sent to the CPU build"
+        return $false
+    }
+    return $true
+}
+
 $Failures = 0
 foreach ($Case in $Cases) {
     $Actual = Select-VariantFor $Case.Cap $Case.Driver $Case.Smi
@@ -83,6 +121,10 @@ foreach ($Case in $Cases) {
         $Failures += 1
     }
 }
+
+Write-Host ''
+Write-Host 'Against the hardware this is running on:'
+if (-not (Test-ThisMachine)) { $Failures += 1 }
 
 Write-Host ''
 if ($Failures) {

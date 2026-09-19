@@ -75,7 +75,11 @@ function Stop-InstalledProcesses {
     }
 }
 
-$BootstrapManifest = Read-Payload 'bootstrap-manifest.json'
+# The variant table is all the check needs; the manifest is read later,
+# because it is written by the build and only a real install requires it.
+# Reading it here made -CheckOnly unreachable from anything except a built
+# payload -- which defeats the point of checking before you commit to a
+# download.
 $RuntimeTable = Read-Payload 'runtime-variants.json'
 
 # Chooses the runtime from what this computer has.
@@ -186,6 +190,8 @@ if ($CheckOnly) {
 
 if (-not $CoordinatorUrl) { throw 'A coordinator address is required to install.' }
 if (-not $ActivationCodeFile) { throw 'An activation code file is required to install.' }
+
+$BootstrapManifest = Read-Payload 'bootstrap-manifest.json'
 
 Write-Stage 1 'Looking at what this computer has...'
 $Selection = Select-Variant

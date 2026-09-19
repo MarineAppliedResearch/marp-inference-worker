@@ -1,0 +1,39 @@
+# The worker source is installed separately from the packaged source archive.
+# Keep this input to third-party runtime dependencies only: a bare `.` would
+# resolve against PowerShell's launch directory on a volunteer computer.
+fastapi
+uvicorn[standard]
+pydantic
+httpx
+ultralytics==8.4.145
+opencv-python
+psutil
+nvidia-ml-py
+loguru
+scipy
+lap
+cython-bbox
+cython
+filterpy
+torch==2.11.0+cu126
+torchvision==0.26.0+cu126
+
+# Held to the versions in requirements-windows-cu126.lock.txt. A fresh Linux resolve
+# picks newer ones, and a pool where a Linux worker and a Windows worker run
+# different versions can return two different answers to the same job spec without
+# announcing it. `ultralytics-platform` is the one that matters -- it is in the
+# inference path, and VP1 has already drifted to 0.1.48 against a lock saying 0.1.40.
+# The rest are pinned for reproducibility rather than because they are known to
+# affect detections.
+ultralytics-platform==0.1.40
+filelock==3.32.6
+fsspec==2026.7.0
+idna==3.19
+urllib3==2.7.0
+
+# torch is pinned to 2.11.0 rather than the newest available, because 2.11.0 is the
+# newest version present on BOTH cu126 and cu128. Pinning each variant to its own
+# maximum put three torch versions in a four-machine pool answering the same job
+# specs -- 2.14.0 on two boxes and 2.11.0 on the Blackwell laptop, with nothing
+# announcing the difference. One version across every variant is worth more than a
+# newer one on some of them.

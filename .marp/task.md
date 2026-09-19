@@ -1,5 +1,5 @@
 ---
-task: MarineAppliedResearch/marp-inference-worker#39
+task: MarineAppliedResearch/marp-inference-worker#38
 repos: [marp-inference-worker]
 status: verifying
 needs: []
@@ -7,59 +7,148 @@ needs: []
 
 ## Goal
 
-A volunteer's worker never signals a process it does not own. Today `close()` terminates the
-process id it launched, and on Linux that id is routinely not the browser any more — so
-ending a job can kill an unrelated program belonging to the volunteer.
+A volunteer with a Linux computer and an NVIDIA card downloads one small file, runs it, and
+their machine joins MARP. No Python to install, no browser to install, no CUDA toolkit, no
+administrator password, and nothing to paste. This is the Linux half of #38; `vp1-marp` has
+Windows.
 
 ## Requirements
 
-- **R1** — `close()` signals the launched pid only when that pid is still this job's browser.
-- **R2** — A pid that has vanished is treated as not ours, without raising. This is the
-  common case, not an edge case: it happens on every job.
-- **R3** — The browser is still closed. `_kill_by_profile()` remains the mechanism; the pid
-  path is a backstop.
-- **R4** — Windows behaviour is unchanged.
+- **R1** — One artifact a volunteer downloads and runs. No manual configuration.
+- **R2** — Works on a machine with no Python, no browser and no CUDA toolkit.
+- **R3** — Never requires root. Everything lives under one directory; uninstall is `rm -rf`.
+- **R4** — Every downloaded artifact is verified against a checked-in SHA-256 before use.
+- **R5** — Re-running after a failure continues rather than starting over.
+- **R6** — A machine that cannot run MARP is told why, in terms it can act on, before
+  anything is downloaded.
+- **R7** — The worker starts at login and restarts if it crashes, without a volunteer
+  intervening.
+- **R8** — The enrolment code is a build-time input and never enters the repository.
 
 ## Open assumptions
 
-None. The traceback names the failing call, the mechanism is `/snap/bin/chromium` being a
-symlink to `/usr/bin/snap`, and the fix is the one #28 already established on Windows —
-match on what is uniquely ours rather than on a pid. Nothing here is a judgement call that a
-different reasonable answer would change.
+- [x] **A1 · architectural · blocking** — answered 2026-09-18 by Isaac: bundle everything, or
+  download at install? **Download.** Costed on the axis he cares about, which is bytes MARP
+  serves rather than bytes a volunteer fetches: ~5.8 MB per volunteer against ~6.8 GB for a
+  bundle, and a bundle also exceeds GitHub's 2 GB release-asset limit so it would need paid
+  hosting. His words: *"Yeah, just go with your recommendation of a downloader. Just make
+  sure that it works really, really well."*
+
+- [x] **A2 · architectural · blocking** — answered 2026-09-18 by Isaac: is dropping torch for
+  a smaller runtime acceptable? **No.** Running his own PyTorch models is a planned
+  capability, so ONNX and TensorRT are closed on requirements rather than benchmarks. This
+  also settles that `triton` and `sympy` stay although unloaded by YOLO inference: they are
+  `torch.compile`'s JIT and torch's symbolic shape machinery, and a future custom model is
+  exactly what reaches for them.
+
+- [x] **A3 · product · blocking** — answered 2026-09-18 by Isaac, **correcting me**. I
+  decided a machine with no NVIDIA GPU should be refused at install, reasoning from
+  `resolve_device` refusing "auto" without CUDA. He had already said the opposite repeatedly:
+  *"i have already answered like 20 times that we should attempt to work on the fucking cpu
+  otherwise."*
+
+  So **a machine with no GPU installs and runs on the processor.** That needs a worker
+  change as well as an installer one, because `resolve_device` was what made it impossible.
+
+  **The worker half is not in this branch.** It was written in parallel as `#41` / PR `#42`
+  (`cpu-only-workers`), and that implementation is better than the one I had here: its
+  warning goes through `ctx.log(level="warning")`, which reaches `/status` where a volunteer
+  can see it, where mine went to loguru and therefore to a journal no volunteer reads. I
+  reverted mine rather than compete with it. **This branch carries only the installer half**
+  — warn and continue instead of refusing, select the CPU torch build, and size the disk
+  check to it.
+
+- [x] **A4 · product · blocking** — **cu126 and cu128 selected per card, not cu130.**
+  I first argued this from donated consumer hardware; Isaac corrected that too — these are
+  his own test machines, not donations: *"we have several test computers with agents running
+  we need to make sure this works with all of them."*
+
+  The decision holds on better grounds. The fleet is ABYSS RTX 4080 SUPER (8.9), a laptop
+  RTX 5060 (12.0, Blackwell), VP1 GTX 1660 (7.5) and this box's GTX 1660 Ti (7.5). **cu126
+  cannot run the laptop** — its architecture list stops at sm_90 — so per-card selection is
+  not a preference but a requirement for the machines that exist. cu130 would cover all four
+  and is ~1 GB smaller, but needs driver >= 580 and the laptop reports 573.13, so it would
+  exclude a machine currently in the fleet.
 
 ## Decisions
 
-- **2026-09-18** — ownership is decided by reading `/proc/<pid>/cmdline` for this job's
-  profile directory. An unreadable or absent `/proc` entry means "not ours", so the failure
-  direction is leaving a window for `_kill_by_profile()` rather than signalling a stranger.
+- **2026-09-18** — POSIX `sh`, not bash. A volunteer's machine may not have bash and nothing
+  here needs it.
+- **2026-09-18** — the CUDA variant is chosen by the same rule as
+  `bootstrap-windows.ps1:92-102`: capability >= 12.0 takes cu128, everything else cu126.
+  Stated as *the same rule* deliberately — two platforms selecting differently would mean two
+  inference stacks.
+- **2026-09-18** — a driver floor is enforced before anything downloads. Without it the CUDA
+  wheels install perfectly against a too-old driver and the worker enrols, polls, heartbeats
+  and fails every job while reporting itself online. Raised by `vp1-marp`, who hit it.
+- **2026-09-18** — `MARP_WORKER_STATE_DIR` is set explicitly for `marp-worker-activate` and
+  for the service. The two have different defaults, and the mismatch spends a volunteer's
+  enrolment then reports "this worker is not activated" — a path fault that reads as a
+  credential fault. MARP_API#208 records what it cost.
+- **2026-09-18** — a systemd **user** service tied to `graphical-session.target`, not
+  lingering. Lingering would start the worker with no display, so the watch window would
+  silently never open — on this platform, the failure that looks like success.
+- **2026-09-18** — `--check-only`, so a volunteer tests their machine in two seconds rather
+  than after twenty minutes of downloading. Finding out late is how people give up.
 
 ## Plan
 
-1. Branch `39-close-trusts-a-recycled-pid` off `develop` at `7964572`. *(done)*
-2. Add `_still_our_browser()` and guard the non-Windows terminate with it. *(done)*
-3. Tests at the tier that can see it. *(done)*
+1. `bootstrap-linux.sh`, mirroring the Windows stage order. *(done)*
+2. `chromium-linux-x64.lock.json` and `uv-linux-x64.lock.json` with real hashes. *(done)*
+3. `requirements-linux-cu126.{in,lock.txt}` — this repository had no Linux lock at all,
+   which is #37. *(done)*
+4. Driver floor, disk check, dependency checks. *(done)*
+5. `build-linux.sh` to assemble the package and substitute the enrolment code. *(done)*
+6. A cu128 lock, so a Blackwell machine gets pinned versions rather than a fresh
+   resolve. *(done)* — and this forced a decision: **cu128 has no torch 2.14.0 at all**,
+   its newest is 2.11.0. Pinning each variant to its own maximum is what put three torch
+   versions in a four-machine pool answering the same job specs. Both variants are now
+   pinned to **torch 2.11.0**, the newest present on both, so the pool runs one version.
 
 ## Acceptance criteria
 
-- A pid whose command line does not name this job's profile is not signalled.
-- A vanished pid returns False rather than raising.
-- Windows still uses `taskkill /T /F` on the process tree.
+- A volunteer downloads one file, runs it, and the worker enrols and starts. **Stages 1-6
+  verified; 7 and 8 are not.**
+- Nothing requires root. **Met.**
+- Every download verified. **Met.**
+- Re-running after an interrupted install continues. **Met**, by killing the installer
+  mid-download and re-running.
+- An unsuitable machine is told why before downloading. **Met** for a missing driver, an old
+  driver, insufficient disk and missing tools.
 
 ## Test plan
 
-`tests/test_watch_display.py`, two added tests: a pid whose command line names something
-else is refused, one that names the profile is accepted, and a vanished pid returns False.
-26 passed, up from 24. Both new tests proven red against the unfixed module first.
+Run against this machine: Ubuntu 26.04, GTX 1660 Ti, driver 595.91.07.
 
-**What this does not prove:** that no window is left behind in production. That needs a real
-browser on a real desktop over many jobs, and the evidence for it is operational rather than
-a test — ~50 attempts on this machine with one Chromium at a time and no accumulation.
+- `--help` and an unknown option behave.
+- `--check-only` passes, reporting GPU, capability, chosen runtime, driver and disk.
+- A machine with no `nvidia-smi` is refused with distribution-specific instructions
+  (simulated by restricting `PATH`).
+- A too-small disk is refused before downloading (observed against a 7 GB filesystem).
+- Full install: a 5.8 MB package produces a 7.9 GB install — Chromium 156.0.8067.0 runs,
+  torch 2.14.0+cu126 sees the card, all three entry points present, and the worker's own
+  `_find_chromium()` resolves the bundled browser.
+- Interrupted install: `SIGKILL` mid-Chromium-download, then re-run — `uv already downloaded
+  and verified`, `reusing the existing environment`, `Chromium already downloaded and
+  verified`.
+
+**NOT verified, and it is two of the eight stages:** enrolment and service start. Both need
+the standing code from MARP_API#208, which this machine does not have; the test runs used a
+deliberately fake code and stage 7 failed exactly as designed. **Do not read "stages 1-6
+verified" as "the installer works end to end."**
+
+Also not verified: any machine but this one. One GPU, one distribution, one driver version.
+"Runs on many different Linux computers" is the requirement, and a single box cannot
+demonstrate it.
 
 ## Status
 
 - **Gate:** verifying
-- **Notes:** found by MARP-DESKTOP-DEV pulling the traceback off the coordinator, because
-  **the worker writes no local record of a failed job**. 550 KB of worker log across the
-  failure window contains no traceback and no error line. That gap is worth its own issue and
-  is not fixed here — a volunteer whose every job fails has nothing to look at and nothing to
-  send.
+- **Notes:** the first resolution of the Linux lock picked `ultralytics-platform==0.1.48`
+  where the Windows lock pins `0.1.40` — the exact package VP1 drifted on. Pinned, and the
+  two platforms now resolve identically across all 60 shared packages.
+
+  Found and left alone: the worker writes **no local record when a job fails**. Diagnosing
+  seven failed attempts here required a traceback fetched from the coordinator by another
+  agent. A volunteer has no such route, which makes it a packaging concern as much as a
+  worker one. Filed separately.

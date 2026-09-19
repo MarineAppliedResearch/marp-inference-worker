@@ -84,16 +84,15 @@ before and after real CUDA work. There is no lazy loading to exploit.
 
 ## Open assumptions
 
-- [x] **A1 · cross-repository** — answered 2026-09-19: **ship the CPU variant anyway and
-  track the worker-side fix separately.** `resolve_device` refuses `auto` with no CUDA by
-  design (R14), so a CPU machine installs correctly, enrols, takes a job and fails it with
-  `no usable CUDA device`. marp-laptop's fix is PR #42 on `cpu-only-workers`. This does not
-  block the installer: R2 is delivered on the installer's side, and what is missing lives
-  in another repository and another PR. Recorded as non-blocking rather than left open,
-  because leaving it open would have stopped work that was not actually blocked. The
-  consequence — the end-to-end CPU path stays unverified until #42 merges, and testing it
-  against `develop` shows a failure that is not the installer's — is carried in
-  Verification, which is where an untested path belongs.
+- [x] **A1 · cross-repository** — answered 2026-09-19, and **since resolved**: PR #42
+  (`cpu-only-workers`, "A machine with no GPU runs on its processor") is **merged**, and
+  its merge commit `c4c0986` is already contained in this branch. `resolve_device` now
+  honours an explicit `cpu` request and no longer refuses a GPU-less machine outright.
+  The original answer was to ship the CPU variant anyway and track the worker-side fix
+  separately, on the grounds that it did not block the installer; that judgement held and
+  the dependency has now closed on its own. What remains is not a blocker but a test gap:
+  **no machine in the fleet lacks an NVIDIA GPU**, so the CPU path is delivered on both
+  sides and exercised on neither. That belongs in Verification, not here.
 
 - [x] **A2 · environment** — answered 2026-09-19: **ship the published minimums and record
   that they are unmeasured.** `runtime-variants.json` carries `driver_floor_verified: false`
@@ -289,8 +288,12 @@ the same missing thing: a clean Windows machine that has never held a worker, wi
 runtime older than the 14.44 we ship, driven by hand rather than by an agent. One such box
 closes all three in a single sitting. Stated here so it reads as one thing to arrange
 rather than three things to keep deferring.
-- **The CPU path** cannot be meaningfully tested until marp-laptop's PR #42 merges; until
-  then R2 is delivered by the installer and defeated by the worker.
+- **The CPU path is now complete on both sides but exercised on neither.** PR #42 is
+  merged and in this branch, so the worker no longer defeats what the installer delivers.
+  What is missing is a machine: both fleet machines have an NVIDIA GPU, so nothing here
+  has ever selected the `cpu` variant for real. Unlike the VC++ gap, this one does not
+  need a *clean* machine — any computer without an NVIDIA card will do, including a
+  virtual machine with no GPU passthrough.
 - **Repeated clean installs accumulate orphaned workers** coordinator-side, because a fresh
   install on a machine whose state directory was removed enrols a new id. Fleet hygiene,
   not an installer bug, but it should be someone's decision rather than a surprise.

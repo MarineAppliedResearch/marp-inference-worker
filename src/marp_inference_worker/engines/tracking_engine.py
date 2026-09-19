@@ -160,10 +160,25 @@ class TrackingEngine(BaseEngine):
         expected_frames = end_frame - start_frame
 
         # The slot the runner pinned this job to, and the device it resolves to.
-        # resolve_device raises rather than downgrading to CPU.
+        #
+        # `auto` on a machine with no CUDA device now resolves to the processor
+        # rather than refusing, so a volunteer with integrated graphics can
+        # still donate. A job that asked for a GPU by name is still refused.
         slot_index = int(params.get("slot_index", 0))
         device = resolve_device(params.get("device"), slot_index)
-        ctx.log(f"resolved device {device} for slot {slot_index}")
+
+        if device == "cpu" and str(params.get("device") or "auto").lower() == "auto":
+            # Said as a warning, not a log line, because this reaches `/status`
+            # where a volunteer can see it. A machine quietly running ten or
+            # twenty times slower than the person expects is the sort of thing
+            # they conclude is broken.
+            ctx.log(
+                f"no usable CUDA device on this worker, so slot {slot_index} is "
+                "running on the processor; this is much slower than a GPU",
+                level="warning",
+            )
+        else:
+            ctx.log(f"resolved device {device} for slot {slot_index}")
 
         # The reduction rule, chosen by the spec and recorded with every row.
         reduction_ref = spec["reduction"]

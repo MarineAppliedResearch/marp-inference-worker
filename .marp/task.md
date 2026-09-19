@@ -111,12 +111,70 @@ fleet machine, a Pascal and a Maxwell volunteer, no GPU at all, `nvidia-smi` ans
 nothing, a GPU on a driver too old for any runtime, and Blackwell never being handed
 cu126.
 
-**What is not yet verified, and by whom:**
+Fabricated readings prove the arithmetic, not the reading of real hardware, which
+marp-laptop-install-test pointed out and then closed by running the real thing.
 
-- No installer has been built. `build-windows.ps1` needs Node for the player build, which
-  is not installed on VP1.
-- Nothing downstream of selection has been executed anywhere: the download path, the VC++
-  step, activation, or the worker starting from an installed runtime.
-- The CPU path cannot be meaningfully tested until PR #42 merges.
-- Real-hardware runs are split by machine: VP1 has sm_75, ABYSS sm_89, marp-laptop sm_120
-  on the old driver. Nobody has a Maxwell or Pascal card, or a machine with no GPU.
+### What has now been run end to end
+
+**marp-laptop-install-test, RTX 5060 Laptop, Windows 11 26200 — clean machine.**
+Selected cu128 live off `nvidia-smi` at compute capability 12.0, driver 573.13. Enrolled
+as worker 1187, torch 2.11.0+cu128, CUDA 12.8, 10.21 GB in 49,789 files on disk. The
+`cython-bbox` wheel installed from the payload rather than being built. Critically, the
+CUDA check **executed and synchronized a real kernel on sm_120** — which is what separates
+"torch imported" from "this card can run our work", and is the check that catches a wheel
+built without this GPU's kernels. That retires the main risk in the cu128 arch-list
+decision. It is one allocation: it says nothing about a full job, sustained load, or
+memory pressure on 8 GB.
+
+**VP1, GTX 1660, Windows 10 19045 — upgrade over an existing install.** Selected cu128 at
+capability 7.5, reused the protected credential, and came up as worker 1185 (separate from
+the hand-built dev worker 1079, which has its own state directory and is untouched).
+Answered `/health` and `/status` in about 10 seconds, idle, enrolled, 1 slot free,
+accepting jobs, on Python 3.12.14.
+
+### Three reporting defects found by running it, and fixed
+
+marp-laptop-install-test read its own transcript and could not tell a healthy install from
+a dead one without reading the source. A volunteer cannot do that, so this was a real
+defect even though the install had worked.
+
+- **Stage 7 was silent on success** — a machine that enrolled correctly and one that did
+  not produced identical transcripts. It now names the worker id and fails loudly if
+  activation claims success but writes no identity file.
+- **Stage 8 leaked three `TerminatingError(Invoke-RestMethod)` lines** directly above the
+  success banner. `-ErrorAction Stop` inside a `try` does **not** fix this: Start-Transcript
+  records a terminating error whether or not a `catch` handles it. Proven on two machines
+  and two Windows builds. The fix is a TCP socket gate — do not make the HTTP call until
+  something is listening. The deadline also became 180s wall-clock instead of 60 iterations
+  of a probe whose length was set by its own timeout, which was a loop count, not a deadline.
+- **Stage 4 leaked `TerminatingError(): "The pipeline has been stopped."`** from
+  `Select-Object -First 1` ending a pipeline early. Fixing it exposed a second, worse bug
+  in the same pipeline: `Sort-Object Name -Descending` is a **string** sort, so it ranked
+  `cpython-3.12.9` above `cpython-3.12.14` and would have built the runtime on the older
+  interpreter on any machine holding both. Same trap that nearly picked the wrong CUDA
+  runtime when `2.9.1` sorted above `2.14.0`.
+
+The banner now names what was checked rather than asserting readiness, and says "a CUDA
+kernel ran" rather than claiming the card is proven for production.
+
+### What is still not verified, and by whom
+
+- **The VC++ install-and-elevate path has never executed.** VP1 has MSVC 14.44 and
+  marp-laptop-install-test has 14.51, both at or above the 14.44 the installer ships, so
+  stage 2 is skipped on every machine in the fleet. `WinError 1114` remains unreproduced.
+  Two green runs on machines that both skip the step are not coverage of the step. This
+  needs a clean Windows box and is Isaac's to place.
+- **The Inno GUI wizard has never been seen.** Both agents have only run `/VERYSILENT`.
+- **The driver floors remain published minimums**, recorded as `driver_floor_verified:
+  false`. The one measured datapoint is cu128 working at driver 573.13.
+- **No genuinely clean volunteer run** — double-clicked from Explorer on a machine that has
+  never held a worker — has happened. Both runs were agent-driven.
+- **The CPU path** cannot be meaningfully tested until marp-laptop's PR #42 merges; until
+  then R2 is delivered by the installer and defeated by the worker.
+- **Repeated clean installs accumulate orphaned workers** coordinator-side, because a fresh
+  install on a machine whose state directory was removed enrols a new id. Fleet hygiene,
+  not an installer bug, but it should be someone's decision rather than a surprise.
+
+The pattern worth keeping: twice in this session the thing that caught an error was
+somebody running it, not somebody reasoning about it. Both the stage 8 misreading and my
+own `-ErrorAction Stop` non-fix were settled by a five-line script, not by argument.

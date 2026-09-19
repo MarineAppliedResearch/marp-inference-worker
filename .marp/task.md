@@ -206,6 +206,29 @@ had. The prediction going in was that the faster card would answer sooner; it di
 the identical number on very different GPUs is stronger evidence for a disk bound than a
 merely slower one would have been.
 
+### A machine cannot test the branch its own configuration makes unreachable
+
+Four separate gaps in this task turned out to be one rule, and stating it once is more
+useful than listing them four times, because the rule predicts the next blind spot instead
+of merely recording the last one.
+
+- VP1 cannot exercise stage 2, because its VC++ runtime is already current, so the step
+  is skipped.
+- Neither machine can exercise the Inno GUI, because both run `/VERYSILENT`.
+- marp-laptop-install-test cannot exercise the Python sort fix, because it holds exactly
+  one managed 3.12 and the bug needs two.
+- **VP1 cannot exercise the `Resolve-BuildPython` fallback, because it has a `py` launcher
+  and the resolver never reaches the fallback.** This one is the sharpest, because the bug
+  being fixed *lived in the fallback*: a green build on VP1 proves the resolver still works
+  on the path that was never broken. The machine that needs the fix is the only machine that
+  can test it.
+
+The general form: **a green result from a machine whose configuration skips the code under
+test is not evidence about that code.** It is worth asking, of every passing run, which
+branch this machine's configuration makes unreachable — and routing that branch to a
+machine that reaches it, or recording it as untested. Two green runs on machines that both
+skip a step is not coverage of the step, however many times it is repeated.
+
 ### What is still not verified, and by whom
 
 - **The VC++ install-and-elevate path has never executed.** VP1 has MSVC 14.44 and

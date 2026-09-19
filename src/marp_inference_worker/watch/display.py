@@ -649,16 +649,23 @@ def close_orphaned_windows(workspace_root: Path) -> int:
         # There is no count, so this reports "some" rather than inventing one.
         return 1 if found.returncode == 0 else 0
 
-    needle = root.replace("\\", "\\\\").replace("'", "''")
-    query = (
-        "SELECT ProcessId FROM Win32_Process WHERE Name = 'chrome.exe' "
-        f"AND CommandLine LIKE '%{needle}%'"
-    )
+    # **Filtered in PowerShell, not in WQL.** `Win32_Process` does not support
+    # `LIKE`: the provider accepts the query and returns nothing, so a WQL match
+    # on CommandLine is not a narrow search, it is a search that never finds
+    # anything. Measured on 2026-09-19 against a Chromium holding a known
+    # profile: the WQL form returned 0 while `Where-Object -like` returned 12,
+    # with both single and doubled backslashes.
+    #
+    # That silence is why this has never worked on Windows. It looks like "no
+    # orphans found" and reads as success.
+    needle = root.replace("'", "''")
 
     try:
         found = subprocess.run(
             ["powershell.exe", "-NoProfile", "-Command",
-             f"Get-CimInstance -Query \"{query}\" | ForEach-Object {{ $_.ProcessId }}"],
+             "Get-CimInstance Win32_Process -Filter \"Name='chrome.exe'\" | "
+             f"Where-Object {{ $_.CommandLine -like '*{needle}*' }} | "
+             "ForEach-Object { $_.ProcessId }"],
             capture_output=True, text=True, timeout=20, check=False,
         )
     except Exception:
@@ -1179,16 +1186,15 @@ class WatchDisplay:
                 return found.returncode == 0
 
             if sys.platform == "win32":
-                # Same quoting as _kill_by_profile: backslashes doubled because
-                # WQL's LIKE treats one as an escape.
-                needle = str(self._profile_dir).replace("\\", "\\\\").replace("'", "''")
-                query = (
-                    "SELECT ProcessId FROM Win32_Process WHERE Name = 'chrome.exe' "
-                    f"AND CommandLine LIKE '%{needle}%'"
-                )
+                # Same mechanism as _kill_by_profile, and for the same reason it
+                # does not use WQL: `Win32_Process` does not support `LIKE`, so
+                # that form finds nothing and reads as "no window".
+                needle = str(self._profile_dir).replace("'", "''")
                 found = subprocess.run(
                     ["powershell.exe", "-NoProfile", "-Command",
-                     f"Get-CimInstance -Query \"{query}\" | ForEach-Object {{ $_.ProcessId }}"],
+                     "Get-CimInstance Win32_Process -Filter \"Name='chrome.exe'\" | "
+                     f"Where-Object {{ $_.CommandLine -like '*{needle}*' }} | "
+                     "ForEach-Object { $_.ProcessId }"],
                     capture_output=True, text=True, timeout=20, check=False,
                 )
                 return bool(found.stdout.strip())

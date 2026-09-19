@@ -1,154 +1,122 @@
----
-task: MarineAppliedResearch/marp-inference-worker#38
-repos: [marp-inference-worker]
-status: verifying
-needs: []
----
+# A Windows installer that runs on any volunteer's computer
 
-## Goal
+Refs MarineAppliedResearch/marp-inference-worker#38
 
-A volunteer with a Linux computer and an NVIDIA card downloads one small file, runs it, and
-their machine joins MARP. No Python to install, no browser to install, no CUDA toolkit, no
-administrator password, and nothing to paste. This is the Linux half of #38; `vp1-marp` has
-Windows.
+## The task
+
+A volunteer downloads one small file, runs it, and their computer joins the pool —
+whatever they happen to have. No Python, no browser, no CUDA toolkit, no Visual Studio
+beforehand, no questions asked during setup, and **no computer refused**.
+
+The installer stays small and fetches what *that machine* needs, decided from what it
+actually has. It does not carry every runtime for every machine, and it does not hand the
+volunteer a choice of downloads.
 
 ## Requirements
 
-- **R1** — One artifact a volunteer downloads and runs. No manual configuration.
-- **R2** — Works on a machine with no Python, no browser and no CUDA toolkit.
-- **R3** — Never requires root. Everything lives under one directory; uninstall is `rm -rf`.
-- **R4** — Every downloaded artifact is verified against a checked-in SHA-256 before use.
-- **R5** — Re-running after a failure continues rather than starting over.
-- **R6** — A machine that cannot run MARP is told why, in terms it can act on, before
-  anything is downloaded.
-- **R7** — The worker starts at login and restarts if it crashes, without a volunteer
-  intervening.
-- **R8** — The enrolment code is a build-time input and never enters the repository.
+- **R1** The installer reads the machine — GPU present, compute capability, driver
+  version — and selects a runtime from that, without asking the volunteer anything.
+- **R2** No computer is refused. A machine with no NVIDIA GPU, or one no CUDA build can
+  serve, installs the CPU runtime and works slowly rather than failing.
+- **R3** Every worker in the pool runs the same inference stack: same torch version, same
+  ultralytics, same ByteTrack. Only the CUDA build differs.
+- **R4** `MARP_WORKER_STATE_DIR` is set explicitly for both `marp-worker-activate` and the
+  job loop, so activation and the worker agree where the credential lives.
+- **R5** The enrolment code is a build-time input, baked into the artifact, never committed.
+- **R6** Setup succeeds with no Visual Studio and no MSVC redistributable newer than a
+  stock Windows install.
+- **R7** A runtime the driver cannot serve is never installed. Refusing is not enough:
+  the machine falls back to something that works.
+
+## The variants, and what decides between them
+
+```
+cu128   sm_70-sm_120    Volta through Blackwell
+cu126   sm_50-sm_90     Maxwell through Hopper -- the donated GTX 1060
+cpu     no GPU, or a GPU no CUDA build can serve
+```
+
+Newest CUDA the machine can run wins, so every current card takes cu128 and cu126 exists
+for older hardware. All three pin **torch 2.11.0 / torchvision 0.26.0**, which is the
+newest version present on all three indexes — cu128's ceiling is what sets it.
+
+**The capability test is a floor, never list membership.** CUDA minor-version
+compatibility runs a binary on later minor versions of the same major family: an RTX 4080
+SUPER reports 8.9, which appears in no arch list we ship, and runs on sm_86 kernels. A
+membership test would refuse a card that has worked for weeks.
+
+## Why torch is pinned across variants
+
+cu126 pinned `torch==2.14.0` and cu128 pinned `2.10.0`, so the pool ran three torch
+versions against the same job specs — ABYSS 2.14.0, VP1 2.14.0, the laptop 2.11.0 — with
+nothing announcing it. Same class of problem as R16's exact `ultralytics` pin.
+
+Moving every variant to 2.11.0 is a **downgrade for cu126 machines**, taken deliberately:
+one version across the whole pool is worth more than a newer one on two thirds of it.
+
+## Not in scope: making the runtime smaller
+
+Torch stays whole. Running Isaac's own PyTorch models is a planned capability, so what
+gets installed is a general PyTorch runtime rather than "what YOLO needs" — anything torch
+might `dlopen` for a model nobody has written yet stays. Measured: every DLL in Windows
+`torch/lib`, all 3,856 MB, maps at plain `import torch`, and the module count is identical
+before and after real CUDA work. There is no lazy loading to exploit.
+
+## Decided without escalating
+
+- **VC++ redistributable, not a vendored CRT**, and installed only when the machine's is
+  older than the one we ship. Microsoft services it for security; vendoring would make us
+  reship for every CRT fix. **Load-bearing, not hygiene:** VP1 carried MSVC 14.28 from
+  2020 and `import torch` failed outright with `OSError WinError 1114` naming `c10.dll` —
+  an error pointing nowhere near the runtime, which a volunteer would report as a broken
+  package. Checking first means most machines never see the elevation prompt.
+
+- **cu130 dropped.** Measured on real hardware: newest torch, 1.07 GB smaller, reaches
+  Blackwell — but it drops Maxwell and Pascal and needs driver 580. Narrower coverage is
+  the wrong trade when the goal is any volunteer.
 
 ## Open assumptions
 
-- [x] **A1 · architectural · blocking** — answered 2026-09-18 by Isaac: bundle everything, or
-  download at install? **Download.** Costed on the axis he cares about, which is bytes MARP
-  serves rather than bytes a volunteer fetches: ~5.8 MB per volunteer against ~6.8 GB for a
-  bundle, and a bundle also exceeds GitHub's 2 GB release-asset limit so it would need paid
-  hosting. His words: *"Yeah, just go with your recommendation of a downloader. Just make
-  sure that it works really, really well."*
+- [ ] **The CPU path needs a worker change that is not merged.** (cross-repository,
+  `blocking`) `resolve_device` refuses `auto` with no CUDA by design (R14), so a CPU
+  machine installs correctly, enrols, takes a job and fails it with `no usable CUDA
+  device`. marp-laptop's fix is PR #42 on `cpu-only-workers`. Until it merges, R2 is
+  delivered by the installer and defeated by the worker, and testing the CPU path against
+  `develop` will show a failure that is not the installer's.
 
-- [x] **A2 · architectural · blocking** — answered 2026-09-18 by Isaac: is dropping torch for
-  a smaller runtime acceptable? **No.** Running his own PyTorch models is a planned
-  capability, so ONNX and TensorRT are closed on requirements rather than benchmarks. This
-  also settles that `triton` and `sympy` stay although unloaded by YOLO inference: they are
-  `torch.compile`'s JIT and torch's symbolic shape machinery, and a future custom model is
-  exactly what reaches for them.
+- [ ] **The cu126 and cu128 driver floors are published minimums, not measured ones.**
+  (environment) Recorded as `driver_floor_verified: false`. Nobody in the fleet has a
+  machine old enough to find where either actually stops. The one measured datapoint is
+  cu128 working at driver 573.13, from marp-laptop.
 
-- [x] **A3 · product · blocking** — answered 2026-09-18 by Isaac, **correcting me**. I
-  decided a machine with no NVIDIA GPU should be refused at install, reasoning from
-  `resolve_device` refusing "auto" without CUDA. He had already said the opposite repeatedly:
-  *"i have already answered like 20 times that we should attempt to work on the fucking cpu
-  otherwise."*
+## Record which torch build produced an observation
 
-  So **a machine with no GPU installs and runs on the processor.** That needs a worker
-  change as well as an installer one, because `resolve_device` was what made it impossible.
+`gpu_job_attempts.capabilities_snapshot` records `cuda_devices`, `cuda_device_count` and
+`ultralytics_version` per attempt, but **not the torch build** — so cu126 against cu128
+cannot be recovered for a given observation.
 
-  **The worker half is not in this branch.** It was written in parallel as `#41` / PR `#42`
-  (`cpu-only-workers`), and that implementation is better than the one I had here: its
-  warning goes through `ctx.log(level="warning")`, which reaches `/status` where a volunteer
-  can see it, where mine went to loguru and therefore to a journal no volunteer reads. I
-  reverted mine rather than compete with it. **This branch carries only the installer half**
-  — warn and continue instead of refusing, select the CPU torch build, and size the disk
-  check to it.
+This cuts both ways and both halves belong here. Pinning one torch version is partly a way
+of making the question stop mattering: one build in the pool is a variable nobody has to
+record. But two CUDA builds are deliberate and right, because a donated GTX 1060 is the
+volunteer this is for. **So both builds stay and the snapshot should gain the field** —
+the pinning is not an argument for collapsing to one.
 
-- [x] **A4 · product · blocking** — **cu126 and cu128 selected per card, not cu130.**
-  I first argued this from donated consumer hardware; Isaac corrected that too — these are
-  his own test machines, not donations: *"we have several test computers with agents running
-  we need to make sure this works with all of them."*
+Cross-repository: the recording half is `MarineAppliedResearch/MARP_API`.
 
-  The decision holds on better grounds. The fleet is ABYSS RTX 4080 SUPER (8.9), a laptop
-  RTX 5060 (12.0, Blackwell), VP1 GTX 1660 (7.5) and this box's GTX 1660 Ti (7.5). **cu126
-  cannot run the laptop** — its architecture list stops at sm_90 — so per-card selection is
-  not a preference but a requirement for the machines that exist. cu130 would cover all four
-  and is ~1 GB smaller, but needs driver >= 580 and the laptop reports 573.13, so it would
-  exclude a machine currently in the fleet.
+## Verification
 
-## Decisions
+`packaging/test-select-variant.ps1` drives the selection rule with fabricated machine
+readings, so it covers hardware nobody in the fleet has. 11 cases, all passing: every
+fleet machine, a Pascal and a Maxwell volunteer, no GPU at all, `nvidia-smi` answering
+nothing, a GPU on a driver too old for any runtime, and Blackwell never being handed
+cu126.
 
-- **2026-09-18** — POSIX `sh`, not bash. A volunteer's machine may not have bash and nothing
-  here needs it.
-- **2026-09-18** — the CUDA variant is chosen by the same rule as
-  `bootstrap-windows.ps1:92-102`: capability >= 12.0 takes cu128, everything else cu126.
-  Stated as *the same rule* deliberately — two platforms selecting differently would mean two
-  inference stacks.
-- **2026-09-18** — a driver floor is enforced before anything downloads. Without it the CUDA
-  wheels install perfectly against a too-old driver and the worker enrols, polls, heartbeats
-  and fails every job while reporting itself online. Raised by `vp1-marp`, who hit it.
-- **2026-09-18** — `MARP_WORKER_STATE_DIR` is set explicitly for `marp-worker-activate` and
-  for the service. The two have different defaults, and the mismatch spends a volunteer's
-  enrolment then reports "this worker is not activated" — a path fault that reads as a
-  credential fault. MARP_API#208 records what it cost.
-- **2026-09-18** — a systemd **user** service tied to `graphical-session.target`, not
-  lingering. Lingering would start the worker with no display, so the watch window would
-  silently never open — on this platform, the failure that looks like success.
-- **2026-09-18** — `--check-only`, so a volunteer tests their machine in two seconds rather
-  than after twenty minutes of downloading. Finding out late is how people give up.
+**What is not yet verified, and by whom:**
 
-## Plan
-
-1. `bootstrap-linux.sh`, mirroring the Windows stage order. *(done)*
-2. `chromium-linux-x64.lock.json` and `uv-linux-x64.lock.json` with real hashes. *(done)*
-3. `requirements-linux-cu126.{in,lock.txt}` — this repository had no Linux lock at all,
-   which is #37. *(done)*
-4. Driver floor, disk check, dependency checks. *(done)*
-5. `build-linux.sh` to assemble the package and substitute the enrolment code. *(done)*
-6. A cu128 lock, so a Blackwell machine gets pinned versions rather than a fresh
-   resolve. *(done)* — and this forced a decision: **cu128 has no torch 2.14.0 at all**,
-   its newest is 2.11.0. Pinning each variant to its own maximum is what put three torch
-   versions in a four-machine pool answering the same job specs. Both variants are now
-   pinned to **torch 2.11.0**, the newest present on both, so the pool runs one version.
-
-## Acceptance criteria
-
-- A volunteer downloads one file, runs it, and the worker enrols and starts. **Stages 1-6
-  verified; 7 and 8 are not.**
-- Nothing requires root. **Met.**
-- Every download verified. **Met.**
-- Re-running after an interrupted install continues. **Met**, by killing the installer
-  mid-download and re-running.
-- An unsuitable machine is told why before downloading. **Met** for a missing driver, an old
-  driver, insufficient disk and missing tools.
-
-## Test plan
-
-Run against this machine: Ubuntu 26.04, GTX 1660 Ti, driver 595.91.07.
-
-- `--help` and an unknown option behave.
-- `--check-only` passes, reporting GPU, capability, chosen runtime, driver and disk.
-- A machine with no `nvidia-smi` is refused with distribution-specific instructions
-  (simulated by restricting `PATH`).
-- A too-small disk is refused before downloading (observed against a 7 GB filesystem).
-- Full install: a 5.8 MB package produces a 7.9 GB install — Chromium 156.0.8067.0 runs,
-  torch 2.14.0+cu126 sees the card, all three entry points present, and the worker's own
-  `_find_chromium()` resolves the bundled browser.
-- Interrupted install: `SIGKILL` mid-Chromium-download, then re-run — `uv already downloaded
-  and verified`, `reusing the existing environment`, `Chromium already downloaded and
-  verified`.
-
-**NOT verified, and it is two of the eight stages:** enrolment and service start. Both need
-the standing code from MARP_API#208, which this machine does not have; the test runs used a
-deliberately fake code and stage 7 failed exactly as designed. **Do not read "stages 1-6
-verified" as "the installer works end to end."**
-
-Also not verified: any machine but this one. One GPU, one distribution, one driver version.
-"Runs on many different Linux computers" is the requirement, and a single box cannot
-demonstrate it.
-
-## Status
-
-- **Gate:** verifying
-- **Notes:** the first resolution of the Linux lock picked `ultralytics-platform==0.1.48`
-  where the Windows lock pins `0.1.40` — the exact package VP1 drifted on. Pinned, and the
-  two platforms now resolve identically across all 60 shared packages.
-
-  Found and left alone: the worker writes **no local record when a job fails**. Diagnosing
-  seven failed attempts here required a traceback fetched from the coordinator by another
-  agent. A volunteer has no such route, which makes it a packaging concern as much as a
-  worker one. Filed separately.
+- No installer has been built. `build-windows.ps1` needs Node for the player build, which
+  is not installed on VP1.
+- Nothing downstream of selection has been executed anywhere: the download path, the VC++
+  step, activation, or the worker starting from an installed runtime.
+- The CPU path cannot be meaningfully tested until PR #42 merges.
+- Real-hardware runs are split by machine: VP1 has sm_75, ABYSS sm_89, marp-laptop sm_120
+  on the old driver. Nobody has a Maxwell or Pascal card, or a machine with no GPU.

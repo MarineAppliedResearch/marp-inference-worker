@@ -1,5 +1,6 @@
 # The worker source is installed separately from the packaged source archive.
-# Keep this input to third-party runtime dependencies only.
+# Keep this input to third-party runtime dependencies only: a bare `.` would
+# resolve against PowerShell's launch directory on a volunteer computer.
 fastapi
 uvicorn[standard]
 pydantic
@@ -15,5 +16,15 @@ cython-bbox
 cython
 filterpy
 pyinstaller==6.22.2
-torch==2.10.0+cu128
-torchvision==0.25.0+cu128
+#
+# torch 2.11.0 across EVERY variant, deliberately. It is the newest version
+# present on the cu126, cu128 and cpu indexes alike, and one version across the
+# whole pool is worth more than a newer one on part of it: cu126 pinned 2.14.0
+# and cu128 pinned 2.10.0, and the pool has been running three different torch
+# versions against the same job specs. This is a downgrade for cu126 machines
+# from 2.14.0, taken on purpose.
+#
+# CUDA 12.8: sm_70-sm_120, Volta through Blackwell. The only variant that can
+# run a consumer Blackwell card; cu126 stops at sm_90.
+torch==2.11.0+cu128
+torchvision==0.26.0+cu128

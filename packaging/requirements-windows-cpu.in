@@ -24,8 +24,8 @@ pyinstaller==6.22.2
 # versions against the same job specs. This is a downgrade for cu126 machines
 # from 2.14.0, taken on purpose.
 #
-# CUDA 12.6: sm_50-sm_90, Maxwell through Hopper. The only variant that serves
-# a GTX 900 or GTX 10-series card, which is the spare GPU a volunteer is most
-# likely to donate.
-torch==2.11.0+cu126
-torchvision==0.26.0+cu126
+# No CUDA. For a machine with no NVIDIA GPU, or one no CUDA variant can serve.
+# Roughly 1-2 frames a second against 23 on a real card -- slow rather than
+# useless, and Isaac's instruction is that such a volunteer still takes part.
+torch==2.11.0+cpu
+torchvision==0.26.0+cpu

@@ -2,8 +2,9 @@
 param(
     [Parameter(Mandatory)][string]$PayloadRoot,
     [Parameter(Mandatory)][string]$InstallRoot,
-    [Parameter(Mandatory)][string]$CoordinatorUrl,
-    [Parameter(Mandatory)][string]$ActivationCodeFile
+    [string]$CoordinatorUrl,
+    [string]$ActivationCodeFile,
+    [switch]$CheckOnly
 )
 
 # bootstrap-windows.ps1
@@ -140,6 +141,51 @@ function Select-Variant {
     Write-Host 'Updating the NVIDIA driver from nvidia.com may let MARP use the GPU.' -ForegroundColor Yellow
     return @{ Variant = $Cpu; Reason = 'no CUDA runtime matches this GPU and driver' }
 }
+
+# -CheckOnly answers "will this work on my computer" in a couple of seconds.
+#
+# The alternative is a volunteer finding out twenty minutes and several
+# gigabytes in, which is the position the Linux side fixed first. It reports
+# what was found and what would be installed, then exits without touching
+# anything -- no download, no install, no enrolment.
+if ($CheckOnly) {
+    Write-Host ''
+    Write-Host 'Checking whether this computer can run MARP...' -ForegroundColor Cyan
+    $Selection = Select-Variant
+    $Variant = $Selection.Variant
+    Write-Host ''
+    Write-Host "MARP would install the $($Variant.name) runtime, because $($Selection.Reason)." -ForegroundColor Green
+    if ($Variant.name -eq 'cpu') {
+        Write-Host 'That runs on the processor: much slower than a graphics card, and still useful.'
+        Write-Host 'A newer NVIDIA driver from nvidia.com may let MARP use a GPU instead.'
+    } else {
+        Write-Host "GPUs this runtime serves: $($Variant.architectures)"
+        Write-Host "Oldest NVIDIA driver it needs: $($Variant.minimum_driver_version)"
+    }
+
+    # The runtime the volunteer already has decides whether setup will ask for
+    # administrator approval, and that is worth knowing before they start.
+    $Installed = Join-Path $env:SystemRoot 'System32\msvcp140.dll'
+    $Required = [version](Read-Payload 'vcredist-windows-x64.lock.json').file_version
+    $Present = $null
+    if (Test-Path -LiteralPath $Installed) {
+        $Present = [version](Get-Item -LiteralPath $Installed).VersionInfo.FileVersion
+    }
+    if ($Present -and $Present -ge $Required) {
+        Write-Host "Visual C++ runtime $Present is present; setup will not need administrator approval."
+    } else {
+        $Found = if ($Present) { "$Present" } else { 'none' }
+        Write-Host "Visual C++ runtime found: $Found. Setup will install $Required and ask for administrator approval once." -ForegroundColor Yellow
+    }
+
+    Write-Host ''
+    Write-Host 'Nothing was installed or downloaded. Run setup normally to install.'
+    Stop-Transcript | Out-Null
+    exit 0
+}
+
+if (-not $CoordinatorUrl) { throw 'A coordinator address is required to install.' }
+if (-not $ActivationCodeFile) { throw 'An activation code file is required to install.' }
 
 Write-Stage 1 'Looking at what this computer has...'
 $Selection = Select-Variant

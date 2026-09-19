@@ -1164,6 +1164,32 @@ class WatchDisplay:
     # Output: none.
     # Use this from close(), before the pid-based kill. Best effort throughout:
     # a window that will not die must not stop a job being reported.
+    # _still_our_browser()
+    # Whether the launched pid is still the browser we started.
+    # Inputs: none; reads /proc.
+    # Output: True only when the process at that pid still names this job's
+    # profile directory on its command line.
+    #
+    # Use this before signalling. A pid is not an identity on Linux: it is a number
+    # that gets reused, and a wrapper that execs and exits hands ours back within
+    # seconds. Answering "no" wrongly leaves a window for `_kill_by_profile` to
+    # close; answering "yes" wrongly kills somebody else's process.
+    def _still_our_browser(self) -> bool:
+
+        if self._process is None or self._profile_dir is None:
+            return False
+
+        try:
+            # /proc is the only thing that can answer this, and it is absent on a
+            # platform without it -- in which case we decline to signal rather than
+            # guess, because the profile match has already run.
+            command_line = Path(f"/proc/{self._process.pid}/cmdline").read_bytes()
+        except OSError:
+            return False
+
+        return str(self._profile_dir).encode("utf-8") in command_line
+
+
     def _kill_by_profile(self) -> None:
 
         if self._profile_dir is None:
@@ -1240,7 +1266,23 @@ class WatchDisplay:
         # unique to this job, so anything holding it is ours.
         self._kill_by_profile()
 
-        if self._process is not None and self._process.poll() is None:
+        # Off Windows, only signal the pid if it is still *our* browser.
+        #
+        # `/snap/bin/chromium` is a symlink to `/usr/bin/snap`, which execs and
+        # hands off, so the pid we launched belongs to a wrapper that exits almost
+        # immediately. Linux then recycles that number, and by the time a job ends
+        # it can belong to anything. Terminating it raised PermissionError on seven
+        # attempts here -- and that was the *lucky* outcome, because EPERM only
+        # happens when the new owner is another user. Recycled to a process this
+        # worker could signal, it would have killed a volunteer's own program
+        # silently, with nothing written anywhere.
+        #
+        # `_kill_by_profile()` above has already closed the real browser by matching
+        # its profile directory, so this path is a backstop rather than the
+        # mechanism. Same lesson as #28 on Windows: match on what is uniquely ours,
+        # never on a pid that something else may now own.
+        if self._process is not None and self._process.poll() is None \
+                and (sys.platform == "win32" or self._still_our_browser()):
             if sys.platform == "win32":
                 # Installed Chrome owns a renderer tree. Terminating only its
                 # first process leaves the visible app window orphaned.

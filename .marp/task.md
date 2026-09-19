@@ -1,5 +1,5 @@
 ---
-task: MarineAppliedResearch/marp-inference-worker#31
+task: MarineAppliedResearch/marp-inference-worker#39
 repos: [marp-inference-worker]
 status: verifying
 needs: []
@@ -7,142 +7,59 @@ needs: []
 
 ## Goal
 
-A volunteer running the worker on Linux sees the watch window — the model's annotations drawn
-live over the video it is working on — exactly as a Windows volunteer does. Today they see
-nothing: the browser search looks only for `chrome.exe` under Windows `Program Files`, so
-`_find_chromium()` returns `None`, `start()` raises, and the window has never opened on any
-Linux machine. The window is how a volunteer can tell the worker is doing something real,
-and it is how a wrong model was noticed by eye the one time it happened.
+A volunteer's worker never signals a process it does not own. Today `close()` terminates the
+process id it launched, and on Linux that id is routinely not the browser any more — so
+ending a job can kill an unrelated program belonging to the volunteer.
 
 ## Requirements
 
-- **R1** — On Linux the worker finds a Chromium-family browser and opens the watch window.
-- **R2** — Discovery is **bundled first, system second**, matching Windows, so a packaged
-  build and a development machine take the same path rather than two.
-- **R3** — A browser found through a multi-call wrapper is launched by the name it was found
-  under, not by the target of its symlink.
-- **R4** — Window geometry comes from the real display on Linux, with the single-screen
-  fallback retained for when it cannot be read.
-- **R5** — A finished or killed job closes its own window on Linux, matching on the
-  attempt's profile directory so it can never reach the volunteer's own browser.
-- **R6** — Windows behaviour is unchanged throughout.
+- **R1** — `close()` signals the launched pid only when that pid is still this job's browser.
+- **R2** — A pid that has vanished is treated as not ours, without raising. This is the
+  common case, not an edge case: it happens on every job.
+- **R3** — The browser is still closed. `_kill_by_profile()` remains the mechanism; the pid
+  path is a backstop.
+- **R4** — Windows behaviour is unchanged.
 
 ## Open assumptions
 
-- [x] **A1 · environment · blocking** — answered 2026-09-18 by Isaac: this machine had no
-  Chromium-family browser at all, so #31 could not be demonstrated. **Install a system
-  Chromium**, explicitly as an interim measure. His words: *"I don't want a volunteer to have
-  to install fucking things to get this working!!!!! but for now have it go ahead and install
-  the damned chromium browser, but we have to make sure later that we package up everything
-  the user needs."* So the shipped answer is the bundled-snapshot pattern that
-  `packaging/chromium-windows-x64.lock.json` already implements for Windows, pointed at
-  `Linux_x64/<snapshot>/chrome-linux.zip`. That is **not in this branch** — see *Not in
-  scope*.
-
-- [x] **A2 · product/UI · blocking** — answered 2026-09-18 by Isaac: the only display here is
-  a 5120x2880 panel rotated left, so the desktop is 2880x5120 portrait. Is a landscape window
-  on a portrait screen acceptable rather than a reason to hold? **Yes.** So R4 is about
-  reading the real geometry, not about laying out differently for portrait.
+None. The traceback names the failing call, the mechanism is `/snap/bin/chromium` being a
+symlink to `/usr/bin/snap`, and the fix is the one #28 already established on Windows —
+match on what is uniquely ours rather than on a pid. Nothing here is a judgement call that a
+different reasonable answer would change.
 
 ## Decisions
 
-- **2026-09-18** — browser discovery asks `PATH` via `shutil.which` before falling back to
-  fixed paths. Linux has no `Program Files` equivalent and a volunteer's browser may be a
-  distribution package, a vendor `.deb`, a snap or a flatpak. The fixed paths remain for a
-  worker started from a service with a minimal environment, where `PATH` is not the whole
-  answer.
-
-- **2026-09-18** — `_find_chromium()` no longer resolves a candidate whose resolved basename
-  differs from the name it was found under. `/snap/bin/chromium` is a symlink to
-  `/usr/bin/snap`, which reads `argv[0]` to decide which snap to run: resolving it launches
-  the snap tool with Chromium's arguments and nothing appears. This was found by running it,
-  not by reading it — the first attempt returned `/usr/bin/snap` and opened no window.
-
-- **2026-09-18** — window cleanup on Linux is `pkill -f <profile path>`. Matching the profile
-  directory rather than the process name is what keeps it off the volunteer's own browser,
-  and that matters more here than on Windows because the system Chromium the worker borrows
-  may be the browser they are reading the instructions in.
-
-- **2026-09-18** — raising the window and idle detection are left as no-ops on Linux, as
-  advised. They are polish and they are not worth blocking the port on.
-
-- **2026-09-18** — `O_BINARY` is included in the open flags via `getattr(os, "O_BINARY", 0)`,
-  because the constant does not exist off Windows. **This was a regression introduced by the
-  decision above and caught by Windows verification, not by reasoning.** `os.open` without it
-  gives a text-mode descriptor on Windows, which translates every `0x0A` written to
-  `0x0D 0x0A`; DPAPI ciphertext is binary, so the credential was corrupted on write and
-  `CryptUnprotectData` failed at startup with *The data is invalid*. Demonstrated rather than
-  argued: `010a020a0a03` came back as `010d0a020d0a0d0a03`.
-
-  Worth recording because of its shape. A Windows worker would have activated successfully,
-  written a corrupted credential, and failed to authenticate later — the same failure that
-  opened this issue, arriving from the opposite platform. The tests written here are what
-  caught it; the original code never went near `os.open`.
+- **2026-09-18** — ownership is decided by reading `/proc/<pid>/cmdline` for this job's
+  profile directory. An unreadable or absent `/proc` entry means "not ours", so the failure
+  direction is leaving a window for `_kill_by_profile()` rather than signalling a stranger.
 
 ## Plan
 
-1. Branch **from `32-linux-credential-store`, not `develop`** — stacked deliberately. Without
-   #32 a Linux worker cannot read its credential at startup, so a `develop`-based branch
-   could not be run at all on the machine this was developed and tested on. *(done)*
-2. Linux browser discovery in `_find_chromium()`, bundled first. *(done)*
-3. Stop resolving multi-call wrappers. *(done)*
-4. `xrandr --listmonitors` branch in `_monitors()`, ahead of the existing fallback. *(done)*
-5. Linux branch in `_kill_by_profile()`. *(done)*
-6. Tests for each. *(done)*
+1. Branch `39-close-trusts-a-recycled-pid` off `develop` at `7964572`. *(done)*
+2. Add `_still_our_browser()` and guard the non-Windows terminate with it. *(done)*
+3. Tests at the tier that can see it. *(done)*
 
 ## Acceptance criteria
 
-- The watch window opens on Linux during a real job. **Met** — observed on attempt 5043,
-  with `browser-render-proof.jpg` written and Chromium running as pid 20041.
-- `_find_chromium()` returns a launchable path on a snap-based Ubuntu. **Met** — returns
-  `/snap/bin/chromium`, not `/usr/bin/snap`.
-- `_monitors()` reports the real desktop. **Met** — `[(0, 0, 2880, 5120)]` on the rotated 5K
-  panel, where the fallback would have said 1920x1080.
-- A finished job leaves no window. **Not directly observed** — see below.
-- Windows unchanged. **Not executable here.**
+- A pid whose command line does not name this job's profile is not signalled.
+- A vanished pid returns False rather than raising.
+- Windows still uses `taskkill /T /F` on the process tree.
 
 ## Test plan
 
-`tests/test_watch_display.py`, six added tests, run as a file rather than as a suite:
-browser found on `PATH`; a multi-call wrapper not resolved; `xrandr` parsed into rectangles;
-the fallback when `xrandr` is absent; `pkill` invoked with the profile path; and nothing
-invoked when there is no profile. 24 passed, up from 18.
+`tests/test_watch_display.py`, two added tests: a pid whose command line names something
+else is refused, one that names the profile is accepted, and a vanished pid returns False.
+26 passed, up from 24. Both new tests proven red against the unfixed module first.
 
-**What these do not prove**, stated rather than left to look like coverage:
-- **R5 is proven at the wrong tier.** The test asserts `pkill` is *called with* the profile
-  path. It does not assert a window actually disappeared, because that needs a real window
-  and a real desktop. The failure mode #29 describes could still exist here.
-- **R6 is not proven at all.** Windows cannot be executed on this machine. Every change is a
-  `sys.platform` branch that returns before the Windows code, but the Windows path has not
-  been run.
-
-## Not in scope
-
-- **The bundled Chromium snapshot for Linux**, which is the actual answer to A1 and is the
-  difference between this working for a developer and working for a volunteer. Needs a
-  `chromium-linux-x64.lock.json` alongside the Windows one.
-- **Snap confinement is untested and may matter.** The browser used here is the Chromium
-  snap, which is AppArmor-confined. It rendered the page from the package directory under
-  `$HOME` and it worked, but a confined snap is a poor stand-in for the bundled build, and
-  it could pass here and fail for a volunteer, or the reverse.
-- **Raising and idle detection**, left as no-ops by decision.
-- **#29**, orphaned windows from a previous run, which is `marp-laptop`'s branch.
+**What this does not prove:** that no window is left behind in production. That needs a real
+browser on a real desktop over many jobs, and the evidence for it is operational rather than
+a test — ~50 attempts on this machine with one Chromium at a time and no accumulation.
 
 ## Status
 
 - **Gate:** verifying
-- **Notes:** written **after** implementation rather than before it, which is not the order
-  the harness asks for. Both assumptions had been answered by Isaac beforehand, so no
-  blocking assumption was open while the code was written, but the spec did not exist at
-  G1 and this note is here rather than left for someone to notice.
-
-  Found and left alone: **ten tests in `tests/test_watch_display.py` are defined twice** —
-  ruff reports ten F811 redefinitions on `develop`, unchanged by this branch. A block of the
-  file appears to have been duplicated, so the first definition of each is shadowed and has
-  never run. Among them is
-  `test_chromium_is_found_from_configuration_or_an_installed_browser`, which covers the very
-  function this branch changes — so the existing coverage of `_find_chromium()` is half what
-  it looks like. Pre-dates this branch and is not fixed here.
-
-  Also from Windows verification, recorded because it is expensive to rediscover: `wmic` has
-  been removed from current Windows builds, so anything reaching for it fails.
+- **Notes:** found by MARP-DESKTOP-DEV pulling the traceback off the coordinator, because
+  **the worker writes no local record of a failed job**. 550 KB of worker log across the
+  failure window contains no traceback and no error line. That gap is worth its own issue and
+  is not fixed here — a volunteer whose every job fails has nothing to look at and nothing to
+  send.

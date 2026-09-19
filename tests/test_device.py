@@ -24,19 +24,18 @@ from marp_inference_worker.system import device as device_module
 #
 # Proves R14's second sentence. On a machine with no CUDA device, a job asking
 # for "auto" is refused, and the refusal says what to do instead.
-def test_auto_refuses_rather_than_falling_back_to_cpu(monkeypatch) -> None:
+def test_auto_falls_back_to_cpu_on_a_machine_with_no_gpu(monkeypatch) -> None:
 
     # Stand in for a machine with no usable GPU.
     monkeypatch.setattr(device_module, "cuda_device_count", lambda: 0)
 
-    with pytest.raises(JobUnrunnable) as raised:
-        device_module.resolve_device("auto", slot_index=0)
-
-    # The message has to be actionable, not just a refusal.
-    message = str(raised.value)
-    assert "auto" in message
-    assert "no usable CUDA device" in message
-    assert "'cpu'" in message
+    # This asserted a refusal until 18 September, and the refusal was
+    # defensible while a worker was assumed to be a GPU machine. The pool is
+    # volunteers now, and Isaac's requirement is any computer, any GPU or no
+    # GPU: a laptop with integrated graphics donating slow frames is worth more
+    # than one that will not start. The protection that mattered is kept by
+    # `test_an_explicit_gpu_request_still_refuses_without_one` below.
+    assert device_module.resolve_device("auto", slot_index=0) == "cpu"
 
 
 # test_missing_device_is_treated_as_auto_and_also_refuses(monkeypatch)
@@ -47,12 +46,13 @@ def test_auto_refuses_rather_than_falling_back_to_cpu(monkeypatch) -> None:
 # Proves the rule cannot be sidestepped by omission. A job spec that says
 # nothing about devices means "auto", so it must refuse on a GPU-less machine
 # too -- otherwise the safe default would be the unsafe one.
-def test_missing_device_is_treated_as_auto_and_also_refuses(monkeypatch) -> None:
+def test_missing_device_is_treated_as_auto(monkeypatch) -> None:
 
     monkeypatch.setattr(device_module, "cuda_device_count", lambda: 0)
 
-    with pytest.raises(JobUnrunnable):
-        device_module.resolve_device(None, slot_index=0)
+    # A spec that says nothing about devices means "use what this machine has",
+    # which on a machine with no GPU is its processor.
+    assert device_module.resolve_device(None, slot_index=0) == "cpu"
 
 
 # test_explicit_cpu_is_honoured()
@@ -123,14 +123,21 @@ def test_auto_shares_the_cards_when_there_are_more_slots_than_gpus(monkeypatch) 
 # Output: pytest pass/fail result.
 # Sharing cards is only meaningful when there is a card. A machine with none
 # has to be told so, rather than being handed `cuda:0` that does not exist.
-def test_auto_still_refuses_when_there_is_no_gpu_at_all(monkeypatch) -> None:
+def test_an_explicit_gpu_request_still_refuses_without_one(monkeypatch) -> None:
 
     monkeypatch.setattr(device_module, "cuda_device_count", lambda: 0)
 
-    with pytest.raises(JobUnrunnable) as raised:
-        device_module.resolve_device("auto", slot_index=0)
+    # This is the half of the old refusal worth keeping, and it is the whole
+    # distinction: `auto` means "whatever this machine has", so a CPU is a
+    # correct answer. `cuda` is a job stating a requirement, and quietly giving
+    # it a processor would mean a run twenty times slower than anyone expected,
+    # reported as a success. A machine doing what it can is not the same as a
+    # job getting something it did not ask for.
+    for request in ("cuda", "cuda:0", "cuda:3"):
+        with pytest.raises(JobUnrunnable) as raised:
+            device_module.resolve_device(request, slot_index=0)
 
-    assert "no usable CUDA device" in str(raised.value)
+        assert "no usable CUDA device" in str(raised.value), request
 
 
 # test_explicit_cuda_index_is_checked_against_what_exists(monkeypatch)
@@ -233,3 +240,20 @@ def test_cuda_device_count_is_zero_without_torch(monkeypatch) -> None:
 
     assert device_module.cuda_device_count() == 0
     assert device_module.describe_cuda_devices() == []
+
+
+# test_a_cpu_only_machine_still_derives_a_usable_slot_count()
+# Verifies a GPU-less volunteer gets one slot rather than none or many.
+# Inputs: none.
+# Output: pytest pass/fail result.
+#
+# The ceiling divides VRAM by a per-job figure. On a machine with no cards
+# there is no VRAM to divide, and either answer at the extremes is wrong: zero
+# slots is a worker that never takes work, and a number derived from cores
+# alone would hand four concurrent jobs to a processor that struggles with one.
+def test_a_cpu_only_machine_still_derives_a_usable_slot_count(monkeypatch) -> None:
+    from marp_inference_worker.jobs import runner as runner_module
+
+    monkeypatch.setattr(runner_module.device_module, "describe_cuda_devices", lambda: [])
+
+    assert runner_module.derive_slot_count() == 1

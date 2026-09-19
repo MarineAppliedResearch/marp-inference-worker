@@ -135,14 +135,25 @@ def resolve_device(requested: str | None, slot_index: int) -> str:
             )
         return f"cuda:{requested_index}"
 
-    # "auto" resolves to this slot's GPU, and refuses if there is not one.
+    # "auto" resolves to this slot's GPU, or to the CPU when there is none.
     if request == "auto":
         device_count = cuda_device_count()
+
         if device_count == 0:
-            raise JobUnrunnable(
-                "job requested device 'auto' but this worker has no usable CUDA device; "
-                "set device to 'cpu' explicitly to run without a GPU"
-            )
+            # A machine with no usable CUDA device runs on its processor.
+            #
+            # This used to refuse, and refusing was defensible while a worker
+            # was assumed to be a GPU machine: a job that silently ran twenty
+            # times slower looked like a working worker having a bad day. But
+            # the pool is volunteers, and Isaac's requirement is any computer,
+            # any GPU or no GPU -- a laptop with integrated graphics donating
+            # slow frames is worth more than a laptop that refuses to start.
+            #
+            # `auto` only. An explicit `cuda` or `cuda:N` below still refuses,
+            # because a job that *asked* for a GPU must not quietly get a CPU
+            # and report success -- that is the difference between a machine
+            # doing what it can and a job producing a result nobody expected.
+            return "cpu"
 
         # Slots share the cards, round robin.
         #

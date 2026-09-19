@@ -1,5 +1,5 @@
 ---
-task: MarineAppliedResearch/marp-inference-worker#31
+task: MarineAppliedResearch/marp-inference-worker#38
 repos: [marp-inference-worker]
 status: verifying
 needs: []
@@ -7,142 +7,124 @@ needs: []
 
 ## Goal
 
-A volunteer running the worker on Linux sees the watch window — the model's annotations drawn
-live over the video it is working on — exactly as a Windows volunteer does. Today they see
-nothing: the browser search looks only for `chrome.exe` under Windows `Program Files`, so
-`_find_chromium()` returns `None`, `start()` raises, and the window has never opened on any
-Linux machine. The window is how a volunteer can tell the worker is doing something real,
-and it is how a wrong model was noticed by eye the one time it happened.
+A volunteer with a Linux computer and an NVIDIA card downloads one small file, runs it, and
+their machine joins MARP. No Python to install, no browser to install, no CUDA toolkit, no
+administrator password, and nothing to paste. This is the Linux half of #38; `vp1-marp` has
+Windows.
 
 ## Requirements
 
-- **R1** — On Linux the worker finds a Chromium-family browser and opens the watch window.
-- **R2** — Discovery is **bundled first, system second**, matching Windows, so a packaged
-  build and a development machine take the same path rather than two.
-- **R3** — A browser found through a multi-call wrapper is launched by the name it was found
-  under, not by the target of its symlink.
-- **R4** — Window geometry comes from the real display on Linux, with the single-screen
-  fallback retained for when it cannot be read.
-- **R5** — A finished or killed job closes its own window on Linux, matching on the
-  attempt's profile directory so it can never reach the volunteer's own browser.
-- **R6** — Windows behaviour is unchanged throughout.
+- **R1** — One artifact a volunteer downloads and runs. No manual configuration.
+- **R2** — Works on a machine with no Python, no browser and no CUDA toolkit.
+- **R3** — Never requires root. Everything lives under one directory; uninstall is `rm -rf`.
+- **R4** — Every downloaded artifact is verified against a checked-in SHA-256 before use.
+- **R5** — Re-running after a failure continues rather than starting over.
+- **R6** — A machine that cannot run MARP is told why, in terms it can act on, before
+  anything is downloaded.
+- **R7** — The worker starts at login and restarts if it crashes, without a volunteer
+  intervening.
+- **R8** — The enrolment code is a build-time input and never enters the repository.
 
 ## Open assumptions
 
-- [x] **A1 · environment · blocking** — answered 2026-09-18 by Isaac: this machine had no
-  Chromium-family browser at all, so #31 could not be demonstrated. **Install a system
-  Chromium**, explicitly as an interim measure. His words: *"I don't want a volunteer to have
-  to install fucking things to get this working!!!!! but for now have it go ahead and install
-  the damned chromium browser, but we have to make sure later that we package up everything
-  the user needs."* So the shipped answer is the bundled-snapshot pattern that
-  `packaging/chromium-windows-x64.lock.json` already implements for Windows, pointed at
-  `Linux_x64/<snapshot>/chrome-linux.zip`. That is **not in this branch** — see *Not in
-  scope*.
+- [x] **A1 · architectural · blocking** — answered 2026-09-18 by Isaac: bundle everything, or
+  download at install? **Download.** Costed on the axis he cares about, which is bytes MARP
+  serves rather than bytes a volunteer fetches: ~5.8 MB per volunteer against ~6.8 GB for a
+  bundle, and a bundle also exceeds GitHub's 2 GB release-asset limit so it would need paid
+  hosting. His words: *"Yeah, just go with your recommendation of a downloader. Just make
+  sure that it works really, really well."*
 
-- [x] **A2 · product/UI · blocking** — answered 2026-09-18 by Isaac: the only display here is
-  a 5120x2880 panel rotated left, so the desktop is 2880x5120 portrait. Is a landscape window
-  on a portrait screen acceptable rather than a reason to hold? **Yes.** So R4 is about
-  reading the real geometry, not about laying out differently for portrait.
+- [x] **A2 · architectural · blocking** — answered 2026-09-18 by Isaac: is dropping torch for
+  a smaller runtime acceptable? **No.** Running his own PyTorch models is a planned
+  capability, so ONNX and TensorRT are closed on requirements rather than benchmarks. This
+  also settles that `triton` and `sympy` stay although unloaded by YOLO inference: they are
+  `torch.compile`'s JIT and torch's symbolic shape machinery, and a future custom model is
+  exactly what reaches for them.
+
+- [x] **A3 · product · blocking** — decided here rather than escalated, on Isaac's
+  instruction to stop bringing him decisions: **a machine with no NVIDIA GPU is refused at
+  install.** `resolve_device` refuses "auto" without CUDA by design, so installing anyway
+  would produce a worker that enrols, polls, and declines every job — worse for a volunteer
+  than an honest refusal with instructions.
+
+- [x] **A4 · product · blocking** — decided here: **cu126 and cu128 selected per card, not
+  cu130.** cu130 offers a newer torch and ~1 GB less, at the cost of excluding Maxwell and
+  Pascal. A donated GTX 1060 is precisely the hardware this feature exists to accept.
 
 ## Decisions
 
-- **2026-09-18** — browser discovery asks `PATH` via `shutil.which` before falling back to
-  fixed paths. Linux has no `Program Files` equivalent and a volunteer's browser may be a
-  distribution package, a vendor `.deb`, a snap or a flatpak. The fixed paths remain for a
-  worker started from a service with a minimal environment, where `PATH` is not the whole
-  answer.
-
-- **2026-09-18** — `_find_chromium()` no longer resolves a candidate whose resolved basename
-  differs from the name it was found under. `/snap/bin/chromium` is a symlink to
-  `/usr/bin/snap`, which reads `argv[0]` to decide which snap to run: resolving it launches
-  the snap tool with Chromium's arguments and nothing appears. This was found by running it,
-  not by reading it — the first attempt returned `/usr/bin/snap` and opened no window.
-
-- **2026-09-18** — window cleanup on Linux is `pkill -f <profile path>`. Matching the profile
-  directory rather than the process name is what keeps it off the volunteer's own browser,
-  and that matters more here than on Windows because the system Chromium the worker borrows
-  may be the browser they are reading the instructions in.
-
-- **2026-09-18** — raising the window and idle detection are left as no-ops on Linux, as
-  advised. They are polish and they are not worth blocking the port on.
-
-- **2026-09-18** — `O_BINARY` is included in the open flags via `getattr(os, "O_BINARY", 0)`,
-  because the constant does not exist off Windows. **This was a regression introduced by the
-  decision above and caught by Windows verification, not by reasoning.** `os.open` without it
-  gives a text-mode descriptor on Windows, which translates every `0x0A` written to
-  `0x0D 0x0A`; DPAPI ciphertext is binary, so the credential was corrupted on write and
-  `CryptUnprotectData` failed at startup with *The data is invalid*. Demonstrated rather than
-  argued: `010a020a0a03` came back as `010d0a020d0a0d0a03`.
-
-  Worth recording because of its shape. A Windows worker would have activated successfully,
-  written a corrupted credential, and failed to authenticate later — the same failure that
-  opened this issue, arriving from the opposite platform. The tests written here are what
-  caught it; the original code never went near `os.open`.
+- **2026-09-18** — POSIX `sh`, not bash. A volunteer's machine may not have bash and nothing
+  here needs it.
+- **2026-09-18** — the CUDA variant is chosen by the same rule as
+  `bootstrap-windows.ps1:92-102`: capability >= 12.0 takes cu128, everything else cu126.
+  Stated as *the same rule* deliberately — two platforms selecting differently would mean two
+  inference stacks.
+- **2026-09-18** — a driver floor is enforced before anything downloads. Without it the CUDA
+  wheels install perfectly against a too-old driver and the worker enrols, polls, heartbeats
+  and fails every job while reporting itself online. Raised by `vp1-marp`, who hit it.
+- **2026-09-18** — `MARP_WORKER_STATE_DIR` is set explicitly for `marp-worker-activate` and
+  for the service. The two have different defaults, and the mismatch spends a volunteer's
+  enrolment then reports "this worker is not activated" — a path fault that reads as a
+  credential fault. MARP_API#208 records what it cost.
+- **2026-09-18** — a systemd **user** service tied to `graphical-session.target`, not
+  lingering. Lingering would start the worker with no display, so the watch window would
+  silently never open — on this platform, the failure that looks like success.
+- **2026-09-18** — `--check-only`, so a volunteer tests their machine in two seconds rather
+  than after twenty minutes of downloading. Finding out late is how people give up.
 
 ## Plan
 
-1. Branch **from `32-linux-credential-store`, not `develop`** — stacked deliberately. Without
-   #32 a Linux worker cannot read its credential at startup, so a `develop`-based branch
-   could not be run at all on the machine this was developed and tested on. *(done)*
-2. Linux browser discovery in `_find_chromium()`, bundled first. *(done)*
-3. Stop resolving multi-call wrappers. *(done)*
-4. `xrandr --listmonitors` branch in `_monitors()`, ahead of the existing fallback. *(done)*
-5. Linux branch in `_kill_by_profile()`. *(done)*
-6. Tests for each. *(done)*
+1. `bootstrap-linux.sh`, mirroring the Windows stage order. *(done)*
+2. `chromium-linux-x64.lock.json` and `uv-linux-x64.lock.json` with real hashes. *(done)*
+3. `requirements-linux-cu126.{in,lock.txt}` — this repository had no Linux lock at all,
+   which is #37. *(done)*
+4. Driver floor, disk check, dependency checks. *(done)*
+5. `build-linux.sh` to assemble the package and substitute the enrolment code. *(not done)*
 
 ## Acceptance criteria
 
-- The watch window opens on Linux during a real job. **Met** — observed on attempt 5043,
-  with `browser-render-proof.jpg` written and Chromium running as pid 20041.
-- `_find_chromium()` returns a launchable path on a snap-based Ubuntu. **Met** — returns
-  `/snap/bin/chromium`, not `/usr/bin/snap`.
-- `_monitors()` reports the real desktop. **Met** — `[(0, 0, 2880, 5120)]` on the rotated 5K
-  panel, where the fallback would have said 1920x1080.
-- A finished job leaves no window. **Not directly observed** — see below.
-- Windows unchanged. **Not executable here.**
+- A volunteer downloads one file, runs it, and the worker enrols and starts. **Stages 1-6
+  verified; 7 and 8 are not.**
+- Nothing requires root. **Met.**
+- Every download verified. **Met.**
+- Re-running after an interrupted install continues. **Met**, by killing the installer
+  mid-download and re-running.
+- An unsuitable machine is told why before downloading. **Met** for a missing driver, an old
+  driver, insufficient disk and missing tools.
 
 ## Test plan
 
-`tests/test_watch_display.py`, six added tests, run as a file rather than as a suite:
-browser found on `PATH`; a multi-call wrapper not resolved; `xrandr` parsed into rectangles;
-the fallback when `xrandr` is absent; `pkill` invoked with the profile path; and nothing
-invoked when there is no profile. 24 passed, up from 18.
+Run against this machine: Ubuntu 26.04, GTX 1660 Ti, driver 595.91.07.
 
-**What these do not prove**, stated rather than left to look like coverage:
-- **R5 is proven at the wrong tier.** The test asserts `pkill` is *called with* the profile
-  path. It does not assert a window actually disappeared, because that needs a real window
-  and a real desktop. The failure mode #29 describes could still exist here.
-- **R6 is not proven at all.** Windows cannot be executed on this machine. Every change is a
-  `sys.platform` branch that returns before the Windows code, but the Windows path has not
-  been run.
+- `--help` and an unknown option behave.
+- `--check-only` passes, reporting GPU, capability, chosen runtime, driver and disk.
+- A machine with no `nvidia-smi` is refused with distribution-specific instructions
+  (simulated by restricting `PATH`).
+- A too-small disk is refused before downloading (observed against a 7 GB filesystem).
+- Full install: a 5.8 MB package produces a 7.9 GB install — Chromium 156.0.8067.0 runs,
+  torch 2.14.0+cu126 sees the card, all three entry points present, and the worker's own
+  `_find_chromium()` resolves the bundled browser.
+- Interrupted install: `SIGKILL` mid-Chromium-download, then re-run — `uv already downloaded
+  and verified`, `reusing the existing environment`, `Chromium already downloaded and
+  verified`.
 
-## Not in scope
+**NOT verified, and it is two of the eight stages:** enrolment and service start. Both need
+the standing code from MARP_API#208, which this machine does not have; the test runs used a
+deliberately fake code and stage 7 failed exactly as designed. **Do not read "stages 1-6
+verified" as "the installer works end to end."**
 
-- **The bundled Chromium snapshot for Linux**, which is the actual answer to A1 and is the
-  difference between this working for a developer and working for a volunteer. Needs a
-  `chromium-linux-x64.lock.json` alongside the Windows one.
-- **Snap confinement is untested and may matter.** The browser used here is the Chromium
-  snap, which is AppArmor-confined. It rendered the page from the package directory under
-  `$HOME` and it worked, but a confined snap is a poor stand-in for the bundled build, and
-  it could pass here and fail for a volunteer, or the reverse.
-- **Raising and idle detection**, left as no-ops by decision.
-- **#29**, orphaned windows from a previous run, which is `marp-laptop`'s branch.
+Also not verified: any machine but this one. One GPU, one distribution, one driver version.
+"Runs on many different Linux computers" is the requirement, and a single box cannot
+demonstrate it.
 
 ## Status
 
 - **Gate:** verifying
-- **Notes:** written **after** implementation rather than before it, which is not the order
-  the harness asks for. Both assumptions had been answered by Isaac beforehand, so no
-  blocking assumption was open while the code was written, but the spec did not exist at
-  G1 and this note is here rather than left for someone to notice.
+- **Notes:** the first resolution of the Linux lock picked `ultralytics-platform==0.1.48`
+  where the Windows lock pins `0.1.40` — the exact package VP1 drifted on. Pinned, and the
+  two platforms now resolve identically across all 60 shared packages.
 
-  Found and left alone: **ten tests in `tests/test_watch_display.py` are defined twice** —
-  ruff reports ten F811 redefinitions on `develop`, unchanged by this branch. A block of the
-  file appears to have been duplicated, so the first definition of each is shadowed and has
-  never run. Among them is
-  `test_chromium_is_found_from_configuration_or_an_installed_browser`, which covers the very
-  function this branch changes — so the existing coverage of `_find_chromium()` is half what
-  it looks like. Pre-dates this branch and is not fixed here.
-
-  Also from Windows verification, recorded because it is expensive to rediscover: `wmic` has
-  been removed from current Windows builds, so anything reaching for it fails.
+  Found and left alone: the worker writes **no local record when a job fails**. Diagnosing
+  seven failed attempts here required a traceback fetched from the coordinator by another
+  agent. A volunteer has no such route, which makes it a packaging concern as much as a
+  worker one. Filed separately.

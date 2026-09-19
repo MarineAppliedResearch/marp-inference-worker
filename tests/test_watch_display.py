@@ -911,3 +911,44 @@ def test_orphaned_windows_are_closed_at_startup(monkeypatch, tmp_path: Path) -> 
                         lambda args, **_k: calls.append(list(args)) or SimpleNamespace(stdout="", returncode=0))
     assert display_module.close_orphaned_windows(tmp_path / "jobs") == 0
     assert not [c for c in calls if c and c[0] == "taskkill"]
+
+
+# test_orphaned_windows_are_closed_on_linux_too(monkeypatch, tmp_path)
+# Verifies the startup cleanup is not Windows-only.
+# Inputs: pytest monkeypatch and temporary directory.
+# Output: pytest pass/fail result.
+#
+# This function returned 0 on anything but Windows, which was harmless while no
+# window could open on Linux and became a hole the moment one could: a Linux
+# worker would close its own window at the end of a job and leave behind every
+# window a previous run had abandoned. Same symptom as #27, on the platform
+# nobody was watching.
+#
+# `pkill -f <profile path>` and not a window manager: snap Chromium runs
+# natively on Wayland, where xdotool and wmctrl report success and move
+# nothing. Matching a command line is unaffected by the window system.
+def test_orphaned_windows_are_closed_on_linux_too(monkeypatch, tmp_path: Path) -> None:
+    from marp_inference_worker.watch import display as display_module
+
+    calls: list[list[str]] = []
+
+    def record(args, **_kwargs):
+        calls.append(list(args))
+        return SimpleNamespace(returncode=0, stdout="")
+
+    monkeypatch.setattr(display_module.sys, "platform", "linux")
+    monkeypatch.setattr(display_module.subprocess, "run", record)
+
+    assert display_module.close_orphaned_windows(tmp_path / "jobs") == 1
+
+    assert calls and calls[0][0] == "pkill"
+    # Scoped to this worker's own workspace, so it cannot reach the volunteer's
+    # browser — which on Linux is very likely the same Chromium binary.
+    assert calls[0][1] == "-f"
+    assert calls[0][2] == str((tmp_path / "jobs").resolve())
+
+    # Nothing matched is not a failure: a clean machine has no orphans.
+    calls.clear()
+    monkeypatch.setattr(display_module.subprocess, "run",
+                        lambda a, **_k: calls.append(list(a)) or SimpleNamespace(returncode=1, stdout=""))
+    assert display_module.close_orphaned_windows(tmp_path / "jobs") == 0

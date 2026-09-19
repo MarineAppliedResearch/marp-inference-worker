@@ -23,6 +23,13 @@ import cv2
 _FRAME_ACK_TIMEOUT_S = 60.0
 
 
+# How often to ask whether anything still holds this attempt's Chromium profile,
+# once the process we launched has exited. A second is far below what a person
+# would notice in a window going away, and the check costs a process spawn on
+# Windows, so polling faster would be paying real money for nothing.
+_PROFILE_POLL_SECONDS = 1.0
+
+
 # _window_position()
 # Where the watch window opens, as Chromium's `x,y`.
 # Inputs: none; reads `MARP_WATCH_WINDOW_POSITION`.
@@ -1113,13 +1120,83 @@ class WatchDisplay:
             self._detach(f"watch display could not start: {type(error).__name__}: {error}")
             return False
 
+    # _watch_process()
+    # Detaches the display when the window is really gone, not when the pid is.
+    # Inputs: none; waits on the launched process and then on the profile.
+    # Output: none; runs on its own thread until the window goes or the job ends.
+    #
+    # **The launched pid exiting does not mean the window closed.** `close()` has
+    # said so for a while -- Chromium hands the window to another process and the
+    # launcher exits 0 -- but this thread did not know it, so it called
+    # `_detach()`, which closes the frame channel. The window then had nothing to
+    # fetch and went black, and the worker reported "watch window closed;
+    # inference is continuing headless" as though it had merely observed that.
+    #
+    # It was observing its own doing. On 2026-09-19 this fired on **86 attempts
+    # on one machine and 101 on another in twelve hours** -- effectively every
+    # job -- so the watch window was not an unreliable feature, it was a feature
+    # that switched itself off almost immediately, every time.
+    #
+    # The profile directory is the honest signal, and is what `close()` already
+    # keys on: it is unique to this attempt, so anything holding it is our
+    # window and nothing else can be.
     def _watch_process(self) -> None:
         assert self._process is not None
         exit_code = self._process.wait()
+
+        # The launcher is gone; the window may not be. Wait for the profile to
+        # be released before believing it. Polling rather than another wait()
+        # because the process now holding the window was never ours to wait on.
+        while not self._closing and self._profile_in_use():
+            time.sleep(_PROFILE_POLL_SECONDS)
+
         if not self._closing:
             self._detach(
                 f"watch window closed with exit code {exit_code}; inference is continuing headless"
             )
+
+    # _profile_in_use()
+    # Says whether any process still holds this attempt's Chromium profile.
+    # Inputs: none; reads `self._profile_dir`.
+    # Output: True while something holds it, False when nothing does.
+    #
+    # Deliberately the same test `_kill_by_profile()` kills on, so the two can
+    # never disagree about whether a window exists. Unknown counts as gone: a
+    # platform this cannot inspect should fall back to headless rather than hold
+    # a channel open for a window nobody can see.
+    def _profile_in_use(self) -> bool:
+
+        if self._profile_dir is None:
+            return False
+
+        try:
+            if sys.platform.startswith("linux"):
+                found = subprocess.run(
+                    ["pgrep", "-f", str(self._profile_dir)],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    timeout=10, check=False,
+                )
+                return found.returncode == 0
+
+            if sys.platform == "win32":
+                # Same quoting as _kill_by_profile: backslashes doubled because
+                # WQL's LIKE treats one as an escape.
+                needle = str(self._profile_dir).replace("\\", "\\\\").replace("'", "''")
+                query = (
+                    "SELECT ProcessId FROM Win32_Process WHERE Name = 'chrome.exe' "
+                    f"AND CommandLine LIKE '%{needle}%'"
+                )
+                found = subprocess.run(
+                    ["powershell.exe", "-NoProfile", "-Command",
+                     f"Get-CimInstance -Query \"{query}\" | ForEach-Object {{ $_.ProcessId }}"],
+                    capture_output=True, text=True, timeout=20, check=False,
+                )
+                return bool(found.stdout.strip())
+        except Exception:
+            # An inspection that failed is not evidence the window is alive.
+            return False
+
+        return False
 
     def _diagnostics(self) -> str:
         requests_seen = list(self._server.requests_seen) if self._server is not None else []

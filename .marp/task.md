@@ -229,6 +229,20 @@ branch this machine's configuration makes unreachable — and routing that branc
 machine that reaches it, or recording it as untested. Two green runs on machines that both
 skip a step is not coverage of the step, however many times it is repeated.
 
+And the reason it matters more than an ordinary gap: **running a test that cannot fail for
+the reason you are testing is worse than not running one**, because it produces a green
+result that then gets reported as verification. The `Resolve-BuildPython` fix was reported
+here as verified on the strength of a VP1 build that never entered the repaired branch. The
+gap was closed by running it on the machine with no `py` launcher, where the fallback is
+the only path available:
+
+    py absent - fallback WILL be exercised
+    Building the wheel with ...\MARP\Worker\python\cpython-3.12.14-...\python.exe (Python 3.12.14).
+
+That host confirmed the launcher's absence in the same run rather than asserting it, so the
+branch that executed is demonstrable rather than assumed — which is the standard the rule
+above is asking for.
+
 ### What is still not verified, and by whom
 
 - **The VC++ install-and-elevate path has never executed.** VP1 has MSVC 14.44 and

@@ -67,6 +67,60 @@ _PROGRESS_EVERY_FRAMES = 30
 _CLASS_MATCH_IOU = 0.4
 
 
+# Ultralytics predict() settings a job may set, with the type each is coerced to.
+#
+# **An allow list rather than a pass-through.** A job spec is submitted data, and
+# handing it straight to predict() as keyword arguments would let a typo become a
+# TypeError on the volunteer's machine halfway through a video, or let something
+# unrelated -- `save`, `project`, `show` -- write files on it.
+#
+# These are the settings `object_tracking_live.py` actually varied, which is the
+# reason for the list rather than a guess at what might be useful:
+#
+#     rockfish:  conf 0.60,  imgsz 1280, iou 0.2, augment True, agnostic_nms True
+#     deepsea:   conf 0.001, imgsz 1280, iou 0.2, augment True, agnostic_nms True
+#
+# `conf` is deliberately absent: confidence has its own argument and its own
+# default, and having two ways to set it is how they end up disagreeing.
+_INFERENCE_OPTIONS: dict[str, Any] = {
+    "imgsz": int,
+    "iou": float,
+    "augment": bool,
+    "agnostic_nms": bool,
+    "max_det": int,
+    "half": bool,
+}
+
+
+# inference_options_from_params()
+# Picks the Ultralytics predict() settings a job asked for out of its params.
+# Inputs: the job's params mapping.
+# Output: a dict of recognised settings, coerced, ready to pass to predict().
+#
+# Anything unrecognised is dropped silently here and reported by the caller, so
+# a job that sets a key the worker does not honour is visible rather than
+# quietly ignored -- which is the failure this whole path had before.
+def inference_options_from_params(params: Mapping[str, Any]) -> dict[str, Any]:
+
+    options: dict[str, Any] = {}
+
+    for name, coerce in _INFERENCE_OPTIONS.items():
+        if name not in params or params[name] is None:
+            continue
+
+        # A bad value is worth failing on rather than silently dropping: it means
+        # the job asked for something specific and would otherwise run as though
+        # it had not.
+        try:
+            options[name] = coerce(params[name])
+        except (TypeError, ValueError) as error:
+            raise JobUnrunnable(
+                f"job spec params.{name} is not a valid {coerce.__name__}: {params[name]!r}"
+            ) from error
+
+    return options
+
+
 # TrackingEngine
 # Runs MARP's detect -> track -> reduce pipeline over one frame range.
 # One instance per job, in the job's own child process, so its tracker and model
@@ -199,7 +253,39 @@ class TrackingEngine(BaseEngine):
         # Detection confidence. The live pipeline ran low on purpose: MARP's
         # reviewers reject false positives cheaply, and a false negative costs
         # somebody re-reviewing a great deal of video.
-        confidence = float(params.get("confidence", 0.15))
+        #
+        # **`conf` is accepted as well as `confidence`.** Every note and script
+        # MARP's settings come from writes `conf`, because that is what
+        # Ultralytics calls it, and a job spec that used it was silently running
+        # at the 0.15 default instead -- which looks exactly like the settings
+        # having no effect.
+        confidence = float(params.get("confidence", params.get("conf", 0.15)))
+
+        # The rest of what the job asked predict() for: imgsz, iou, augment and
+        # so on. Filtered to an allow list, so a key the worker does not honour
+        # is dropped here and reported below rather than ignored in silence.
+        predict_options = inference_options_from_params(params)
+
+        # Say what is being applied, including the settings nothing honours.
+        # Until this existed there was no way -- in the logs or in the database --
+        # to tell a job that ran with the MBARI deep-sea settings from one that
+        # asked for them and ran at the defaults. See MARP_API#232.
+        ignored = sorted(
+            key for key in params
+            if key in {"conf", "confidence", "track_thresh", "match_thresh", "track_buffer",
+                       "mot20", "data_type", "slot_index", "slot_count", "device", "watch"}
+            or key.startswith("_") or key.startswith("model_")
+        )
+        unknown = sorted(set(params) - set(ignored) - set(predict_options))
+
+        ctx.log(
+            "inference settings: confidence=%s %s%s"
+            % (
+                confidence,
+                " ".join(f"{k}={v}" for k, v in sorted(predict_options.items())) or "(ultralytics defaults)",
+                f"  IGNORED: {', '.join(unknown)}" if unknown else "",
+            )
+        )
 
         # Dataset type drives which survey rule picks the observation frame.
         data_type = str(params.get("data_type", "Fish"))
@@ -342,7 +428,7 @@ class TrackingEngine(BaseEngine):
                     ),
                 )
                 for frame_detections in self._detector.infer_stream(
-                    yolo_model, frame_stream, confidence
+                    yolo_model, frame_stream, confidence, predict_options
                 ):
                     frame = frame_detections.frame
                     detections = frame_detections.detections

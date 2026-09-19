@@ -524,7 +524,7 @@ def test_tracking_engine_reports_phases_in_actual_work_order(tmp_path: Path, mon
         def load_weights(self, _path, _device):
             return SimpleNamespace(names={})
 
-        def infer_stream(self, _model, frames, _confidence):
+        def infer_stream(self, _model, frames, _confidence, _predict_options=None):
             for frame in frames:
                 yield SimpleNamespace(frame=frame, detections=[])
 
@@ -1003,3 +1003,109 @@ def test_a_model_with_no_declared_classes_is_not_refused() -> None:
     # coordinator's event stream.
     assert not declared
     assert sorted(str(n) for n in loaded.values()) == ["Anything At All"]
+
+
+# The inference settings a job asks for have to reach Ultralytics (MARP_API#232).
+#
+# They did not. `tracking_engine` read `params["confidence"]`, and every note and
+# script MARP's settings come from writes `conf` -- so a job carrying the MBARI
+# deep-sea block ran at the 0.15 default. `imgsz`, `iou`, `augment` and
+# `agnostic_nms` were not read at all, so a spec asking for 1280-pixel inference
+# with test-time augmentation got 640 and none.
+#
+# Nothing failed. The run looked exactly like a run with no settings at all,
+# which is why this is a test rather than a comment.
+def test_conf_is_accepted_as_well_as_confidence() -> None:
+    from marp_inference_worker.engines.tracking_engine import (
+        inference_options_from_params,
+    )
+
+    # `conf` is what Ultralytics calls it and what the scripts write.
+    assert float({"conf": 0.001}.get("confidence", {"conf": 0.001}.get("conf", 0.15))) == 0.001
+
+    # And it is not swallowed by the predict-option filter, which owns the rest.
+    assert "conf" not in inference_options_from_params({"conf": 0.001})
+
+
+def test_deepsea_mot_settings_reach_predict() -> None:
+    from marp_inference_worker.engines.tracking_engine import (
+        inference_options_from_params,
+    )
+
+    # The block `object_tracking_live.py` marks "use this deepsea mot settings
+    # when running inverts", verbatim.
+    options = inference_options_from_params(
+        {
+            "data_type": "Invert",
+            "conf": 0.001,
+            "imgsz": 1280,
+            "iou": 0.2,
+            "augment": True,
+            "agnostic_nms": True,
+            "track_thresh": 0.01,
+            "match_thresh": 0.80,
+            "track_buffer": 300,
+            "mot20": True,
+        }
+    )
+
+    assert options == {
+        "imgsz": 1280,
+        "iou": 0.2,
+        "augment": True,
+        "agnostic_nms": True,
+    }
+
+
+def test_unknown_params_are_not_passed_to_predict() -> None:
+    from marp_inference_worker.engines.tracking_engine import (
+        inference_options_from_params,
+    )
+
+    # A job spec is submitted data. Passing it straight through as keyword
+    # arguments would let `save` or `project` write files on a volunteer's
+    # machine, and would turn a typo into a TypeError mid-video.
+    assert inference_options_from_params({"save": True, "project": "/tmp", "nonsense": 1}) == {}
+
+
+def test_a_bad_option_value_stops_the_job_rather_than_being_dropped() -> None:
+    import pytest
+
+    from marp_inference_worker.engines.base_engine import JobUnrunnable
+    from marp_inference_worker.engines.tracking_engine import (
+        inference_options_from_params,
+    )
+
+    # Dropping it would run the job as though the setting had never been asked
+    # for, which is the failure this whole change is about.
+    with pytest.raises(JobUnrunnable):
+        inference_options_from_params({"imgsz": "big"})
+
+
+def test_infer_stream_applies_the_options_it_is_given() -> None:
+    from types import SimpleNamespace
+
+    from marp_inference_worker.engines.ultralytics_engine import UltralyticsEngine
+
+    seen: dict = {}
+
+    class Model:
+        def predict(self, **kwargs):
+            seen.update(kwargs)
+            return [SimpleNamespace(boxes=None)]
+
+    frames = [SimpleNamespace(image="frame-0", index=0)]
+
+    list(
+        UltralyticsEngine().infer_stream(
+            Model(), frames, 0.001, {"imgsz": 1280, "iou": 0.2, "augment": True}
+        )
+    )
+
+    assert seen["imgsz"] == 1280
+    assert seen["iou"] == 0.2
+    assert seen["augment"] is True
+
+    # Confidence keeps its own argument; the option map must not shadow it.
+    assert seen["conf"] == 0.001
+    assert seen["verbose"] is False

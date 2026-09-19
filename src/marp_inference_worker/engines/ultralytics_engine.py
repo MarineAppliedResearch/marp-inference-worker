@@ -186,22 +186,28 @@ class UltralyticsEngine(FrameInferenceCapable):
         yolo_model: Any,
         frames: Iterable[DecodedFrame],
         confidence: float,
+        predict_options: dict[str, Any] | None = None,
     ) -> Iterator[FrameDetections]:
 
         # inference_mode is cheaper than no_grad and is what the live script used.
         import torch
 
+        # What the job asked for, settled once rather than per frame. `conf` and
+        # `verbose` are applied last so the dedicated confidence argument stays
+        # authoritative and Ultralytics never prints a line per frame.
+        #
+        # The caller has already filtered this to keys Ultralytics accepts, so
+        # nothing arbitrary from a job spec reaches predict().
+        options = dict(predict_options or {})
+        options["conf"] = confidence
+        options["verbose"] = False
+
         # Walk the frame generator; nothing before the current frame is retained.
         for frame in frames:
 
-            # Predict on the single decoded array. verbose=False keeps
-            # Ultralytics from printing a line per frame.
+            # Predict on the single decoded array.
             with torch.inference_mode():
-                results = yolo_model.predict(
-                    source=frame.image,
-                    conf=confidence,
-                    verbose=False,
-                )
+                results = yolo_model.predict(source=frame.image, **options)
 
             # An empty result list would be an Ultralytics fault, not an empty
             # frame; an empty frame still returns one Results with no boxes.

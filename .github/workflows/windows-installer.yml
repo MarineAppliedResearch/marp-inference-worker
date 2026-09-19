@@ -1,0 +1,78 @@
+# Builds the Windows volunteer installer on every push to a packaging branch,
+# and publishes it as a downloadable artifact.
+#
+# This exists because the installer has to be rebuilt and retested many times
+# against real hardware, and the machines that build it and the machines that
+# test it are not the same. Handing the .exe between them by hand does not
+# scale past the first attempt: the runner builds it, the test machines fetch
+# it, and nobody moves a file.
+name: Windows installer
+
+on:
+  push:
+    branches:
+      - '38-*'
+      - 'packaging/**'
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch or SHA to build
+        required: false
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.ref || github.ref }}
+          fetch-depth: 0
+
+      # The player is a separate repository and the build needs it at the
+      # revision packaging/player.lock.json pins.
+      - name: Check out the video player
+        uses: actions/checkout@v4
+        with:
+          repository: MarineAppliedResearch/marp-video-player
+          path: marp-video-player
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Inno Setup
+        run: choco install innosetup --no-progress -y
+
+      # The enrolment code never enters the repository. Add it once as a
+      # repository secret named MARP_WORKER_ENROLMENT_CODE; the build reads it
+      # from the environment exactly as it does on a developer machine.
+      - name: Build the installer
+        shell: pwsh
+        env:
+          MARP_WORKER_ENROLMENT_CODE: ${{ secrets.MARP_WORKER_ENROLMENT_CODE }}
+          MARP_COORDINATOR_URL: ${{ vars.MARP_COORDINATOR_URL || 'http://47.208.203.78:3000' }}
+        run: |
+          .\packaging\build-windows.ps1 -Development `
+            -PlayerRepository "${{ github.workspace }}\marp-video-player" `
+            -OutputRoot "${{ runner.temp }}\marpbuild"
+
+      - name: Report what was built
+        shell: pwsh
+        run: |
+          $exe = Get-ChildItem "${{ runner.temp }}\marpbuild\installer\*.exe" | Select-Object -First 1
+          "installer : $($exe.Name)"
+          "bytes     : $($exe.Length)"
+          "sha256    : $((Get-FileHash $exe.FullName -Algorithm SHA256).Hash.ToLowerInvariant())"
+          "commit    : ${{ github.sha }}"
+          Get-Content "${{ runner.temp }}\marpbuild\installer\build-manifest.json" -Raw
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: marp-inference-worker-windows-installer
+          path: ${{ runner.temp }}\marpbuild\installer\*
+          retention-days: 14

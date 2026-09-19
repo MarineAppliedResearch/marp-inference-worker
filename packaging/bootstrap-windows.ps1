@@ -378,31 +378,56 @@ $StartupError = Join-Path $StateRoot 'worker-startup.stderr.log'
 $WorkerProcess = Start-Process -FilePath "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" `
     -ArgumentList $LauncherArguments -PassThru `
     -RedirectStandardOutput $StartupOut -RedirectStandardError $StartupError -WindowStyle Hidden
+# Test-PortOpen()
+# True when something is accepting TCP connections on a local port.
+# Inputs: the port number, and how long to wait for the connection.
+# Output: $true if the port accepted a connection, $false otherwise.
+#
+# This exists to keep the wait below quiet. Invoke-RestMethod against a port
+# nothing is listening on raises a TERMINATING error, and `catch` does not keep
+# that out of the transcript -- Start-Transcript records it as
+# `PS>TerminatingError(Invoke-RestMethod)` whether or not it was handled. A
+# volunteer on a Blackwell laptop read three of those directly above "installed
+# and ready" and could not tell whether their machine had worked. A socket
+# connect that fails writes nothing anywhere, so the worker's ordinary startup
+# time stops looking like three errors.
+function Test-PortOpen {
+    param([int]$Port, [int]$TimeoutMs = 500)
+    $Client = New-Object System.Net.Sockets.TcpClient
+    try {
+        return $Client.ConnectAsync('127.0.0.1', $Port).Wait($TimeoutMs)
+    } catch {
+        return $false
+    } finally {
+        $Client.Close()
+    }
+}
+
 # Wait for the worker to answer, quietly, and say how long it took.
 #
-# The worker needs time to import torch and bind its port, so the first few
-# probes time out as a matter of course. Those timeouts used to land in the
-# transcript as bare `TerminatingError(Invoke-RestMethod)` lines with nothing
-# explaining them, directly above "installed and ready" -- so a volunteer read
-# three errors and a success and could not tell whether their machine worked.
-# The retries are normal; the silence about them was the problem.
-Write-Host 'Waiting for the worker to start. The first attempts usually time out while it loads.'
+# The worker has to import torch before it binds its port, which takes tens of
+# seconds on a cold filesystem cache. That is normal, so it is announced rather
+# than left as an unexplained pause -- and the port is checked before any HTTP
+# call is made, so the normal case adds nothing alarming to the transcript.
+Write-Host 'Waiting for the worker to start. It loads PyTorch first, which takes a moment.'
 $Healthy = $false
 $Waited = 0
-$Deadline = 120
+$Deadline = 180
 while ($Waited -lt $Deadline) {
     if ($WorkerProcess.HasExited) { break }
-    try {
-        $Health = Invoke-RestMethod -Uri 'http://127.0.0.1:8010/health' -TimeoutSec 2 -ErrorAction Stop
-        $Status = Invoke-RestMethod -Uri 'http://127.0.0.1:8010/status' -TimeoutSec 2 -ErrorAction Stop
-        if ($Health.status -eq 'ok' -and $Status.capabilities -and $Status.enrolled) { $Healthy = $true; break }
-    } catch {
-        # Expected while it loads. Counted, not printed.
+    if (Test-PortOpen -Port 8010) {
+        try {
+            $Health = Invoke-RestMethod -Uri 'http://127.0.0.1:8010/health' -TimeoutSec 5 -ErrorAction Stop
+            $Status = Invoke-RestMethod -Uri 'http://127.0.0.1:8010/status' -TimeoutSec 5 -ErrorAction Stop
+            if ($Health.status -eq 'ok' -and $Status.capabilities -and $Status.enrolled) { $Healthy = $true; break }
+        } catch {
+            # The port is open but the app is not serving yet. Rare and brief.
+        }
     }
     Start-Sleep -Seconds 2
     $Waited += 2
 }
-if ($Healthy) { Write-Host "The worker answered after $Waited seconds." }
+if ($Healthy) { Write-Host "The worker answered after about $Waited seconds." }
 if (-not $Healthy) {
     if (Test-Path -LiteralPath $StartupError) {
         Write-Host 'Worker startup error:' -ForegroundColor Red

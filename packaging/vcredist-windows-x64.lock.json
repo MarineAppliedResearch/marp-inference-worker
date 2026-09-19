@@ -1,0 +1,8 @@
+{
+  "name": "Microsoft Visual C++ 2015-2022 Redistributable (x64)",
+  "url": "https://aka.ms/vs/17/release/vc_redist.x64.exe",
+  "size_bytes": 25635768,
+  "sha256": "cc0ff0eb1dc3f5188ae6300faef32bf5beeba4bdd6e8e445a9184072096b713b",
+  "file_version": "14.44.35211.0",
+  "note": "torch's DLLs link the MSVC runtime and will not load against an old one: a machine here carried 14.28 from 2020 and `import torch` failed with OSError WinError 1114 naming c10.dll, which points nowhere near the cause. Microsoft services this redistributable for security, which is why it is installed rather than vendored beside our binaries. The aka.ms URL always serves the newest 14.x, so size_bytes and sha256 go stale by design and the build refuses rather than shipping something unverified -- re-pin them deliberately when that happens."
+}

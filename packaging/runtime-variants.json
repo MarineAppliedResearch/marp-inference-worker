@@ -1,0 +1,39 @@
+{
+  "note": "Which runtime a computer gets, decided from what it has rather than from what it downloaded. The installer carries this table and the locks; it selects the first variant whose floors the machine meets, newest CUDA first, and falls back to cpu. Only torch and torchvision differ between variants -- every other dependency is identical across all of them, which is what keeps one inference stack across the pool.",
+  "torch_version": "2.11.0",
+  "torch_version_note": "The newest torch present on BOTH the cu126 and cu128 indexes. Pinning every variant to one version is the point: cu126 pinned 2.14.0 and cu128 pinned 2.10.0, and the pool has been running three different torch versions on the same job specs -- ABYSS 2.14.0, VP1 2.14.0, the laptop 2.11.0. This is a DOWNGRADE for cu126 machines from 2.14.0, taken deliberately: one version across the whole pool is worth more than a newer one on two thirds of it.",
+  "variants": [
+    {
+      "name": "cu128",
+      "lock": "requirements-windows-cu128.lock.txt",
+      "minimum_compute_capability": 7.0,
+      "minimum_driver_version": 525.0,
+      "driver_floor_verified": false,
+      "architectures": "sm_70 sm_75 sm_80 sm_86 sm_90 sm_100 sm_120",
+      "note": "Volta through Blackwell. Measured live on an RTX 5060 Laptop (capability 12.0) at driver 573.13, so it is known to work well below its published floor. The floor itself is CUDA's published minimum and has not been tested -- nobody in the fleet has a machine old enough to find where it actually stops.",
+      "torch_backend": "cu128"
+    },
+    {
+      "name": "cu126",
+      "lock": "requirements-windows-cu126.lock.txt",
+      "minimum_compute_capability": 5.0,
+      "maximum_compute_capability": 9.9,
+      "minimum_driver_version": 525.0,
+      "driver_floor_verified": false,
+      "architectures": "sm_50 sm_60 sm_61 sm_70 sm_75 sm_80 sm_86 sm_90",
+      "note": "Maxwell through Hopper, and the only variant that serves a GTX 900 or GTX 10-series card -- the spare GPU a volunteer is most likely to have. Its arch list stops at sm_90, so it is capped here rather than being allowed to match a Blackwell card it cannot run. Capability 8.9 is not in its arch list and runs anyway on sm_86 kernels, which is why the test is a range and not membership.",
+      "torch_backend": "cu126"
+    },
+    {
+      "name": "cpu",
+      "lock": "requirements-windows-cpu.lock.txt",
+      "minimum_compute_capability": 0.0,
+      "minimum_driver_version": 0.0,
+      "driver_floor_verified": true,
+      "architectures": "none",
+      "note": "No NVIDIA GPU, or a GPU no bundled CUDA runtime can serve. Isaac: 'if there is no gpu we should run on a CPU'. Roughly 1-2 frames a second against 23 on a real card, so such a worker is slow rather than useless. A job that explicitly asks for cuda:N still refuses rather than silently running twenty times slower and reporting success.",
+      "torch_backend": "cpu"
+    }
+  ],
+  "index_note": "Selected with uv's --torch-backend, never --index-url. --index-url REPLACES PyPI, so the PyTorch index becomes the only source and every ordinary dependency disappears: a real install failed with 'altgraph was not found in the package registry'. --torch-backend adds the right PyTorch index for torch alone and leaves PyPI serving the rest."
+}

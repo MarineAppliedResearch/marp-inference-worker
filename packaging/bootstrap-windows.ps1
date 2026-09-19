@@ -264,13 +264,30 @@ $PreviousErrorPreference = $ErrorActionPreference
 $ErrorActionPreference = 'Continue'
 & $Uv python install 3.12 2>$null | Out-Null
 $ErrorActionPreference = $PreviousErrorPreference
-$ManagedPython = Get-ChildItem -LiteralPath $env:UV_PYTHON_INSTALL_DIR -Directory |
-    Where-Object { $_.Name -match '^cpython-3\.12\.\d+-windows-x86_64-none$' } |
-    Sort-Object Name -Descending |
-    ForEach-Object { Join-Path $_.FullName 'python.exe' } |
-    Where-Object { Test-Path -LiteralPath $_ } |
-    Select-Object -First 1
-if (-not $ManagedPython) { throw 'Python 3.12 installation failed.' }
+# Pick the newest managed 3.12, sorting by patch NUMBER rather than by name.
+#
+# Two problems lived in one pipeline here. `Sort-Object Name -Descending` is a
+# STRING sort, so it ranks cpython-3.12.9 above cpython-3.12.14 and would build
+# the runtime on the older interpreter whenever a machine had both. And ending
+# the pipeline with `Select-Object -First 1` stops the upstream stages early,
+# which PowerShell records in the transcript as
+# `PS>TerminatingError(): "The pipeline has been stopped."` -- a volunteer saw
+# that under "Installing Python..." on a install that was working fine.
+# Collecting into an array and indexing avoids both.
+$PythonCandidates = @(
+    Get-ChildItem -LiteralPath $env:UV_PYTHON_INSTALL_DIR -Directory -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -match '^cpython-3\.12\.(\d+)-windows-x86_64-none$' } |
+        ForEach-Object {
+            [PSCustomObject]@{
+                Patch = [int]$Matches[1]
+                Path  = Join-Path $_.FullName 'python.exe'
+            }
+        } |
+        Where-Object { Test-Path -LiteralPath $_.Path } |
+        Sort-Object Patch -Descending
+)
+if ($PythonCandidates.Count -eq 0) { throw 'Python 3.12 installation failed.' }
+$ManagedPython = $PythonCandidates[0].Path
 $Runtime = Join-Path $VersionRoot 'runtime'
 & $ManagedPython -m venv --without-pip $Runtime
 if ($LASTEXITCODE -ne 0) { throw 'Worker runtime creation failed.' }

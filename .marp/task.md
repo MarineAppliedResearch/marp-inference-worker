@@ -47,10 +47,16 @@ Windows.
   *"i have already answered like 20 times that we should attempt to work on the fucking cpu
   otherwise."*
 
-  So **a machine with no GPU installs and runs on the processor.** That required a worker
-  change as well as an installer change, because `resolve_device` was the thing making it
-  impossible — which is why the installer alone could not have delivered it. The reversal of
-  R14 and its reasoning are recorded in `system/device.py` and in the rewritten tests.
+  So **a machine with no GPU installs and runs on the processor.** That needs a worker
+  change as well as an installer one, because `resolve_device` was what made it impossible.
+
+  **The worker half is not in this branch.** It was written in parallel as `#41` / PR `#42`
+  (`cpu-only-workers`), and that implementation is better than the one I had here: its
+  warning goes through `ctx.log(level="warning")`, which reaches `/status` where a volunteer
+  can see it, where mine went to loguru and therefore to a journal no volunteer reads. I
+  reverted mine rather than compete with it. **This branch carries only the installer half**
+  — warn and continue instead of refusing, select the CPU torch build, and size the disk
+  check to it.
 
 - [x] **A4 · product · blocking** — **cu126 and cu128 selected per card, not cu130.**
   I first argued this from donated consumer hardware; Isaac corrected that too — these are

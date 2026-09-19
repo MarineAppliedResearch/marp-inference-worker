@@ -3,10 +3,18 @@
 # Author: Isaac Travers
 #
 # Tests for compute device resolution in the MARP Inference Worker.
-# One rule here matters more than the rest: "auto" must never quietly become
-# "cpu" (R14). A job that asked for a GPU and silently got a CPU does not fail
-# -- it takes a hundred times as long and produces results nobody knows were
-# degraded, which is worse than an error.
+# One rule here matters more than the rest, and it changed on 2026-09-18: "auto"
+# now falls back to "cpu" on a machine with no GPU, and must announce it every
+# time.
+#
+# R14 previously refused instead, for a good reason -- "results nobody knows were
+# degraded, which is worse than an error". But refusing made a machine without a
+# graphics card useless: the coordinator sends specs with no device, which means
+# "auto", so such a worker enrolled, polled and declined every job while reporting
+# itself healthy. The volunteer programme accepts any computer, with a GPU or
+# without. So the danger R14 named is answered by the warning rather than by the
+# refusal, and these tests now assert the warning as strictly as they once
+# asserted the exception.
 #
 # These run on a machine with no GPU, which is the case that makes them useful:
 # the fallback these guard against is exactly what a GPU-less machine would do.
@@ -17,26 +25,31 @@ from marp_inference_worker.engines.base_engine import JobUnrunnable
 from marp_inference_worker.system import device as device_module
 
 
-# test_auto_refuses_rather_than_falling_back_to_cpu(monkeypatch)
-# Verifies the central rule.
+# test_auto_falls_back_to_cpu_and_says_so(monkeypatch, caplog)
+# Verifies the central rule, as it now stands.
 # Inputs: pytest monkeypatch.
 # Output: pytest pass/fail result.
 #
-# Proves R14's second sentence. On a machine with no CUDA device, a job asking
-# for "auto" is refused, and the refusal says what to do instead.
-def test_auto_refuses_rather_than_falling_back_to_cpu(monkeypatch) -> None:
+# A machine with no CUDA device runs the job on the processor rather than refusing
+# it -- and warns, because a silent twenty-fold slowdown is the thing R14 was right
+# to object to. Replaces test_auto_refuses_rather_than_falling_back_to_cpu.
+def test_auto_falls_back_to_cpu_and_says_so(monkeypatch) -> None:
 
     # Stand in for a machine with no usable GPU.
     monkeypatch.setattr(device_module, "cuda_device_count", lambda: 0)
 
-    with pytest.raises(JobUnrunnable) as raised:
-        device_module.resolve_device("auto", slot_index=0)
+    warnings = []
+    monkeypatch.setattr(
+        device_module.logger, "warning", lambda message, *a, **k: warnings.append(message)
+    )
 
-    # The message has to be actionable, not just a refusal.
-    message = str(raised.value)
-    assert "auto" in message
-    assert "no usable CUDA device" in message
-    assert "'cpu'" in message
+    assert device_module.resolve_device("auto", slot_index=0) == "cpu"
+
+    # The fallback must not be silent. Asserting the warning is the whole point:
+    # without it this test would be licensing exactly what R14 forbade.
+    assert len(warnings) == 1
+    assert "CPU" in warnings[0]
+    assert "slower" in warnings[0]
 
 
 # test_missing_device_is_treated_as_auto_and_also_refuses(monkeypatch)
@@ -44,15 +57,15 @@ def test_auto_refuses_rather_than_falling_back_to_cpu(monkeypatch) -> None:
 # Inputs: pytest monkeypatch.
 # Output: pytest pass/fail result.
 #
-# Proves the rule cannot be sidestepped by omission. A job spec that says
-# nothing about devices means "auto", so it must refuse on a GPU-less machine
-# too -- otherwise the safe default would be the unsafe one.
-def test_missing_device_is_treated_as_auto_and_also_refuses(monkeypatch) -> None:
+# Proves an omitted device behaves exactly like "auto". This is the common case
+# rather than an edge one: the coordinator sends specs with no device at all, so
+# whatever happens here is what happens to every job on a machine without a GPU.
+def test_missing_device_is_treated_as_auto(monkeypatch) -> None:
 
     monkeypatch.setattr(device_module, "cuda_device_count", lambda: 0)
+    monkeypatch.setattr(device_module.logger, "warning", lambda *a, **k: None)
 
-    with pytest.raises(JobUnrunnable):
-        device_module.resolve_device(None, slot_index=0)
+    assert device_module.resolve_device(None, slot_index=0) == "cpu"
 
 
 # test_explicit_cpu_is_honoured()
@@ -117,20 +130,21 @@ def test_auto_shares_the_cards_when_there_are_more_slots_than_gpus(monkeypatch) 
     ] == ["cuda:0"] * 4
 
 
-# test_auto_still_refuses_when_there_is_no_gpu_at_all(monkeypatch)
-# Verifies the one refusal `auto` must keep.
+# test_auto_never_hands_back_a_card_that_does_not_exist(monkeypatch)
+# Verifies the failure `auto` must still not have.
 # Inputs: pytest monkeypatch.
 # Output: pytest pass/fail result.
-# Sharing cards is only meaningful when there is a card. A machine with none
-# has to be told so, rather than being handed `cuda:0` that does not exist.
-def test_auto_still_refuses_when_there_is_no_gpu_at_all(monkeypatch) -> None:
+# Sharing cards is only meaningful when there is a card. With none, the answer is
+# "cpu" -- never `cuda:0`, which would fail later and further from the cause.
+def test_auto_never_hands_back_a_card_that_does_not_exist(monkeypatch) -> None:
 
     monkeypatch.setattr(device_module, "cuda_device_count", lambda: 0)
+    monkeypatch.setattr(device_module.logger, "warning", lambda *a, **k: None)
 
-    with pytest.raises(JobUnrunnable) as raised:
-        device_module.resolve_device("auto", slot_index=0)
+    resolved = device_module.resolve_device("auto", slot_index=0)
 
-    assert "no usable CUDA device" in str(raised.value)
+    assert resolved == "cpu"
+    assert "cuda" not in resolved
 
 
 # test_explicit_cuda_index_is_checked_against_what_exists(monkeypatch)

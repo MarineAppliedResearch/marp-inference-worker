@@ -8,11 +8,22 @@
 # requested device into a concrete device string, and refuses rather than
 # guessing when it cannot.
 #
-# The rule that matters: "auto" never silently falls back to CPU (R14). A job
-# that asked for a GPU and got a CPU does not fail, it just takes a hundred times
-# as long and produces results nobody knows were degraded.
+# The rule that matters: "auto" falls back to the CPU on a machine with no GPU,
+# and says so loudly every time it does.
+#
+# This reverses R14, which refused instead. R14's reasoning was sound about the
+# danger -- "results nobody knows were degraded" -- but its remedy made a machine
+# without a graphics card useless to MARP, because the coordinator sends specs
+# with no device, which means "auto". Such a worker enrolled, polled, heartbeated
+# and declined every job while reporting itself healthy. The volunteer programme's
+# goal is any computer, with a GPU or without, so the fallback is now taken and
+# the degradation is announced rather than hidden.
 
 # JobUnrunnable is how a device that cannot serve the job is reported.
+# loguru carries the CPU-fallback warning, which has to be visible per job
+# rather than once at startup.
+from loguru import logger
+
 from marp_inference_worker.engines.base_engine import JobUnrunnable
 
 # Any types the optional torch module.
@@ -97,10 +108,10 @@ def describe_cuda_devices() -> list[dict[str, Any]]:
 # Output: a device string torch and Ultralytics both accept.
 # Raises JobUnrunnable when the request cannot be honoured on this machine.
 #
-# "auto" means "the GPU for my slot", and on a machine with no GPU it is a
-# refusal, not a downgrade. A job that wants CPU has to say "cpu" explicitly,
-# which makes the slow path a decision somebody made rather than one that
-# happened (R14).
+# "auto" means "the GPU for my slot", and on a machine with no GPU it means the
+# CPU, with a warning on every job. An explicitly requested "cuda" still refuses
+# when there is no card: a job that named a GPU outright wanted one, and quietly
+# giving it a CPU is the degradation R14 was right to object to.
 def resolve_device(requested: str | None, slot_index: int) -> str:
 
     # Treat a missing request as "auto", which is what a job spec that says
@@ -135,14 +146,34 @@ def resolve_device(requested: str | None, slot_index: int) -> str:
             )
         return f"cuda:{requested_index}"
 
-    # "auto" resolves to this slot's GPU, and refuses if there is not one.
+    # "auto" resolves to this slot's GPU, and falls back to the CPU when there is
+    # not one.
     if request == "auto":
         device_count = cuda_device_count()
         if device_count == 0:
-            raise JobUnrunnable(
-                "job requested device 'auto' but this worker has no usable CUDA device; "
-                "set device to 'cpu' explicitly to run without a GPU"
+            # This used to refuse, telling the caller to ask for 'cpu' explicitly.
+            # That made a machine without a GPU useless to MARP: the coordinator
+            # sends specs with no device, which means 'auto', so such a worker
+            # enrolled, polled, heartbeated and then declined every job it was
+            # given -- while reporting itself healthy.
+            #
+            # A volunteer computer without an NVIDIA card is a computer that can
+            # still contribute, slowly. "Any computer, any GPU, or no GPU" is the
+            # stated goal of the volunteer programme, and refusing here is what
+            # stopped it being true. Slow work is worth more than no work.
+            #
+            # R14's objection was never to the CPU -- it was to the fallback being
+            # *quiet*: "results nobody knows were degraded, which is worse than an
+            # error". That objection is answered by announcing it rather than by
+            # refusing, so this is loud. A machine running every job twenty times
+            # slower than expected should say so on every job, not once at startup,
+            # because the person reading the log may not have seen the startup.
+            logger.warning(
+                "no CUDA device on this worker; running this job on the CPU. "
+                "This is roughly twenty times slower than a GPU. Install an NVIDIA "
+                "driver and restart to use a graphics card."
             )
+            return "cpu"
 
         # Slots share the cards, round robin.
         #

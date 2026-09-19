@@ -3,7 +3,9 @@
 # Created: 2026-09-18
 # Author: Isaac Travers
 #
-# Turns a Linux computer with an NVIDIA GPU into a MARP volunteer worker.
+# Turns a Linux computer into a MARP volunteer worker. An NVIDIA GPU is preferred
+# and not required -- without one it installs the CPU build and works slowly, which
+# is worth more than turning the volunteer away.
 #
 # The POSIX counterpart of bootstrap-windows.ps1, and deliberately the same shape:
 # the same stages in the same order, the same lock files with url/size/sha256, the
@@ -40,7 +42,11 @@ LOCKS="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 LOG="$INSTALL_ROOT/install.log"
 
 # Enough for the venv (~7 GB), Chromium (~600 MB unpacked) and headroom.
-REQUIRED_FREE_MB=12000
+# The CUDA build needs about 8 GB installed; the CPU build about 2 GB. Checked
+# against whichever is actually being installed rather than always demanding the
+# larger, so a small CPU-only machine is not turned away for space it will not use.
+REQUIRED_FREE_CUDA_MB=12000
+REQUIRED_FREE_CPU_MB=4000
 
 TOTAL_STAGES=8
 stage_number=0
@@ -187,38 +193,63 @@ need sha256sum coreutils
 need tar tar
 need unzip unzip
 
-# The one thing a Linux package genuinely cannot carry. A GPU driver is a kernel
-# module; no user-space installer can ship it. Windows can lean on the vendor
-# installer already being present, so this stage is a hard asymmetry rather than an
-# omission -- say so plainly instead of failing obscurely later.
-command -v nvidia-smi >/dev/null 2>&1 || fail \
-    "No NVIDIA driver was found on this computer." \
-    "MARP needs an NVIDIA graphics card and its driver to run models." \
-    "" \
-    "  Ubuntu/Debian:  sudo ubuntu-drivers autoinstall   (then restart)" \
-    "  Fedora:         enable RPM Fusion, then sudo dnf install akmod-nvidia" \
-    "  Arch:           sudo pacman -S nvidia" \
-    "" \
-    "  After the driver is installed and the computer restarted, run this again."
+# A GPU is preferred and not required. A machine without one still contributes,
+# slowly, so this warns and continues rather than refusing -- "any computer, any
+# GPU, or no GPU" is the goal, and an installer that turns people away at the door
+# is the main thing that stopped it being true.
+#
+# A GPU driver is a kernel module and no user-space installer can ship one, so this
+# is the one dependency the package cannot carry on any platform. All it can do is
+# say so clearly.
+CAPABILITY=""
+GPU_NAME=""
+if command -v nvidia-smi >/dev/null 2>&1; then
+    CAPABILITY=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d ' ')
+    GPU_NAME=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1)
+fi
 
-CAPABILITY=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d ' ')
-[ -n "$CAPABILITY" ] || fail \
-    "An NVIDIA driver is present but no GPU answered." \
-    "This can happen if the driver was updated without restarting." \
-    "Restart the computer and run this installer again."
-
-GPU_NAME=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1)
-say "    GPU: $GPU_NAME (compute capability $CAPABILITY)"
+if [ -n "$CAPABILITY" ]; then
+    say "    GPU: $GPU_NAME (compute capability $CAPABILITY)"
+else
+    GPU_MODE=cpu
+    say ""
+    if command -v nvidia-smi >/dev/null 2>&1; then
+        say "    An NVIDIA driver is present but no GPU answered."
+        say "    This usually means the driver was updated without restarting."
+    else
+        say "    No NVIDIA graphics card was found."
+    fi
+    say ""
+    say "    MARP will install and run on the processor instead. That works, and it"
+    say "    is roughly twenty times slower than a graphics card -- so this computer"
+    say "    will contribute, but slowly."
+    say ""
+    say "    To use a graphics card instead, install its driver, restart, and run"
+    say "    this installer again:"
+    say "      Ubuntu/Debian:  sudo ubuntu-drivers autoinstall"
+    say "      Fedora:         enable RPM Fusion, then sudo dnf install akmod-nvidia"
+    say "      Arch:           sudo pacman -S nvidia"
+    say ""
+fi
 
 # Same rule as bootstrap-windows.ps1:92-102, and it must stay the same rule:
-# consumer Blackwell reports 12.x and needs kernels built with CUDA 12.8.
-CUDA_MAJOR=${CAPABILITY%%.*}
-if [ "$CUDA_MAJOR" -ge 12 ] 2>/dev/null; then
-    TORCH_BACKEND=cu128
+# consumer Blackwell reports 12.x and needs kernels built with CUDA 12.8. Without a
+# card we take the CPU build, which is also about 6 GB smaller -- a machine that
+# cannot use the CUDA libraries should not download them.
+if [ -z "$CAPABILITY" ]; then
+    TORCH_BACKEND=cpu
+    TORCH_INDEX="https://download.pytorch.org/whl/cpu"
+    say "    selected runtime: cpu"
 else
-    TORCH_BACKEND=cu126
+    CUDA_MAJOR=${CAPABILITY%%.*}
+    if [ "$CUDA_MAJOR" -ge 12 ] 2>/dev/null; then
+        TORCH_BACKEND=cu128
+    else
+        TORCH_BACKEND=cu126
+    fi
+    TORCH_INDEX="https://download.pytorch.org/whl/$TORCH_BACKEND"
+    say "    selected CUDA runtime: $TORCH_BACKEND"
 fi
-say "    selected CUDA runtime: $TORCH_BACKEND"
 
 # A driver floor, because the failure without one is silent and expensive: the CUDA
 # wheels install perfectly against a too-old driver, and the worker then starts,
@@ -228,11 +259,13 @@ say "    selected CUDA runtime: $TORCH_BACKEND"
 # 525.60.13 is NVIDIA's minimum for the CUDA 12.x runtime on Linux. cu130 would need
 # 580, and is not selected by this installer.
 case "$TORCH_BACKEND" in
+    cpu)         DRIVER_FLOOR=0 ;;
     cu126|cu128) DRIVER_FLOOR=525 ;;
     *)           DRIVER_FLOOR=580 ;;
 esac
 
-DRIVER_VERSION=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -1 | tr -d ' ')
+DRIVER_VERSION=""
+[ "$DRIVER_FLOOR" -gt 0 ] && DRIVER_VERSION=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -1 | tr -d ' ')
 DRIVER_MAJOR=${DRIVER_VERSION%%.*}
 
 if [ -n "$DRIVER_MAJOR" ] && [ "$DRIVER_MAJOR" -lt "$DRIVER_FLOOR" ] 2>/dev/null; then
@@ -248,9 +281,14 @@ if [ -n "$DRIVER_MAJOR" ] && [ "$DRIVER_MAJOR" -lt "$DRIVER_FLOOR" ] 2>/dev/null
         "  Fedora:         sudo dnf upgrade akmod-nvidia" \
         "  Arch:           sudo pacman -Syu nvidia"
 fi
-say "    driver: $DRIVER_VERSION (needs $DRIVER_FLOOR or newer)"
+[ -n "$DRIVER_VERSION" ] && say "    driver: $DRIVER_VERSION (needs $DRIVER_FLOOR or newer)"
 
 FREE_MB=$(df -Pm "$INSTALL_ROOT" | awk 'NR==2 {print $4}')
+if [ "$TORCH_BACKEND" = cpu ]; then
+    REQUIRED_FREE_MB=$REQUIRED_FREE_CPU_MB
+else
+    REQUIRED_FREE_MB=$REQUIRED_FREE_CUDA_MB
+fi
 [ "$FREE_MB" -ge "$REQUIRED_FREE_MB" ] 2>/dev/null || fail \
     "Not enough free disk space." \
     "MARP needs about $((REQUIRED_FREE_MB / 1000)) GB free and this disk has $((FREE_MB / 1000)) GB." \
@@ -306,12 +344,18 @@ stage "Installing the MARP worker..."
 # ---------------------------------------------------------------------------
 say "    this is the long part -- several GB, and it only happens once"
 SOURCE_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)/worker"
+# Pin to the checked-in lock when one exists for this variant, so every worker on
+# this runtime resolves identically. A variant without a lock resolves freshly --
+# worse, and still better than refusing to install.
+CONSTRAINT=""
+[ -f "$LOCKS/requirements-linux-$TORCH_BACKEND.lock.txt" ] \
+    && CONSTRAINT="--constraint $LOCKS/requirements-linux-$TORCH_BACKEND.lock.txt"
 [ -d "$SOURCE_DIR" ] || fail "This installer package is missing the worker source."
 
 "$UV" pip install --python "$VENV/bin/python" \
-    --extra-index-url "https://download.pytorch.org/whl/$TORCH_BACKEND" \
+    --extra-index-url "$TORCH_INDEX" \
     --index-strategy unsafe-best-match \
-    --constraint "$LOCKS/requirements-linux-$TORCH_BACKEND.lock.txt" \
+    $CONSTRAINT \
     "$SOURCE_DIR" >> "$LOG" 2>&1 || fail \
     "Could not install the MARP worker." \
     "This is usually a network problem partway through a large download." \
@@ -320,6 +364,12 @@ SOURCE_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)/worker"
 # Prove the GPU actually works before telling anybody it does. An install that
 # reports success and then cannot see the card is the worst outcome, because the
 # volunteer has no way to tell whether they are contributing.
+if [ "$TORCH_BACKEND" = cpu ]; then
+    "$VENV/bin/python" -c "
+import torch
+print('    torch', torch.__version__, '/ running on the processor')
+" || fail "MARP installed but could not start." "See the log for what it reported."
+else
 "$VENV/bin/python" -c "
 import sys, torch
 if not torch.cuda.is_available():
@@ -329,6 +379,7 @@ print('    torch', torch.__version__, '/', torch.cuda.get_device_name(0))
     "MARP installed but could not use the graphics card." \
     "The driver may be older than the CUDA runtime MARP needs." \
     "Update the NVIDIA driver, restart, and run this installer again."
+fi
 
 # ---------------------------------------------------------------------------
 stage "Installing the video display..."

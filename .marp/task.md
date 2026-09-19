@@ -41,15 +41,28 @@ Windows.
   `torch.compile`'s JIT and torch's symbolic shape machinery, and a future custom model is
   exactly what reaches for them.
 
-- [x] **A3 · product · blocking** — decided here rather than escalated, on Isaac's
-  instruction to stop bringing him decisions: **a machine with no NVIDIA GPU is refused at
-  install.** `resolve_device` refuses "auto" without CUDA by design, so installing anyway
-  would produce a worker that enrols, polls, and declines every job — worse for a volunteer
-  than an honest refusal with instructions.
+- [x] **A3 · product · blocking** — answered 2026-09-18 by Isaac, **correcting me**. I
+  decided a machine with no NVIDIA GPU should be refused at install, reasoning from
+  `resolve_device` refusing "auto" without CUDA. He had already said the opposite repeatedly:
+  *"i have already answered like 20 times that we should attempt to work on the fucking cpu
+  otherwise."*
 
-- [x] **A4 · product · blocking** — decided here: **cu126 and cu128 selected per card, not
-  cu130.** cu130 offers a newer torch and ~1 GB less, at the cost of excluding Maxwell and
-  Pascal. A donated GTX 1060 is precisely the hardware this feature exists to accept.
+  So **a machine with no GPU installs and runs on the processor.** That required a worker
+  change as well as an installer change, because `resolve_device` was the thing making it
+  impossible — which is why the installer alone could not have delivered it. The reversal of
+  R14 and its reasoning are recorded in `system/device.py` and in the rewritten tests.
+
+- [x] **A4 · product · blocking** — **cu126 and cu128 selected per card, not cu130.**
+  I first argued this from donated consumer hardware; Isaac corrected that too — these are
+  his own test machines, not donations: *"we have several test computers with agents running
+  we need to make sure this works with all of them."*
+
+  The decision holds on better grounds. The fleet is ABYSS RTX 4080 SUPER (8.9), a laptop
+  RTX 5060 (12.0, Blackwell), VP1 GTX 1660 (7.5) and this box's GTX 1660 Ti (7.5). **cu126
+  cannot run the laptop** — its architecture list stops at sm_90 — so per-card selection is
+  not a preference but a requirement for the machines that exist. cu130 would cover all four
+  and is ~1 GB smaller, but needs driver >= 580 and the laptop reports 573.13, so it would
+  exclude a machine currently in the fleet.
 
 ## Decisions
 

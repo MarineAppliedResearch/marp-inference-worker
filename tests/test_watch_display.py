@@ -865,3 +865,63 @@ def test_orphaned_windows_are_closed_on_linux_too(monkeypatch, tmp_path: Path) -
     monkeypatch.setattr(display_module.subprocess, "run",
                         lambda a, **_k: calls.append(list(a)) or SimpleNamespace(returncode=1, stdout=""))
     assert display_module.close_orphaned_windows(tmp_path / "jobs") == 0
+
+
+# The launcher exiting is not the window closing (#50).
+#
+# Chromium hands the window to another process and the process we launched exits
+# 0. `close()` has always known this -- it kills by profile directory rather than
+# by pid for exactly that reason -- but `_watch_process()` did not, so it treated
+# the launcher's exit as the window closing and called `_detach()`, which closes
+# the frame channel. The window then had nothing to fetch, went black, and
+# disappeared. The worker reported "watch window closed; inference is continuing
+# headless" as though it had merely noticed.
+#
+# It had caused it. Measured on 2026-09-19: this fired on 86 attempts on one
+# machine and 101 on another inside twelve hours, which is essentially every job.
+# The watch window was not unreliable; it switched itself off almost immediately,
+# every single time.
+def test_the_launcher_exiting_does_not_detach_while_the_window_lives(tmp_path) -> None:
+    import threading
+
+    warnings: list[str] = []
+    display = WatchDisplay("window", tmp_path / "jobs" / "50", warnings.append)
+    display._profile_dir = tmp_path / "profile-50"
+
+    # A launcher that has already exited, as Chromium's does after handing off.
+    class Exited:
+        def wait(self) -> int:
+            return 0
+
+    display._process = Exited()
+
+    # The window is still up: something still holds the profile directory.
+    holding = threading.Event()
+    holding.set()
+    display._profile_in_use = lambda: holding.is_set()
+
+    watcher = threading.Thread(target=display._watch_process, daemon=True)
+    watcher.start()
+
+    # While the profile is held, the display must not detach -- detaching is
+    # what killed the window.
+    watcher.join(timeout=2.5)
+    assert watcher.is_alive(), "detached while the window was still on screen"
+    assert warnings == [], f"warned about a window that had not closed: {warnings}"
+
+    # When the window really goes, the profile is released and it detaches.
+    holding.clear()
+    watcher.join(timeout=10)
+
+    assert not watcher.is_alive(), "never detached after the window closed"
+    assert any("watch window closed" in w for w in warnings), warnings
+
+
+def test_an_uninspectable_profile_is_treated_as_gone(tmp_path) -> None:
+    # Unknown must mean headless, not "hold the channel open forever". A platform
+    # this cannot inspect would otherwise keep feeding frames to a window nobody
+    # can see, for the whole job.
+    display = WatchDisplay("window", tmp_path / "jobs" / "51", lambda _m: None)
+
+    display._profile_dir = None
+    assert display._profile_in_use() is False

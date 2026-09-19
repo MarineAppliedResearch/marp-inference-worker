@@ -463,6 +463,12 @@ $Ready = "MARP Inference Worker is installed and running ($ComputeRuntime)"
 if ($Status -and $Status.worker_id) { $Ready += ", enrolled as worker $($Status.worker_id)" }
 Write-Host "$Ready." -ForegroundColor Green
 if ($ComputeRuntime -ne 'cpu') {
-    Write-Host 'Its graphics card has been checked and can run MARP work.' -ForegroundColor Green
+    # Precisely what was proven, and no more. A kernel allocated, executed and
+    # synchronized on this GPU is what separates "torch imported" from "this
+    # card can run our work" -- it is the check that catches a wheel built
+    # without this GPU's kernels. It is still one allocation: it does not
+    # demonstrate a full job, sustained load or behaviour under memory
+    # pressure, so it is not worded as though it did.
+    Write-Host 'A CUDA kernel ran on its graphics card, so PyTorch works here.' -ForegroundColor Green
 }
 Stop-Transcript | Out-Null

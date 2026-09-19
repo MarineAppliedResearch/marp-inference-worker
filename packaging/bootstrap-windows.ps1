@@ -353,6 +353,23 @@ if ((Test-Path -LiteralPath $CredentialPath) -and (Test-Path -LiteralPath $Ident
     if ($LASTEXITCODE -ne 0) { throw 'Worker activation failed.' }
 }
 
+# Say what enrolling produced, rather than leaving a silent stage.
+#
+# This printed nothing at all on a successful enrolment, so the transcript of a
+# machine that enrolled correctly was indistinguishable from one that had not.
+# A volunteer sending us their setup.log had nothing in it to read, and neither
+# did we.
+if (Test-Path -LiteralPath $IdentityPath) {
+    try {
+        $Identity = Get-Content -LiteralPath $IdentityPath -Raw | ConvertFrom-Json
+        Write-Host "This computer is enrolled with MARP as worker $($Identity.worker_id)."
+    } catch {
+        Write-Host 'This computer is enrolled with MARP.'
+    }
+} else {
+    throw 'Enrolment reported success but wrote no worker identity.'
+}
+
 Write-Stage 8 'Starting the worker and checking it can run MARP work...'
 $Launcher = Join-Path $InstallRoot 'launcher.ps1'
 $LauncherArguments = "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$Launcher`" -Screen window"
@@ -361,16 +378,31 @@ $StartupError = Join-Path $StateRoot 'worker-startup.stderr.log'
 $WorkerProcess = Start-Process -FilePath "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" `
     -ArgumentList $LauncherArguments -PassThru `
     -RedirectStandardOutput $StartupOut -RedirectStandardError $StartupError -WindowStyle Hidden
+# Wait for the worker to answer, quietly, and say how long it took.
+#
+# The worker needs time to import torch and bind its port, so the first few
+# probes time out as a matter of course. Those timeouts used to land in the
+# transcript as bare `TerminatingError(Invoke-RestMethod)` lines with nothing
+# explaining them, directly above "installed and ready" -- so a volunteer read
+# three errors and a success and could not tell whether their machine worked.
+# The retries are normal; the silence about them was the problem.
+Write-Host 'Waiting for the worker to start. The first attempts usually time out while it loads.'
 $Healthy = $false
-for ($Attempt = 0; $Attempt -lt 60; $Attempt += 1) {
+$Waited = 0
+$Deadline = 120
+while ($Waited -lt $Deadline) {
     if ($WorkerProcess.HasExited) { break }
     try {
-        $Health = Invoke-RestMethod -Uri 'http://127.0.0.1:8010/health' -TimeoutSec 2 -ErrorAction SilentlyContinue
-        $Status = Invoke-RestMethod -Uri 'http://127.0.0.1:8010/status' -TimeoutSec 2 -ErrorAction SilentlyContinue
+        $Health = Invoke-RestMethod -Uri 'http://127.0.0.1:8010/health' -TimeoutSec 2 -ErrorAction Stop
+        $Status = Invoke-RestMethod -Uri 'http://127.0.0.1:8010/status' -TimeoutSec 2 -ErrorAction Stop
         if ($Health.status -eq 'ok' -and $Status.capabilities -and $Status.enrolled) { $Healthy = $true; break }
-    } catch { }
-    Start-Sleep -Seconds 1
+    } catch {
+        # Expected while it loads. Counted, not printed.
+    }
+    Start-Sleep -Seconds 2
+    $Waited += 2
 }
+if ($Healthy) { Write-Host "The worker answered after $Waited seconds." }
 if (-not $Healthy) {
     if (Test-Path -LiteralPath $StartupError) {
         Write-Host 'Worker startup error:' -ForegroundColor Red
@@ -379,7 +411,9 @@ if (-not $Healthy) {
     if (Get-Process -Id $WorkerProcess.Id -ErrorAction SilentlyContinue) {
         Stop-Process -Id $WorkerProcess.Id -Force -ErrorAction SilentlyContinue
     }
-    throw 'The worker installed but did not report healthy enrollment.'
+    throw ("The worker installed but never answered in $Deadline seconds, so MARP cannot " +
+        'confirm it is working. Nothing here is a half-install: run setup again, and if it ' +
+        "fails the same way send us $SetupLog.")
 }
 
 # CUDA being visible is weaker than CUDA being usable. A wheel built without
@@ -395,5 +429,15 @@ if ($ComputeRuntime -ne 'cpu') {
 
 Remove-Item -LiteralPath $UvArchive, $ChromeArchive -Force -ErrorAction SilentlyContinue
 Write-Host ''
-Write-Host "MARP Inference Worker is installed and ready ($ComputeRuntime)." -ForegroundColor Green
+# The banner names what was actually checked.
+#
+# "installed and ready" on its own is a claim with nothing behind it -- the same
+# sentence whether the worker enrolled or not. Naming the worker and the runtime
+# makes it a report rather than an assurance.
+$Ready = "MARP Inference Worker is installed and running ($ComputeRuntime)"
+if ($Status -and $Status.worker_id) { $Ready += ", enrolled as worker $($Status.worker_id)" }
+Write-Host "$Ready." -ForegroundColor Green
+if ($ComputeRuntime -ne 'cpu') {
+    Write-Host 'Its graphics card has been checked and can run MARP work.' -ForegroundColor Green
+}
 Stop-Transcript | Out-Null

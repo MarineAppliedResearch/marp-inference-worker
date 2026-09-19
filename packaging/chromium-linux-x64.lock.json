@@ -1,9 +1,0 @@
-{
-  "name": "Chromium",
-  "version": "snapshot-1701186",
-  "platform": "linux",
-  "architecture": "x86_64",
-  "url": "https://storage.googleapis.com/chromium-browser-snapshots/Linux_x64/1701186/chrome-linux.zip",
-  "size_bytes": 247608347,
-  "sha256": "1e25d5443475f39d44a5f3fb93e8427859deec60b49fcedd21b6e27f17ab0df6"
-}

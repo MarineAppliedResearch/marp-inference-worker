@@ -1,3 +1,10 @@
+---
+task: MarineAppliedResearch/marp-inference-worker#38
+repos: [marp-inference-worker, marp-video-player]
+status: verifying
+needs: []
+---
+
 # A Windows installer that runs on any volunteer's computer
 
 Refs MarineAppliedResearch/marp-inference-worker#38
@@ -77,17 +84,27 @@ before and after real CUDA work. There is no lazy loading to exploit.
 
 ## Open assumptions
 
-- [ ] **The CPU path needs a worker change that is not merged.** (cross-repository,
-  `blocking`) `resolve_device` refuses `auto` with no CUDA by design (R14), so a CPU
-  machine installs correctly, enrols, takes a job and fails it with `no usable CUDA
-  device`. marp-laptop's fix is PR #42 on `cpu-only-workers`. Until it merges, R2 is
-  delivered by the installer and defeated by the worker, and testing the CPU path against
-  `develop` will show a failure that is not the installer's.
+- [x] **A1 · cross-repository** — answered 2026-09-19: **ship the CPU variant anyway and
+  track the worker-side fix separately.** `resolve_device` refuses `auto` with no CUDA by
+  design (R14), so a CPU machine installs correctly, enrols, takes a job and fails it with
+  `no usable CUDA device`. marp-laptop's fix is PR #42 on `cpu-only-workers`. This does not
+  block the installer: R2 is delivered on the installer's side, and what is missing lives
+  in another repository and another PR. Recorded as non-blocking rather than left open,
+  because leaving it open would have stopped work that was not actually blocked. The
+  consequence — the end-to-end CPU path stays unverified until #42 merges, and testing it
+  against `develop` shows a failure that is not the installer's — is carried in
+  Verification, which is where an untested path belongs.
 
-- [ ] **The cu126 and cu128 driver floors are published minimums, not measured ones.**
-  (environment) Recorded as `driver_floor_verified: false`. Nobody in the fleet has a
-  machine old enough to find where either actually stops. The one measured datapoint is
-  cu128 working at driver 573.13, from marp-laptop.
+- [x] **A2 · environment** — answered 2026-09-19: **ship the published minimums and record
+  that they are unmeasured.** `runtime-variants.json` carries `driver_floor_verified: false`
+  on both cu126 and cu128 so the uncertainty travels with the data rather than living in
+  somebody's memory. Nobody in the fleet has a machine old enough to find where either
+  floor actually stops, so measuring it is not available to us; the choice was between
+  guessing lower, guessing higher, or shipping the vendor's number and saying so. The one
+  measured datapoint is cu128 working at driver 573.13 on an RTX 5060, well below its
+  published floor, which suggests the floor is conservative rather than wrong. A decision
+  taken with its uncertainty recorded is an answer; it is not the same as a verified floor,
+  and Verification says so.
 
 ## Record which torch build produced an observation
 

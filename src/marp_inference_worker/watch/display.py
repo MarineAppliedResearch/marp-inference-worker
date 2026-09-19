@@ -593,6 +593,84 @@ def _bring_to_front(process_id: int, attempts: int = 40) -> None:
         pass
 
 
+# close_orphaned_windows()
+# Ends watch windows left behind by a previous run of this worker.
+# Inputs: the directory job workspaces live under.
+# Output: how many processes were asked to stop.
+# Use this once at start, before taking work.
+#
+# `WatchDisplay.close()` only runs in the process that owns the display, so a
+# worker that was killed -- by a crash, a reaper, or somebody closing the
+# terminal -- leaves its windows alive with nothing left to close them. The new
+# process knows nothing about them, so they sit there forever showing the last
+# frame they drew, labels and all.
+#
+# That is not merely untidy. A frozen window keeps whatever was on its canvas,
+# so a window from a job that ran a coral model goes on showing coral names
+# while the machine runs something else entirely -- and somebody looking at the
+# screen sees a label that is wrong for the work being done, with no way to tell
+# it is a ghost.
+#
+# Matched on the workspace root, so it can only ever reach this worker's own
+# windows: the volunteer's browser and any other worker's windows use different
+# profile paths.
+def close_orphaned_windows(workspace_root: Path) -> int:
+
+    root = str(Path(workspace_root).resolve())
+
+    if sys.platform != "win32":
+        # Matched on the profile path, not the process name. That is what keeps
+        # this off the volunteer's own browser -- and it matters more here than
+        # on Windows, because the Chromium a Linux worker borrows is often the
+        # one the volunteer is reading this in.
+        #
+        # `pkill` and not a window manager, deliberately. Snap Chromium runs
+        # natively on Wayland, where `xdotool`, `wmctrl` and that family return
+        # success, move nothing and log nothing against a window that is
+        # plainly on screen. `pkill` matches a command line, so it is unaffected
+        # by which window system is in play. See #31.
+        try:
+            found = subprocess.run(
+                ["pkill", "-f", root],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                timeout=20, check=False,
+            )
+        except Exception:
+            return 0
+
+        # pkill exits 0 when it signalled something, 1 when it matched nothing.
+        # There is no count, so this reports "some" rather than inventing one.
+        return 1 if found.returncode == 0 else 0
+
+    needle = root.replace("\\", "\\\\").replace("'", "''")
+    query = (
+        "SELECT ProcessId FROM Win32_Process WHERE Name = 'chrome.exe' "
+        f"AND CommandLine LIKE '%{needle}%'"
+    )
+
+    try:
+        found = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-Command",
+             f"Get-CimInstance -Query \"{query}\" | ForEach-Object {{ $_.ProcessId }}"],
+            capture_output=True, text=True, timeout=20, check=False,
+        )
+    except Exception:
+        return 0
+
+    stopped = 0
+
+    for line in (found.stdout or "").split():
+        if not line.strip().isdigit():
+            continue
+        subprocess.run(
+            ["taskkill", "/PID", line.strip(), "/T", "/F"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False,
+        )
+        stopped += 1
+
+    return stopped
+
+
 class _FrameChannel:
     """One-slot ordered channel whose consumer explicitly acknowledges a draw."""
 

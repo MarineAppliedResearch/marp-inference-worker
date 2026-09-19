@@ -641,6 +641,21 @@ class JobRunner:
         # this refreshes the pool row rather than creating a second one. Found
         # live: this machine's pool entry still read "no GPU" after CUDA was
         # working, because capabilities had only ever been sent once.
+        # Windows from a previous run of this worker, if it did not exit
+        # cleanly. They cannot close themselves and nothing else will close
+        # them, and a frozen window goes on showing the labels of whatever job
+        # drew it last -- which reads as the current job labelled wrongly.
+        try:
+            from marp_inference_worker.watch.display import close_orphaned_windows
+
+            orphans = close_orphaned_windows(self._workspace_root)
+
+            if orphans:
+                self._state.note(f"closed {orphans} watch window(s) left by a previous run")
+        except Exception as error:
+            # Never fatal: a worker that cannot tidy up must still take work.
+            self._state.note_error(f"could not close orphaned watch windows: {error}")
+
         self.ensure_enrolled(force=True)
 
         # Report a job that did not survive the last restart, before taking new

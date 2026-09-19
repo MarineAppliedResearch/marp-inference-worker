@@ -104,11 +104,29 @@ stage() {
 # unhandled error teaches the volunteer that the project is broken, when usually
 # they are one missing thing away from working.
 fail() {
+    # Snapshot the log before writing anything, or the tail below shows this
+    # function's own output instead of the error that caused it.
+    # Only past stage 1. A preflight refusal explains itself in full and its log
+    # tail is just the banner, which buries the actionable message in noise. A
+    # failure inside a real step is the opposite: the useful detail is whatever the
+    # tool printed, and it is the only place it exists.
+    failure_context=""
+    [ "$stage_number" -gt 1 ] && [ -s "$LOG" ] && failure_context=$(tail -n 10 "$LOG" 2>/dev/null)
+
     say ""
     say "MARP setup stopped."
     say ""
     for line in "$@"; do say "  $line"; done
-    say ""
+    # Show what the failing step actually said. Pointing at a log file is useless
+    # advice on a volunteer's machine: they have to find it, open it, and know
+    # which part matters -- and if they are reporting the problem to us, the lines
+    # we need are the ones we just told them to go and look for themselves.
+    if [ -n "$failure_context" ]; then
+        say "  What the last step reported:"
+        say ""
+        printf '%s\n' "$failure_context" | sed 's/^/      /'
+        say ""
+    fi
     say "  Nothing was left running. Fix the above and run this installer again --"
     say "  it continues from where it stopped rather than starting over."
     say ""
@@ -192,6 +210,22 @@ need curl curl
 need sha256sum coreutils
 need tar tar
 need unzip unzip
+
+# A C compiler, because `cython-bbox` publishes no wheel for any platform and is
+# built from source during stage 5. Checked here rather than discovered there:
+# without this the install fails after several gigabytes have downloaded, which is
+# the most expensive moment to find out and the one most likely to lose a
+# volunteer. ByteTrack needs it and ByteTrack is not optional -- the tracking stage
+# imports BYTETracker from the vendored tree.
+command -v cc >/dev/null 2>&1 || command -v gcc >/dev/null 2>&1 || fail \
+    "This installer needs a C compiler, which is not on this computer." \
+    "One of MARP's components has no prebuilt package and is compiled during setup." \
+    "" \
+    "  Debian/Ubuntu:  sudo apt install build-essential" \
+    "  Fedora:         sudo dnf groupinstall \"Development Tools\"" \
+    "  Arch:           sudo pacman -S base-devel" \
+    "" \
+    "  Then run this installer again."
 
 # A GPU is preferred and not required. A machine without one still contributes,
 # slowly, so this warns and continues rather than refusing -- "any computer, any

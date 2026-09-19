@@ -15,10 +15,10 @@ lap
 cython-bbox
 cython
 filterpy
-torch==2.11.0+cu126
-torchvision==0.26.0+cu126
+torch==2.11.0+cu128
+torchvision==0.26.0+cu128
 
-# Held to the versions in requirements-windows-cu126.lock.txt. A fresh Linux resolve
+# Held to the versions in requirements-windows-cu128.lock.txt. A fresh Linux resolve
 # picks newer ones, and a pool where a Linux worker and a Windows worker run
 # different versions can return two different answers to the same job spec without
 # announcing it. `ultralytics-platform` is the one that matters -- it is in the

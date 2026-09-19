@@ -92,7 +92,12 @@ Windows.
 3. `requirements-linux-cu126.{in,lock.txt}` — this repository had no Linux lock at all,
    which is #37. *(done)*
 4. Driver floor, disk check, dependency checks. *(done)*
-5. `build-linux.sh` to assemble the package and substitute the enrolment code. *(not done)*
+5. `build-linux.sh` to assemble the package and substitute the enrolment code. *(done)*
+6. A cu128 lock, so a Blackwell machine gets pinned versions rather than a fresh
+   resolve. *(done)* — and this forced a decision: **cu128 has no torch 2.14.0 at all**,
+   its newest is 2.11.0. Pinning each variant to its own maximum is what put three torch
+   versions in a four-machine pool answering the same job specs. Both variants are now
+   pinned to **torch 2.11.0**, the newest present on both, so the pool runs one version.
 
 ## Acceptance criteria
 

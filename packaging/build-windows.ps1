@@ -53,6 +53,78 @@ function Sign-Artifact([string]$Path) {
 if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT -or $env:PROCESSOR_ARCHITECTURE -ne 'AMD64') {
     throw 'The Windows bootstrap must be built on Windows x64.'
 }
+
+# Resolve-BuildPython()
+# Finds a Python 3.12 to build the cython-bbox wheel with, and proves it is 3.12
+# before the build does anything else.
+# Inputs: $BuildPython, which may be a bare name or a full path.
+# Output: a path to a python.exe that reported 3.12.
+#
+# The wheel is cp312 and the installed runtime is 3.12.14, so the build host
+# needs 3.12 specifically -- not merely "a Python". The default was the `py`
+# launcher, which is a BUILD-HOST ASSUMPTION rather than a fact: a machine with
+# no launcher failed MINUTES in, at the wheel step, after the enrolment check
+# and the ByteTrack prune had already run. marp-laptop-install-test hit exactly
+# that. A build host missing its compiler should be told so in two seconds.
+#
+# `-3.12` is appended only for the launcher, because only the launcher takes it.
+# That means passing an explicit interpreter path silently skips the version
+# selection -- correct, but sharp enough to be worth checking the version here
+# rather than trusting the caller pointed at the right one.
+function Resolve-BuildPython {
+    param([string]$Requested)
+
+    $Candidates = @()
+    if ($Requested) { $Candidates += $Requested }
+    # Whatever uv laid down for an installed worker on this machine is a known
+    # -good 3.12, and a build host is very often also a test host.
+    $Managed = Join-Path $env:LOCALAPPDATA 'MARP\Worker\python'
+    if (Test-Path -LiteralPath $Managed) {
+        $Candidates += @(
+            Get-ChildItem -LiteralPath $Managed -Directory -ErrorAction SilentlyContinue |
+                Where-Object { $_.Name -match '^cpython-3\.12\.(\d+)-windows-x86_64-none$' } |
+                ForEach-Object { [PSCustomObject]@{ Patch = [int]$Matches[1]; Path = Join-Path $_.FullName 'python.exe' } } |
+                Where-Object { Test-Path -LiteralPath $_.Path } |
+                Sort-Object Patch -Descending |
+                ForEach-Object { $_.Path }
+        )
+    }
+
+    $Tried = @()
+    foreach ($Candidate in $Candidates) {
+        $Command = Get-Command $Candidate -ErrorAction SilentlyContinue
+        if (-not $Command) { $Tried += "$Candidate (not found)"; continue }
+        $Executable = $Command.Source
+        $Arguments = @()
+        if ([IO.Path]::GetFileName($Executable) -in @('py', 'py.exe')) { $Arguments += '-3.12' }
+        # No double quotes in this snippet, deliberately. Windows PowerShell
+        # strips embedded double quotes when building a native command line, so
+        # `print("%d.%d" % ...)` reaches Python as `print(%d.%d % ...)` and dies
+        # with a SyntaxError -- which this function would then report as the
+        # interpreter "not running", blaming a perfectly good Python. Found by
+        # testing this resolver rather than by reading it.
+        $Arguments += @('-c', 'import sys; print(sys.version.split()[0])')
+
+        $Previous = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        $Reported = (& $Executable $Arguments 2>$null | Select-Object -Last 1)
+        $Code = $LASTEXITCODE
+        $ErrorActionPreference = $Previous
+
+        $Reported = "$Reported".Trim()
+        if ($Code -ne 0) { $Tried += "$Candidate (would not run)"; continue }
+        if ($Reported -notlike '3.12.*' -and $Reported -ne '3.12') {
+            $Tried += "$Candidate (is $Reported, need 3.12)"; continue
+        }
+        Write-Host "Building the wheel with $Executable (Python $Reported)."
+        return $Executable
+    }
+
+    throw ("No Python 3.12 was found to build the cython-bbox wheel with. Tried: " +
+        ($Tried -join '; ') + ". Pass -BuildPython with a path to a 3.12 interpreter.")
+}
+
+$BuildPython = Resolve-BuildPython $BuildPython
 if (-not $Development -and -not $SigningCertificateThumbprint) {
     throw 'Volunteer artifacts require code signing. Use -Development for an unsigned pilot.'
 }
@@ -265,15 +337,57 @@ try {
     Rename-Item -LiteralPath (Join-Path $Payload 'host') -NewName 'player'
 
     if (-not $IsccPath) {
-        # Per-user first: winget installs Inno Setup under LocalAppData by
-        # default, which neither Program Files path finds.
-        $IsccPath = @(
-            (Join-Path $env:LOCALAPPDATA 'Programs\Inno Setup 6\ISCC.exe'),
-            (Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6\ISCC.exe'),
-            (Join-Path $env:ProgramFiles 'Inno Setup 6\ISCC.exe')
-        ) | Where-Object { $_ -and (Test-Path -LiteralPath $_) } | Select-Object -First 1
+        # Any installed major version, not just 6.
+        #
+        # This looked for the literal directory `Inno Setup 6` in three places.
+        # The current release is 7.x, so somebody told to "install Inno Setup"
+        # installs 7, lands in `Inno Setup 7`, and the build throws
+        # "Inno Setup 6 was not found" while a perfectly good compiler sits on
+        # disk. 6 is preferred because every installer we have shipped was
+        # built with it; a newer one is used with a warning rather than
+        # refused, because refusing a working compiler to protect an untested
+        # assumption is the worse failure.
+        #
+        # Per-user paths come first within each version: winget installs Inno
+        # Setup under LocalAppData by default, which neither Program Files
+        # path finds.
+        # Written out rather than with a ternary: this script has to run under
+        # Windows PowerShell 5.1, which has no `? :`.
+        $IsccRoots = @()
+        if ($env:LOCALAPPDATA) { $IsccRoots += (Join-Path $env:LOCALAPPDATA 'Programs') }
+        if (${env:ProgramFiles(x86)}) { $IsccRoots += ${env:ProgramFiles(x86)} }
+        if ($env:ProgramFiles) { $IsccRoots += $env:ProgramFiles }
+        $IsccFound = @(
+            foreach ($Root in $IsccRoots) {
+                Get-ChildItem -LiteralPath $Root -Directory -Filter 'Inno Setup *' -ErrorAction SilentlyContinue |
+                    ForEach-Object {
+                        $Exe = Join-Path $_.FullName 'ISCC.exe'
+                        if (Test-Path -LiteralPath $Exe) {
+                            $Major = 0
+                            if ($_.Name -match 'Inno Setup (\d+)') { $Major = [int]$Matches[1] }
+                            [PSCustomObject]@{ Major = $Major; Path = $Exe }
+                        }
+                    }
+            }
+        )
+        # 6 first, then the highest other major.
+        $Preferred = @($IsccFound | Where-Object { $_.Major -eq 6 })
+        if ($Preferred.Count -gt 0) {
+            $IsccPath = $Preferred[0].Path
+        } elseif ($IsccFound.Count -gt 0) {
+            $Newest = @($IsccFound | Sort-Object Major -Descending)[0]
+            Write-Warning ("Inno Setup 6 was not found; building with Inno Setup $($Newest.Major) at " +
+                "$($Newest.Path). Every installer shipped so far was built with 6, so this " +
+                'combination is unverified -- check the installer runs before releasing it.')
+            $IsccPath = $Newest.Path
+        }
     }
-    if (-not $IsccPath) { throw 'Inno Setup 6 was not found. Pass -IsccPath.' }
+    if (-not $IsccPath) {
+        throw ('Inno Setup was not found. Install it, or pass -IsccPath. The download link on ' +
+            "jrsoftware.org's download.php returns an HTML page rather than a binary; the real " +
+            'asset is the innosetup-*.exe on https://github.com/jrsoftware/issrc/releases. ' +
+            'Silent install: /VERYSILENT /SUPPRESSMSGBOXES /CURRENTUSER /NORESTART /SP-')
+    }
     & $IsccPath "/DPayloadDir=$Payload" "/DOutputDir=$InstallerDir" "/DWorkerVersion=$Version" `
         "/DWorkerRevision=$WorkerRevision" `
         "/DCoordinatorUrl=$CoordinatorUrl" "/DEnrollmentCode=$EnrollmentCode" `

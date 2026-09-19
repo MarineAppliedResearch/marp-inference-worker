@@ -192,6 +192,20 @@ noise is where a reader's attention goes and quiet wrong answers are what surviv
 The banner now names what was checked rather than asserting readiness, and says "a CUDA
 kernel ran" rather than claiming the card is proven for production.
 
+### The stage 8 deadline is sized against disk, not GPU
+
+Both machines report the worker answering in **about 10 seconds** — VP1 on a GTX 1660 and
+marp-laptop-install-test on an RTX 5060 Laptop. The faster card did not help, which it
+would have if the wait were compute. Loading PyTorch is dominated by reading roughly 2.5 GB
+of DLLs and initialising the runtime, and the GPU contributes nothing to that.
+
+So the 180s deadline has headroom against *these two machines' SSDs* and nothing is known
+about its headroom on a spinning disk, which is the volunteer most likely to strain it.
+Neither of us can measure that, and neither machine's result should be read as though we
+had. The prediction going in was that the faster card would answer sooner; it did not, and
+the identical number on very different GPUs is stronger evidence for a disk bound than a
+merely slower one would have been.
+
 ### What is still not verified, and by whom
 
 - **The VC++ install-and-elevate path has never executed.** VP1 has MSVC 14.44 and
@@ -204,6 +218,12 @@ kernel ran" rather than claiming the card is proven for production.
   false`. The one measured datapoint is cu128 working at driver 573.13.
 - **No genuinely clean volunteer run** — double-clicked from Explorer on a machine that has
   never held a worker — has happened. Both runs were agent-driven.
+- **The wrong-interpreter path is covered by the three-directory test only.** It misbehaves
+  only on a host holding more than one managed 3.12, and neither machine does, so neither
+  install exercises it. Cite the fabricated-directory comparison for that defect, not either
+  run. What the second machine proves is that the transcript is clean and the upgrade path
+  is intact on a different GPU architecture — which is what it was for.
+- **The stage 8 deadline against slow storage**, per the section above.
 - **The CPU path** cannot be meaningfully tested until marp-laptop's PR #42 merges; until
   then R2 is delivered by the installer and defeated by the worker.
 - **Repeated clean installs accumulate orphaned workers** coordinator-side, because a fresh

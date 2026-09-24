@@ -487,16 +487,27 @@ def test_frame_reader_reports_seek_complete_at_the_real_boundary() -> None:
 
     from marp_inference_worker.media.frame_range_reader import VideoGeometry, iter_frame_range
 
+    import cv2
+
     calls = []
 
+    # Seeks by time and reports the time of the frame it just returned.
     class Capture:
-        def set(self, _property, frame):
-            calls.append(("seek", frame))
+        def __init__(self):
+            self.ms = 0.0
+
+        def set(self, prop, value):
+            calls.append(("seek", prop, value))
+            self.ms = value - 1000.0 / 30.0
             return True
 
         def read(self):
             calls.append(("read", None))
+            self.ms += 1000.0 / 30.0
             return True, "image"
+
+        def get(self, _prop):
+            return self.ms
 
     frames = list(
         iter_frame_range(
@@ -508,8 +519,109 @@ def test_frame_reader_reports_seek_complete_at_the_real_boundary() -> None:
         )
     )
 
-    assert calls == [("seek", 10), ("seek_complete", None), ("read", None)]
+    # The range start is a playback time: frame 10 at 30 fps is 333 ms.
+    assert calls[0][:2] == ("seek", cv2.CAP_PROP_POS_MSEC)
+    assert abs(calls[0][2] - 1000.0 / 3.0) < 1e-6
+    assert calls[1:3] == [("seek_complete", None), ("read", None)]
     assert [frame.index for frame in frames] == [10]
+
+
+# _ClockedCapture
+# A capture that returns frames at given playback times, as a real container does.
+class _ClockedCapture:
+
+    # __init__()
+    # Inputs: the playback time of each frame, in milliseconds.
+    def __init__(self, times_ms):
+
+        self._times = list(times_ms)
+        self._current = None
+
+    def set(self, _prop, _value):
+
+        return True
+
+    def read(self):
+
+        if not self._times:
+            return False, None
+        self._current = self._times.pop(0)
+        return True, "image"
+
+    def get(self, _prop):
+
+        return self._current
+
+
+# test_frames_after_a_timestamp_gap_keep_their_playback_numbers()
+# Verifies a frame's number is its playback time, not a count (MARP_API#231).
+# Inputs: none.
+# Output: pytest pass/fail result.
+# Measured on a real video: time jumps from 440 ms to 2880 ms after the twelfth
+# frame. Counting called the thirteenth frame 12; it plays as frame 72.
+def test_frames_after_a_timestamp_gap_keep_their_playback_numbers() -> None:
+
+    from marp_inference_worker.media.frame_range_reader import VideoGeometry, iter_frame_range
+
+    times = [i * 40.0 for i in range(12)] + [2880.0 + i * 40.0 for i in range(3)]
+    frames = list(
+        iter_frame_range(
+            _ClockedCapture(times),
+            VideoGeometry(width=1, height=1, frame_rate=25.0, total_frames=100),
+            0,
+            100,
+        )
+    )
+
+    assert [frame.index for frame in frames] == list(range(12)) + [72, 73, 74]
+    assert frames[12].time_s == 2.88
+
+
+# test_a_backend_with_no_clock_falls_back_to_counting()
+# Verifies the reader still numbers frames when the backend reports no time.
+# Inputs: none.
+# Output: pytest pass/fail result.
+def test_a_backend_with_no_clock_falls_back_to_counting() -> None:
+
+    from marp_inference_worker.media.frame_range_reader import VideoGeometry, iter_frame_range
+
+    frames = list(
+        iter_frame_range(
+            _ClockedCapture([0.0] * 5),
+            VideoGeometry(width=1, height=1, frame_rate=25.0, total_frames=5),
+            0,
+            5,
+        )
+    )
+
+    assert [frame.index for frame in frames] == [0, 1, 2, 3, 4]
+
+
+# test_an_observation_says_its_frames_are_on_the_playback_clock()
+# Verifies every row declares its frame numbering, which the coordinator checks.
+# Inputs: none.
+# Output: pytest pass/fail result.
+def test_an_observation_says_its_frames_are_on_the_playback_clock() -> None:
+
+    observation = _observation_from(_run_pipeline_over(78)[0])
+
+    assert observation["frame_clock"] == "playback"
+
+
+# test_a_job_spec_carries_the_nominal_frame_rate()
+# Verifies the rate the coordinator sends is kept, and a bad one refused.
+# Inputs: none.
+# Output: pytest pass/fail result.
+def test_a_job_spec_carries_the_nominal_frame_rate() -> None:
+
+    from pydantic import ValidationError
+
+    from marp_inference_worker.jobs.job_spec import VideoRef
+
+    assert VideoRef(url="u", source_name="s", frame_rate=25.0).frame_rate == 25.0
+    assert VideoRef(url="u", source_name="s").frame_rate is None
+    with pytest.raises(ValidationError):
+        VideoRef(url="u", source_name="s", frame_rate=0)
 
 
 # test_tracking_engine_reports_phases_in_actual_work_order()

@@ -190,4 +190,7 @@ def build_observation(
         "observation_frame": chosen_frame,
         # The score at observation_frame, or null when that frame had none.
         "confidence": chosen_confidence,
+        # Frame numbers are playback time times the nominal rate, so the
+        # coordinator can trust them on a video whose timestamps jump (#231).
+        "frame_clock": "playback",
     }

@@ -69,6 +69,12 @@ class VideoRef(BaseModel):
     # what kind of identifier it is, and a job given a bare url carries none.
     jellyfin_item_id: str | None = None
 
+    # The video's nominal frame rate, as the coordinator read it from the media
+    # server. Frame numbers are playback time times this rate, so a video whose
+    # timestamps jump is still numbered on its own clock. Absent for a bare url,
+    # when the rate the decoder reports is used instead.
+    frame_rate: float | None = Field(default=None, gt=0)
+
 
 # FrameRange
 # The frame span this job covers, half-open: [start_frame, end_frame).

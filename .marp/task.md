@@ -1,7 +1,7 @@
 ---
 task: MarineAppliedResearch/marp-inference-worker#49
 repos: [marp-inference-worker]
-status: implementing
+status: verifying
 needs: []
 ---
 
@@ -98,6 +98,7 @@ and shows the species that will be recorded.
 - **2026-09-24** — One species per track; a track is never split (A2).
 - **2026-09-24** — `confidence` is the recorded species' score at the observation frame, or
   null when that frame's detection was another class or there was none (A3).
+  The same rule applies to each keyframe's confidence, since it is the same column meaning.
 
 ## Plan
 
@@ -130,5 +131,6 @@ and shows the species that will be recorded.
 
 ## Status
 
-- **Gate:** implementing
-- **Notes:** A1–A3 answered 2026-09-24.
+- **Gate:** verifying
+- **Notes:** A1–A3 answered 2026-09-24. A3 is applied to keyframe confidences too.
+  On a real piece, 6 of 67 tracks changed species; see `.marp/verification.md`.

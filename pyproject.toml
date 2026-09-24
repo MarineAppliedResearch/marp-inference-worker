@@ -1,6 +1,6 @@
 [project]
 name = "marp-inference-worker"
-version = "0.1.0"
+version = "0.1.1"
 description = "Agnostic MARP inference worker service."
 # 3.12 deliberately, not newer: torch and ultralytics wheels lag new Python
 # releases, and 3.11 is what the previous environment was built against and no

@@ -431,6 +431,13 @@ class TrackingEngine(BaseEngine):
             f"container reports {geometry.total_frames} frames"
         )
 
+        # Number frames on the video's nominal clock when the job gives it. The
+        # decoder's rate is an average, which a timestamp gap pulls below it.
+        nominal_rate = (spec.get("video") or {}).get("frame_rate")
+        if nominal_rate:
+            geometry = geometry._replace(frame_rate=float(nominal_rate))
+            ctx.log(f"numbering frames at the nominal {geometry.frame_rate:.3f} fps")
+
         # Build the model, the tracker and the accumulator for this range only.
         # A fresh tracker per range is what makes the boundary a seam (R10a).
         ctx.report_progress(0, expected_frames, "frames", phase="loading_model")

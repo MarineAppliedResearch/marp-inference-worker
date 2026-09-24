@@ -129,6 +129,9 @@ def test_context_protocol_is_the_only_thing_engines_are_given() -> None:
         "log",
         "report_progress",
         "report_metrics",
+        # MARP_API#232. Outbound only, like log: the engine says how it ran and
+        # learns nothing about MARP in return, which is what this list guards.
+        "report_settings",
         "checkpoint_dir",
         "resume_from",
         "publish_artifact",

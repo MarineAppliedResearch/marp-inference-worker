@@ -60,6 +60,11 @@ class Recorder:
         # because the upload route's path ends in a hash rather than its name.
         self.responses: dict[str, tuple[int, Any]] = {}
 
+        # Optional: (path, body) -> (status, body) or None. For an answer that
+        # depends on what was sent -- a coordinator that refuses one event kind
+        # and accepts another -- which a path fragment cannot express.
+        self.decide: Any = None
+
     # answer()
     # Scripts the answer for one route.
     # Inputs: a fragment of the path to match, the status, and the body.
@@ -113,10 +118,14 @@ def _make_handler(recorder: Recorder):
             })
 
             status, payload = 200, {}
-            for fragment, scripted in recorder.responses.items():
-                if fragment in self.path:
-                    status, payload = scripted
-                    break
+            decided = recorder.decide(self.path, body) if recorder.decide else None
+            if decided is not None:
+                status, payload = decided
+            else:
+                for fragment, scripted in recorder.responses.items():
+                    if fragment in self.path:
+                        status, payload = scripted
+                        break
 
             encoded = json.dumps(payload).encode("utf-8")
             self.send_response(status)
@@ -797,3 +806,95 @@ def test_enrolment_sends_the_name_the_coordinator_keys_on(coordinator) -> None:
     assert body["slot_count"] == 1
     assert body["capabilities"] == {"slots": 1}
     assert record["worker_id"] == 65
+
+
+# test_a_settings_report_travels_in_its_own_batch_after_the_rest()
+# Verifies a settings report never shares a batch with other events.
+# Inputs: the coordinator fixture.
+# Output: pytest pass/fail result.
+#
+# One refused event fails its whole batch, and a coordinator older than
+# MARP_API#232 refuses the kind. Sharing would cost the events beside it.
+def test_a_settings_report_travels_in_its_own_batch_after_the_rest(coordinator) -> None:
+
+    client, recorder = coordinator
+
+    report = {"engine": "marp_tracking",
+              "settings": {"confidence": {"value": 0.001, "type": "real", "source": "job"}},
+              "ignored": {"track_threshh": 0.5}}
+    events = [
+        {"seq": 0, "kind": "log", "level": "info", "message": "before"},
+        {"seq": 1, "kind": "settings", **report},
+        {"seq": 2, "kind": "metrics", "metrics": {"frames": 3}},
+    ]
+    client.post_events(attempt_id="228", worker_id="65", lease_epoch=1, events=events)
+
+    batches = [request["body"]["events"] for request in recorder.for_path("/events")]
+
+    # The others first, together; the report alone, after them.
+    assert [[event["seq"] for event in batch] for batch in batches] == [[0, 2], [1]]
+
+    # And the report arrives in the shape the coordinator validates.
+    sent = batches[1][0]
+    assert sent["kind"] == "settings"
+    assert sent["payload"] == report
+
+
+# test_a_refused_settings_report_is_kept_as_a_warning_log_line()
+# Verifies an older coordinator still receives the record.
+# Inputs: the coordinator fixture.
+# Output: pytest pass/fail result.
+#
+# A coordinator that does not know the kind refuses the batch and writes
+# nothing, so the same seq is free for the fallback -- which carries the report
+# and the reason it was refused, and raises nothing.
+def test_a_refused_settings_report_is_kept_as_a_warning_log_line(coordinator) -> None:
+
+    client, recorder = coordinator
+
+    # older_coordinator()
+    # Answers as a coordinator from before MARP_API#232: refuses the kind.
+    # Inputs: the request path and decoded body.
+    # Output: a refusal for a batch carrying a settings event, else None.
+    def older_coordinator(path, body):
+
+        kinds = [event.get("kind") for event in (body or {}).get("events", [])]
+        if "/events" in path and "settings" in kinds:
+            return 400, {"message": "events[0].kind must be one of: metric, log."}
+        return None
+
+    recorder.decide = older_coordinator
+
+    report = {"engine": "marp_tracking",
+              "settings": {"imgsz": {"value": 1280, "type": "int", "source": "default"}},
+              "ignored": {}}
+    client.post_events(attempt_id="228", worker_id="65", lease_epoch=1,
+                       events=[{"seq": 7, "kind": "settings", **report}])
+
+    refused, kept = [request["body"]["events"][0] for request in recorder.for_path("/events")]
+
+    assert refused["kind"] == "settings"
+    assert kept["seq"] == 7
+    assert kept["kind"] == "log"
+    assert kept["payload"]["level"] == "warning"
+    assert kept["payload"]["child_kind"] == "settings"
+    assert kept["payload"]["settings"] == report["settings"]
+    assert "must be one of" in kept["payload"]["message"]
+
+
+# test_a_settings_report_to_an_unreachable_coordinator_still_raises()
+# Verifies the fallback does not hide a coordinator that is simply down.
+# Inputs: the coordinator fixture.
+# Output: pytest pass/fail result.
+#
+# The runner treats CoordinatorError as "try again next tick"; swallowing it
+# here would turn an outage into a report quietly never sent.
+def test_a_settings_report_to_an_unreachable_coordinator_still_raises(coordinator) -> None:
+
+    client, recorder = coordinator
+    recorder.answer("/events", status=503, body={"message": "down"})
+
+    with pytest.raises(CoordinatorError):
+        client.post_events(attempt_id="228", worker_id="65", lease_epoch=1,
+                           events=[{"seq": 0, "kind": "settings", "engine": "marp_tracking",
+                                    "settings": {}, "ignored": {}}])

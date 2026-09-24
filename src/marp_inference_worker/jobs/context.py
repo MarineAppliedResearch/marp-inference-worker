@@ -201,6 +201,24 @@ class ChildJobContext:
             },
         )
 
+    # report_settings()
+    # Reports every inference setting the engine is about to run with.
+    # Inputs: engine name, settings as {name: {value, type, source}}, and the
+    #   param keys nothing honours with the values the job asked for.
+    # Output: none.
+    # Use this once, before the first frame (MARP_API#232), so an attempt that
+    # fails later still carries its record.
+    def report_settings(
+        self,
+        engine: str,
+        settings: Mapping[str, Any],
+        ignored: Mapping[str, Any],
+    ) -> None:
+
+        # Its own kind, so the coordinator writes it to the settings tables
+        # rather than filing it as one more log line.
+        self._emit("settings", {"engine": engine, "settings": dict(settings), "ignored": dict(ignored)})
+
     # report_metrics()
     # Reports engine metrics for one step of one phase.
     # Inputs: step number, phase name, and a free-form metric mapping.

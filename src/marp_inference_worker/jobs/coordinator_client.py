@@ -35,9 +35,10 @@ _API_PREFIX = "/api/v2/gpu"
 _MAX_EVENTS_PER_BATCH = 500
 
 
-# The only two event kinds the coordinator accepts from a worker.
+# The event kinds the coordinator accepts from a worker.
 # `note` is the coordinator's own kind, for recording why it took a lease away.
-_WORKER_EVENT_KINDS = ("metric", "log")
+# `settings` is the attempt's record of how it ran (MARP_API#232).
+_WORKER_EVENT_KINDS = ("metric", "log", "settings")
 
 
 # CoordinatorError
@@ -404,19 +405,83 @@ class CoordinatorClient:
         if not shaped:
             return
 
+        # A settings report travels in a batch of its own, after the rest.
+        # One refused event fails its whole batch, and a coordinator older than
+        # MARP_API#232 refuses the kind -- so sharing a batch would cost the
+        # metrics and log lines beside it, and the runner's heartbeat with them.
+        settings = [event for event in shaped if event["kind"] == "settings"]
+        others = [event for event in shaped if event["kind"] != "settings"]
+
         # Batched, and keyed by seq so replay is safe. Split at the
         # coordinator's own batch limit: a job reporting a metric per frame
         # passes it within seconds and the whole batch would be refused.
-        for start in range(0, len(shaped), _MAX_EVENTS_PER_BATCH):
-            self._post(
-                f"/attempts/{attempt_id}/events",
-                {
-                    "attempt_id": attempt_id,
-                    "worker_id": coordinator_id(worker_id, "worker_id"),
-                    "lease_epoch": lease_epoch,
-                    "events": shaped[start:start + _MAX_EVENTS_PER_BATCH],
+        for start in range(0, len(others), _MAX_EVENTS_PER_BATCH):
+            self._post_event_batch(attempt_id, worker_id, lease_epoch,
+                                   others[start:start + _MAX_EVENTS_PER_BATCH])
+
+        for report in settings:
+            self._post_settings_report(attempt_id, worker_id, lease_epoch, report)
+
+    # _post_event_batch()
+    # Sends one batch of already-shaped events.
+    # Inputs: attempt envelope fields and the batch.
+    # Output: none. Raises CoordinatorError when the coordinator refuses it.
+    def _post_event_batch(
+        self,
+        attempt_id: str,
+        worker_id: str,
+        lease_epoch: int,
+        batch: list[dict[str, Any]],
+    ) -> None:
+
+        self._post(
+            f"/attempts/{attempt_id}/events",
+            {
+                "attempt_id": attempt_id,
+                "worker_id": coordinator_id(worker_id, "worker_id"),
+                "lease_epoch": lease_epoch,
+                "events": batch,
+            },
+        )
+
+    # _post_settings_report()
+    # Sends an attempt's settings report, and keeps it if it is refused.
+    # Inputs: attempt envelope fields and the shaped settings event.
+    # Output: none. Raises CoordinatorError only when the coordinator cannot be
+    #   reached at all, the same as any other event.
+    #
+    # A refusal is either an older coordinator that does not know the kind or a
+    # report it judged malformed. Either way the record is resent as a warning
+    # log line under the same seq -- free, because a refused batch writes
+    # nothing -- so the report still lands in the attempt's event stream and the
+    # reason it was refused lands beside it.
+    def _post_settings_report(
+        self,
+        attempt_id: str,
+        worker_id: str,
+        lease_epoch: int,
+        report: dict[str, Any],
+    ) -> None:
+
+        try:
+            self._post_event_batch(attempt_id, worker_id, lease_epoch, [report])
+            return
+        except CoordinatorError as refused:
+
+            # The same record as a warning log line, under the same seq.
+            fallback = {
+                "seq": report["seq"],
+                "kind": "log",
+                "at": report.get("at"),
+                "payload": {
+                    **report["payload"],
+                    "level": "warning",
+                    "message": f"the coordinator refused this attempt's settings report: {refused}",
+                    "child_kind": "settings",
                 },
-            )
+            }
+
+        self._post_event_batch(attempt_id, worker_id, lease_epoch, [fallback])
 
     # check_artifact()
     # Offers an artifact by hash and learns whether it needs uploading.

@@ -514,6 +514,9 @@ def test_tracking_engine_reports_phases_in_actual_work_order(tmp_path: Path, mon
         def report_metrics(self, **_fields):
             return None
 
+        def report_settings(self, _engine, _settings, _ignored):
+            return None
+
         def should_stop(self):
             return False
 
@@ -590,6 +593,33 @@ def test_tracking_engine_reports_phases_in_actual_work_order(tmp_path: Path, mon
         "reducing",
         "publishing",
     ]
+
+
+# test_a_fault_in_the_settings_report_does_not_fail_the_job()
+# Verifies the record of how a job ran can never cost the job itself.
+# Inputs: the pytest temporary directory and monkeypatch.
+# Output: pytest pass/fail result.
+#
+# The settings report (MARP_API#232) is bookkeeping. If building it raises, the
+# engine must log a warning and carry on, because the alternative is throwing
+# away a volunteer's GPU run over a record. Runs the whole-engine test above
+# with the report made to fail: that test's own assertion -- every phase through
+# publishing, in order -- is exactly the claim that the job still completed.
+def test_a_fault_in_the_settings_report_does_not_fail_the_job(tmp_path: Path, monkeypatch) -> None:
+
+    from marp_inference_worker.engines import tracking_engine
+
+    # report_that_fails()
+    # Stands in for a report that cannot be built.
+    # Inputs: whatever the engine passes.
+    # Output: never returns; always raises.
+    def report_that_fails(*_args, **_kwargs):
+
+        raise RuntimeError("the report could not be built")
+
+    monkeypatch.setattr(tracking_engine, "inference_settings_report", report_that_fails)
+
+    test_tracking_engine_reports_phases_in_actual_work_order(tmp_path, monkeypatch)
 
 
 # test_an_observation_from_a_job_with_no_item_id_records_null()

@@ -75,6 +75,9 @@ def test_context_offers_exactly_the_six_documented_calls() -> None:
         "log",
         "report_progress",
         "report_metrics",
+        # MARP_API#232. Outbound only, like log: the engine says how it ran and
+        # learns nothing about MARP in return, which is what this list guards.
+        "report_settings",
         "checkpoint_dir",
         "resume_from",
         "publish_artifact",

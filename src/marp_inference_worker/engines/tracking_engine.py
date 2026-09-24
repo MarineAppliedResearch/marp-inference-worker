@@ -555,7 +555,6 @@ class TrackingEngine(BaseEngine):
         # frame it holds the animal, and ids are unique within a job because the
         # tracker is built fresh for each range.
         track_ids_seen: set[Any] = set()
-        live_track_metadata: dict[int, dict[str, Any]] = {}
 
         try:
             # One line per observation, written as tracks finish, so a long job
@@ -600,7 +599,6 @@ class TrackingEngine(BaseEngine):
                         frame_time_s=frame.time_s,
                         frame_width=geometry.width,
                         frame_height=geometry.height,
-                        live_track_metadata=live_track_metadata,
                     )
 
                     track_ids_seen.update(track["track_id"] for track in live_tracks)
@@ -731,11 +729,8 @@ class TrackingEngine(BaseEngine):
         frame_time_s: float,
         frame_width: int,
         frame_height: int,
-        live_track_metadata: dict[int, dict[str, Any]] | None = None,
     ) -> list[dict[str, Any]]:
 
-        if live_track_metadata is None:
-            live_track_metadata = {}
         live_tracks = []
         # Walk the tracks the tracker believes are present on this frame.
         for track in tracked:
@@ -770,14 +765,6 @@ class TrackingEngine(BaseEngine):
                 class_name = yolo_model.names.get(class_id, str(class_id))
 
             track_id = int(track.track_id)
-            if class_id != -1:
-                live_track_metadata[track_id] = {
-                    "class_name": class_name,
-                }
-            display_metadata = live_track_metadata.get(
-                track_id,
-                {"class_name": class_name},
-            )
 
             # Normalize to centre form in 0..1, which is what the keyframe
             # reduction's thresholds are calibrated against.
@@ -798,7 +785,10 @@ class TrackingEngine(BaseEngine):
             live_tracks.append(
                 {
                     "track_id": track_id,
-                    "class_name": display_metadata["class_name"],
+                    # The species this track will be recorded as, decided from
+                    # every frame so far, so the label does not flip with one
+                    # frame's opinion (#49).
+                    "class_name": accumulator.current_species(track_id),
                     # ByteTrack carries its score on every returned track,
                     # including frames propagated by the tracker.
                     "confidence": float(track.score),

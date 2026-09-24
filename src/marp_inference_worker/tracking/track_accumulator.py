@@ -15,6 +15,10 @@
 # defect to be stitched over.
 #
 # Keyframe reduction and observation shaping are downstream and are not here.
+#
+# A track's species is decided here too, when it ends, from the evidence of all
+# its frames (#49). It used to be whatever the first frame said, which is the
+# animal at its smallest and furthest, and the one view every later frame beat.
 
 # Any types the track mappings, which are handed to the reduction unchanged.
 from typing import Any, Iterator
@@ -25,6 +29,30 @@ from typing import Any, Iterator
 # as noise rather than reduced and posted. Measured as last frame minus first,
 # not as the number of frames seen, because a track with gaps still spans them.
 _DEFAULT_MIN_TRACK_SPAN_FRAMES = 30
+
+
+# The species of a track nothing ever detected, only predicted.
+# The same name the engine gives a frame with no detection behind it.
+_UNKNOWN_SPECIES = "Unknown"
+
+
+# decide_species()
+# Picks a track's species from the summed detection confidence of each class.
+# Inputs: {class name: summed confidence}, in the order the classes were first seen.
+# Output: the class with the highest total, or "Unknown" when there is no evidence.
+# Confidence-weighted so a few confident views outweigh a long run of 0.01 noise,
+# settled with Isaac 2026-09-24. A tie goes to the class seen first.
+def decide_species(evidence: dict[str, float]) -> str:
+
+    best_name = _UNKNOWN_SPECIES
+    best_total = None
+    for name, total in evidence.items():
+
+        # Strictly greater, so the first-seen class keeps a tie.
+        if best_total is None or total > best_total:
+            best_name = name
+            best_total = total
+    return best_name
 
 
 # EndedTrack
@@ -120,26 +148,52 @@ class TrackAccumulator:
         confidence: float | None,
     ) -> None:
 
-        # First sighting of this track opens it.
+        # First sighting of this track opens it. Its species is not known yet:
+        # it is decided from every frame when the track closes.
         if track_id not in self._active:
             self._active[track_id] = {
-                "class_name": class_name,
                 "frames": [],
                 "last_seen": frame_index,
+                # Summed confidence per class, the evidence the species comes from.
+                "species_evidence": {},
             }
+        track = self._active[track_id]
+
+        # A frame with a detection behind it has that detection's class. A frame
+        # the tracker only predicted has none, and is no evidence for anything.
+        frame_class = class_name if confidence is not None else None
 
         # Append this frame in the shape the reduction reads.
-        self._active[track_id]["frames"].append(
+        track["frames"].append(
             {
                 "frame": frame_index,
                 "time": frame_time_s,
                 "bbox": bbox_normalized,
                 "confidence": confidence,
+                "class_name": frame_class,
             }
         )
 
+        # Add this frame's opinion to the track's evidence.
+        if frame_class is not None:
+            evidence = track["species_evidence"]
+            evidence[frame_class] = evidence.get(frame_class, 0.0) + confidence
+
         # Remember when it was last seen, so ageing out can be decided.
-        self._active[track_id]["last_seen"] = frame_index
+        track["last_seen"] = frame_index
+
+    # current_species()
+    # The species an open track would be recorded as if it ended now.
+    # Inputs: track id.
+    # Output: the decided species, or None for a track that is not open.
+    # Use this for the live display, so it shows what will be recorded rather
+    # than flickering with each frame's opinion.
+    def current_species(self, track_id: int) -> str | None:
+
+        track = self._active.get(track_id)
+        if track is None:
+            return None
+        return decide_species(track["species_evidence"])
 
     # take_aged_out()
     # Closes and yields tracks the tracker has not seen for long enough.
@@ -189,6 +243,16 @@ class TrackAccumulator:
         if not track["frames"]:
             self.discarded_track_count += 1
             return None
+
+        # Decide the species from every frame, in the field the reduction reads.
+        species = decide_species(track["species_evidence"])
+        track["class_name"] = species
+
+        # A score for a detection of another class says nothing about how sure
+        # the model was of this species, so it is not reported as if it did.
+        for frame in track["frames"]:
+            if frame["class_name"] != species:
+                frame["confidence"] = None
 
         # Apply the minimum-span rule before the caller sees it.
         ended = EndedTrack(track_id=track_id, track=track, reason=reason)

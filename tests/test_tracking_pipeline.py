@@ -744,12 +744,20 @@ class _NamedClasses:
 # Drives the real tracker and the real engine matcher over synthetic detections.
 # Inputs: how many frames to run, and the frame from which the engine is handed
 # no detections to match its tracks against.
+# Optionally, the detections per frame, the model's names, and a list that
+# collects the live display's label for each frame.
 # Output: the list of EndedTrack the accumulator closed at the range end.
 # Use this so both confidence tests exercise TrackingEngine._observe_tracks --
 # the code that actually decides what score a frame is recorded with -- rather
 # than a copy of its matching loop, which could agree with itself while the
 # engine was wrong.
-def _run_pipeline_over(frame_count: int, detections_visible_from: int = 10**9) -> list:
+def _run_pipeline_over(
+    frame_count: int,
+    detections_visible_from: int = 10**9,
+    detections_for=None,
+    model=None,
+    labels: list | None = None,
+) -> list:
 
     from marp_inference_worker.engines.tracking_engine import TrackingEngine
 
@@ -758,7 +766,7 @@ def _run_pipeline_over(frame_count: int, detections_visible_from: int = 10**9) -
     accumulator = TrackAccumulator(track_buffer=args.as_dict["track_buffer"])
 
     for frame_index in range(frame_count):
-        detections = _descending_animal_detections(frame_index)
+        detections = (detections_for or _descending_animal_detections)(frame_index)
 
         # The tracker always sees the real detections, so the track it reports
         # is a real track.
@@ -774,16 +782,18 @@ def _run_pipeline_over(frame_count: int, detections_visible_from: int = 10**9) -
         # Real footage produces this occasionally; forcing it makes it testable.
         visible = [] if frame_index >= detections_visible_from else detections
 
-        engine._observe_tracks(
+        live = engine._observe_tracks(
             accumulator=accumulator,
             tracked=tracked,
             detections=visible,
-            yolo_model=_NamedClasses(),
+            yolo_model=model or _NamedClasses(),
             frame_index=frame_index,
             frame_time_s=frame_index / _FRAME_RATE,
             frame_width=_FRAME_WIDTH,
             frame_height=_FRAME_HEIGHT,
         )
+        if labels is not None:
+            labels.extend(track["class_name"] for track in live)
 
     return list(accumulator.finish_range())
 
@@ -984,6 +994,87 @@ def test_observation_confidence_is_null_when_that_frame_had_no_detection() -> No
     import json
 
     assert json.loads(json.dumps(observation))["confidence"] is None
+
+
+# _TwoSpecies
+# A model with two classes, so a track can be detected as either (#49).
+class _TwoSpecies:
+
+    # Class 0 is what the animal mostly looks like; class 1 is a worse guess.
+    names = {0: "Rockfish", 1: "Kelp greenling"}
+
+
+# _detections_as(class_for)
+# The descending animal, detected as whichever class a frame is given.
+# Inputs: a function from frame index to class id.
+# Output: a detections-per-frame function for _run_pipeline_over.
+def _detections_as(class_for):
+
+    def detections(frame_index: int) -> list[dict]:
+
+        frame = _descending_animal_detections(frame_index)
+        frame[0]["class_id"] = class_for(frame_index)
+        return frame
+    return detections
+
+
+# test_a_track_is_recorded_as_its_evidence_not_its_first_frame()
+# Verifies the recorded species through the real tracker and matcher (#49, R2, R3).
+# Inputs: none.
+# Output: pytest pass/fail result.
+# The first five frames say Kelp greenling; the rest, Rockfish. Every keyframe
+# and the observation must say Rockfish.
+def test_a_track_is_recorded_as_its_evidence_not_its_first_frame() -> None:
+
+    ended = _run_pipeline_over(
+        78, detections_for=_detections_as(lambda f: 1 if f < 5 else 0), model=_TwoSpecies()
+    )
+    assert len(ended) == 1, f"expected one track, got {len(ended)}"
+
+    observation = _observation_from(ended[0])
+
+    assert observation["comname"] == "Rockfish"
+    assert {keyframe["comname"] for keyframe in observation["keyframes"]} == {"Rockfish"}
+
+
+# test_observation_confidence_is_null_when_that_frame_saw_another_species()
+# Verifies the observation never reports another class's score (#49, A3).
+# Inputs: none.
+# Output: pytest pass/fail result.
+# Runs once to find the observation frame, then again with only that frame
+# detected as the other class.
+def test_observation_confidence_is_null_when_that_frame_saw_another_species() -> None:
+
+    baseline = _observation_from(_run_pipeline_over(78)[0])
+    chosen = baseline["observation_frame"]
+    assert baseline["confidence"] == _confidence_for(chosen)
+
+    ended = _run_pipeline_over(
+        78, detections_for=_detections_as(lambda f: 1 if f == chosen else 0), model=_TwoSpecies()
+    )
+    observation = _observation_from(ended[0])
+
+    assert observation["observation_frame"] == chosen
+    assert observation["comname"] == "Rockfish"
+    assert observation["confidence"] is None
+
+
+# test_the_watch_window_label_holds_through_a_dissenting_frame()
+# Verifies the live label is the running decision, not the latest frame (#49, R4).
+# Inputs: none.
+# Output: pytest pass/fail result.
+# Frame 40 alone is detected as Kelp greenling; the label must not flip there.
+def test_the_watch_window_label_holds_through_a_dissenting_frame() -> None:
+
+    labels: list = []
+    _run_pipeline_over(
+        78,
+        detections_for=_detections_as(lambda f: 1 if f == 40 else 0),
+        model=_TwoSpecies(),
+        labels=labels,
+    )
+
+    assert set(labels) == {"Rockfish"}
 
 
 # test_a_job_refuses_weights_that_are_not_the_model_it_asked_for()

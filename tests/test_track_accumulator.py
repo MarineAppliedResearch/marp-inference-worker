@@ -223,3 +223,124 @@ def test_accumulated_track_is_in_the_shape_the_reduction_reads() -> None:
     reduced = keyframes.reduce_to_keyframes_v3_dirpad(ended.track)
     assert reduced[0]["type"] == "start"
     assert reduced[0]["comname"] == "Lingcod"
+
+
+# _observe_frames()
+# Records one track frame by frame, each with its own class and confidence.
+# Inputs: the accumulator, the track id, and (class name, confidence) per frame.
+# Output: none.
+# A confidence of None is a frame the tracker predicted with no detection behind
+# it, which the engine labels "Unknown".
+def _observe_frames(accumulator: TrackAccumulator, track_id: int, opinions: list) -> None:
+
+    for frame_index, (class_name, confidence) in enumerate(opinions):
+        accumulator.observe(
+            track_id=track_id,
+            class_name=class_name,
+            frame_index=frame_index,
+            frame_time_s=frame_index / 30.0,
+            bbox_normalized=(0.5, 0.5, 0.05, 0.05),
+            confidence=confidence,
+        )
+
+
+# test_species_is_the_evidence_not_the_first_frame()
+# Verifies a track's species comes from all its frames (#49).
+# Inputs: none.
+# Output: pytest pass/fail result.
+# The first frame is the worst view and used to decide the species alone.
+def test_species_is_the_evidence_not_the_first_frame() -> None:
+
+    accumulator = TrackAccumulator(track_buffer=240)
+    _observe_frames(accumulator, 1, [("Kelp greenling", 0.05)] + [("Lingcod", 0.8)] * 60)
+
+    ended = next(iter(accumulator.finish_range()))
+
+    assert ended.track["class_name"] == "Lingcod"
+
+
+# test_species_is_weighted_by_confidence_not_counted()
+# Verifies a few confident views outweigh many near-zero ones (#49, A1).
+# Inputs: none.
+# Output: pytest pass/fail result.
+# A majority vote would say Kelp greenling here: 50 frames against 11.
+def test_species_is_weighted_by_confidence_not_counted() -> None:
+
+    accumulator = TrackAccumulator(track_buffer=240)
+    _observe_frames(accumulator, 1, [("Kelp greenling", 0.01)] * 50 + [("Lingcod", 0.9)] * 11)
+
+    ended = next(iter(accumulator.finish_range()))
+
+    assert ended.track["class_name"] == "Lingcod"
+
+
+# test_a_predicted_frame_is_no_evidence()
+# Verifies frames with no detection behind them do not vote (#49, R5).
+# Inputs: none.
+# Output: pytest pass/fail result.
+def test_a_predicted_frame_is_no_evidence() -> None:
+
+    accumulator = TrackAccumulator(track_buffer=240)
+    _observe_frames(accumulator, 1, [("Lingcod", 0.3)] + [("Unknown", None)] * 60)
+
+    ended = next(iter(accumulator.finish_range()))
+
+    assert ended.track["class_name"] == "Lingcod"
+    assert ended.track["frames"][1]["class_name"] is None
+
+
+# test_a_track_nothing_detected_is_unknown()
+# Verifies a track with no detection on any frame stays "Unknown", as before.
+# Inputs: none.
+# Output: pytest pass/fail result.
+def test_a_track_nothing_detected_is_unknown() -> None:
+
+    accumulator = TrackAccumulator(track_buffer=240)
+    _observe_frames(accumulator, 1, [("Unknown", None)] * 61)
+
+    ended = next(iter(accumulator.finish_range()))
+
+    assert ended.track["class_name"] == "Unknown"
+
+
+# test_a_tie_goes_to_the_class_seen_first()
+# Verifies the decision is deterministic when two classes score the same (A4).
+# Inputs: none.
+# Output: pytest pass/fail result.
+def test_a_tie_goes_to_the_class_seen_first() -> None:
+
+    accumulator = TrackAccumulator(track_buffer=240)
+    _observe_frames(accumulator, 1, [("Rockfish", 0.5), ("Lingcod", 0.5)] * 31)
+
+    ended = next(iter(accumulator.finish_range()))
+
+    assert ended.track["class_name"] == "Rockfish"
+
+
+# test_another_class_score_is_not_reported_as_this_species()
+# Verifies frames detected as another class lose their confidence (#49, A3).
+# Inputs: none.
+# Output: pytest pass/fail result.
+# Their score measured something else; the species' own frames keep theirs.
+def test_another_class_score_is_not_reported_as_this_species() -> None:
+
+    accumulator = TrackAccumulator(track_buffer=240)
+    _observe_frames(accumulator, 1, [("Kelp greenling", 0.6)] + [("Lingcod", 0.8)] * 60)
+
+    ended = next(iter(accumulator.finish_range()))
+
+    assert ended.track["frames"][0]["confidence"] is None
+    assert ended.track["frames"][1]["confidence"] == 0.8
+
+
+# test_the_running_species_holds_through_one_dissenting_frame()
+# Verifies the live label is the running decision, not the latest frame (#49, R4).
+# Inputs: none.
+# Output: pytest pass/fail result.
+def test_the_running_species_holds_through_one_dissenting_frame() -> None:
+
+    accumulator = TrackAccumulator(track_buffer=240)
+    _observe_frames(accumulator, 1, [("Lingcod", 0.7)] * 20 + [("Kelp greenling", 0.95)])
+
+    assert accumulator.current_species(1) == "Lingcod"
+    assert accumulator.current_species(99) is None

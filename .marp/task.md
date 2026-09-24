@@ -1,7 +1,7 @@
 ---
 task: MarineAppliedResearch/marp-inference-worker#49
 repos: [marp-inference-worker]
-status: design
+status: implementing
 needs: []
 ---
 
@@ -51,7 +51,8 @@ and shows the species that will be recorded.
 
 ## Open assumptions
 
-- [ ] **A1 · scientific · blocking** — **Which rule decides the species?** They give
+- [x] **A1 · scientific · blocking** — answered 2026-09-24: **(a), confidence-weighted.**
+  **Which rule decides the species?** They give
   different answers on the same track:
   - **(a) Confidence-weighted vote.** Sum each class's detection confidence across the
     track, and the highest total wins. Recommended: it counts every view, and a few
@@ -61,7 +62,8 @@ and shows the species that will be recorded.
     explain, but one lucky frame decides.
   - **(c) Majority vote.** One frame, one vote. At `conf 0.001` a long dull stretch of
     near-zero detections can outvote a few excellent ones.
-- [ ] **A2 · scientific · blocking** — **What about a track that drifts onto a different
+- [x] **A2 · scientific · blocking** — answered 2026-09-24: **(a), one species per track.**
+  **What about a track that drifts onto a different
   animal?** The rule gives the whole track one species. That is the vote winner, not the
   first frame, so it is not first-frame-wins-forever, but half a track can still belong to
   something else. Options:
@@ -69,7 +71,8 @@ and shows the species that will be recorded.
     already labels the track by what it mostly was.
   - **(b) Split the track into two observations** where the species persistently changes.
     That changes how many observations a run produces, and needs a rule for "persistently".
-- [ ] **A3 · data-meaning · blocking** — **Which confidence does the observation report?**
+- [x] **A3 · data-meaning · blocking** — answered 2026-09-24: **(b), the recorded species'
+  score at the observation frame, or null.** **Which confidence does the observation report?**
   `confidence` is the detection score at the observation frame. After this change, that
   frame's detection can be a *different* class from the decided species. For example, it
   says 0.9 for rockfish on an observation recorded as an anemone. Options:
@@ -89,6 +92,12 @@ and shows the species that will be recorded.
   other than what gets recorded.
 
 ## Decisions
+
+- **2026-09-24** — The species is the class with the highest summed detection confidence
+  across the track (A1).
+- **2026-09-24** — One species per track; a track is never split (A2).
+- **2026-09-24** — `confidence` is the recorded species' score at the observation frame, or
+  null when that frame's detection was another class or there was none (A3).
 
 ## Plan
 
@@ -121,5 +130,5 @@ and shows the species that will be recorded.
 
 ## Status
 
-- **Gate:** design
-- **Notes:** A1–A3 need Isaac. Nothing is implemented yet.
+- **Gate:** implementing
+- **Notes:** A1–A3 answered 2026-09-24.

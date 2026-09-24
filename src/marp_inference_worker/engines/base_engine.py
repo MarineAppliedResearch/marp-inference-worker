@@ -94,6 +94,12 @@ class JobContext(Protocol):
     # names differ by task and version, so pinning them here would be wrong.
     def report_metrics(self, step: int, phase: str, metrics: Mapping[str, Any]) -> None: ...
 
+    # Reports every inference setting the engine runs with, once, before the
+    # first frame (MARP_API#232).
+    def report_settings(
+        self, engine: str, settings: Mapping[str, Any], ignored: Mapping[str, Any]
+    ) -> None: ...
+
     # publish_artifact()
     # Hands a finished file to the runner, which hashes it and offers it upstream.
     # Inputs: local path and a role name such as "results" or "checkpoint".

@@ -121,6 +121,131 @@ def inference_options_from_params(params: Mapping[str, Any]) -> dict[str, Any]:
     return options
 
 
+# The type each reported setting is recorded under -- the same types MARP's
+# settings catalogue declares for this engine (MARP_API#232). A report whose type
+# disagrees with the catalogue is refused, so these are not free to drift.
+_SETTING_TYPES: dict[str, str] = {
+    "confidence": "real",
+    "imgsz": "int",
+    "iou": "real",
+    "augment": "bool",
+    "agnostic_nms": "bool",
+    "max_det": "int",
+    "half": "bool",
+    "track_thresh": "real",
+    "match_thresh": "real",
+    "track_buffer": "int",
+    "mot20": "bool",
+    "class_match_iou": "real",
+}
+
+
+# _typed()
+# Puts a value into the type its setting is recorded under.
+# Inputs: the value that ran, and one of real, int, bool, text.
+# Output: the value in that type, or unchanged when it cannot honestly convert.
+#
+# Converting rather than reporting the raw JSON type, because what is recorded
+# is what ran: ByteTrack reads `mot20` by truthiness, and a whole `track_buffer`
+# of 300.0 behaves as 300. A value that cannot convert is left as it is, so the
+# coordinator refuses it loudly rather than this guessing.
+def _typed(value: Any, value_type: str) -> Any:
+
+    if value_type == "bool":
+        return bool(value)
+
+    if value_type == "int":
+        # A checkpoint can carry imgsz as [h, w]; a square one is one number.
+        if isinstance(value, (list, tuple)) and value and len(set(value)) == 1:
+            value = value[0]
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, float) and value.is_integer():
+            return int(value)
+        return value
+
+    if value_type == "real":
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return float(value)
+        return value
+
+    return str(value)
+
+
+# inference_settings_report()
+# Says exactly how this attempt will run, one setting at a time (MARP_API#232).
+# Inputs: the job's params, the confidence resolved from them, the predict
+#   options it set, the tracker's effective settings, the loaded model's own
+#   overrides, and the param keys nothing honours.
+# Output: `(settings, ignored)` -- settings as {name: {value, type, source}},
+#   ignored as {key: the value the job asked for}.
+#
+# **A default is resolved the way Ultralytics resolves it, not assumed.**
+# `Model.predict()` merges `{**model.overrides, **custom, **kwargs}`, and a loaded
+# `.pt` keeps its training `imgsz` in those overrides. So a job that sets no
+# imgsz runs at the model's size -- often 1280 here -- not DEFAULT_CFG's 640, and
+# recording 640 would be exactly the false record this exists to prevent. Order:
+# what the job set, then the model's overrides, then DEFAULT_CFG.
+def inference_settings_report(
+    params: Mapping[str, Any],
+    confidence: float,
+    predict_options: Mapping[str, Any],
+    tracker_settings: Mapping[str, Any],
+    model_overrides: Mapping[str, Any],
+    unknown: list[str],
+    ultralytics_defaults: Mapping[str, Any] | None = None,
+) -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
+
+    # DEFAULT_CFG is what predict() falls back to for anything neither the job
+    # nor the model supplied. Injectable so a test need not import Ultralytics.
+    if ultralytics_defaults is None:
+        from ultralytics.cfg import DEFAULT_CFG
+        ultralytics_defaults = vars(DEFAULT_CFG)
+
+    # The report, one entry per setting, in the shape MARP validates.
+    settings: dict[str, dict[str, Any]] = {}
+
+    # record()
+    # Adds one setting to the report under its catalogue type.
+    # Inputs: the setting's name, the value that ran, and where it came from.
+    # Output: none.
+    def record(name: str, value: Any, source: str) -> None:
+
+        value_type = _SETTING_TYPES[name]
+        settings[name] = {"value": _typed(value, value_type), "type": value_type, "source": source}
+
+    # Confidence has its own argument and its own engine default of 0.15.
+    set_by_job = params.get("confidence") is not None or params.get("conf") is not None
+    record("confidence", confidence, "job" if set_by_job else "default")
+
+    # The predict() settings a job may set.
+    for name in _INFERENCE_OPTIONS:
+        if name in predict_options:
+            record(name, predict_options[name], "job")
+        elif name in model_overrides:
+            record(name, model_overrides[name], "default")
+        else:
+            record(name, ultralytics_defaults.get(name), "default")
+
+    # ByteTrack's four: effective values, which already merge the job over the
+    # engine's defaults. A key the job sent is the job's, whatever it was. Only
+    # what the tracker actually holds is recorded -- TrackerArgs always holds all
+    # four, and a setting it lacked did not run.
+    for name in ("track_thresh", "match_thresh", "track_buffer", "mot20"):
+        if name not in tracker_settings:
+            continue
+        source = "job" if params.get(name) is not None else "default"
+        record(name, tracker_settings[name], source)
+
+    # Not settable by a job, but it decides every track's species.
+    record("class_match_iou", _CLASS_MATCH_IOU, "engine")
+
+    # What the job asked for that nothing here honours, with what it asked for.
+    ignored = {key: params[key] for key in unknown}
+
+    return settings, ignored
+
+
 # TrackingEngine
 # Runs MARP's detect -> track -> reduce pipeline over one frame range.
 # One instance per job, in the job's own child process, so its tracker and model
@@ -388,6 +513,29 @@ class TrackingEngine(BaseEngine):
                 watch = None
         tracker, tracker_args = create_tracker(params)
         accumulator = TrackAccumulator(track_buffer=tracker_args.as_dict["track_buffer"])
+
+        # Say exactly how this attempt runs, before the first frame, so an
+        # attempt that fails later still has its record (MARP_API#232). The log
+        # line above is for people; this is the record, one setting at a time.
+        #
+        # A fault in building the record is a warning, never a failed job: the
+        # record is bookkeeping, and losing a volunteer's GPU run over it would
+        # cost more than the record is worth.
+        try:
+            settings, ignored_params = inference_settings_report(
+                params,
+                confidence,
+                predict_options,
+                tracker_args.as_dict,
+                getattr(yolo_model, "overrides", None) or {},
+                unknown,
+            )
+            ctx.report_settings(self.engine_name, settings, ignored_params)
+        except Exception as error:
+            ctx.log(
+                f"could not report this attempt's settings: {type(error).__name__}: {error}",
+                level="warning",
+            )
 
         # Results go to a file in this attempt's own workspace.
         results_path = ctx.checkpoint_dir / "observations.jsonl"

@@ -17,6 +17,9 @@
 #
 # The timecode helpers here are ported from object_tracking_live.py unchanged.
 
+# math floors the sub-second index the way the coordinator does.
+import math
+
 # Any types the free-form keyframe list and payload.
 from typing import Any
 
@@ -48,6 +51,21 @@ def frame_to_media_position(frame_idx, fps):
     ss = int(seconds % 60)
     ms = (seconds - int(seconds)) * 1000
     return f"{hh:02}:{mm:02}:{ss:02}.{int(ms):03}"
+
+
+# frame_to_subsecond_index()
+# Converts an absolute frame index into MARP's sub-second frame index.
+# Inputs: frame index and frame rate.
+# Output: the index as a string, "0" to "24" at 25 fps.
+# MARP defines it from time: which slot of the second the frame falls in.
+# This used to be frame_idx % int(fps), which agrees only at a whole-number
+# rate -- at 24.946 fps it counted in 24s and the coordinator refused every
+# row (MarineAppliedResearch/MARP_API#231). The arithmetic is the coordinator's
+# own, step for step, so the two cannot drift: whole milliseconds, truncated.
+def frame_to_subsecond_index(frame_idx, fps):
+
+    ms = math.floor(frame_idx * 1000 / fps)
+    return str(math.floor((ms % 1000) * fps / 1000))
 
 
 # pick_observation_time()
@@ -155,7 +173,7 @@ def build_observation(
         "count": 1,
         "tc": frame_to_timecode(chosen_frame, frame_rate),
         # The sub-second frame index within its own second, as MARP stores it.
-        "frame": str(chosen_frame % int(frame_rate)),
+        "frame": frame_to_subsecond_index(chosen_frame, frame_rate),
         "video_source": video_source_name,
         # So the coordinator can resolve session_id and videoLocation. Opaque
         # provenance: echoed exactly as the job spec carried it, and null when

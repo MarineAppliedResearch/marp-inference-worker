@@ -26,6 +26,7 @@ from marp_inference_worker.tracking import byte_tracker_adapter
 from marp_inference_worker.tracking.observations import (
     build_observation,
     frame_to_media_position,
+    frame_to_subsecond_index,
     frame_to_timecode,
     pick_observation_time,
 )
@@ -298,6 +299,29 @@ def test_timecode_helpers_match_the_live_script() -> None:
 
     # Zero is the start, not an error.
     assert frame_to_timecode(0, 30.0) == "00:00:00"
+
+
+# test_subsecond_index_is_marps_definition_at_any_rate()
+# Verifies `frame` is the slot of its second the frame falls in.
+# Inputs: none.
+# Output: pytest pass/fail result.
+# It was frame % int(fps), which is the same thing only at a whole-number rate.
+# At 24.946 fps it counted in 24s, and the coordinator refused every row
+# (MarineAppliedResearch/MARP_API#231).
+def test_subsecond_index_is_marps_definition_at_any_rate() -> None:
+
+    # At 25 fps nothing changes: an hour of frames, all as before.
+    assert all(frame_to_subsecond_index(f, 25.0) == str(f % 25) for f in range(90000))
+
+    # The refused CAMPA video. Frame 430 is 17.237 s in, so slot 5; it was "22".
+    assert frame_to_subsecond_index(430, 24.946007) == "5"
+
+    # A frame 0.09 ms before a second is still in that second's last slot.
+    assert frame_to_timecode(923, 24.946007) == "00:00:36"
+    assert frame_to_subsecond_index(923, 24.946007) == "24"
+
+    # Never outside 0 to 24 at a rate under 25.
+    assert all(0 <= int(frame_to_subsecond_index(f, 24.946007)) <= 24 for f in range(90000))
 
 
 # test_fish_observation_time_is_the_first_bottom_crossing()

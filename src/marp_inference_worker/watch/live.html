@@ -326,6 +326,17 @@
     setTimeout(() => { note.textContent = `${message} — this window can be closed`; }, 1500);
   }
 
+  // How long a broken `/next` is tolerated before the window gives up, and how
+  // long to wait between attempts. Thirty seconds is far longer than any
+  // dropped connection and far shorter than a job, so a window that stays dark
+  // is a window whose worker has really gone.
+  const PUMP_GIVE_UP_MS = 30000;
+  const PUMP_RETRY_MS = 500;
+
+  // When the pump last had a frame. The give-up clock runs from here, not from
+  // the first failure, so a burst of drops is one outage rather than several.
+  let lastGoodAt = Date.now();
+
   async function pump() {
     // One request at a time, forever. `/next` long-polls, so this is not a
     // spin -- it blocks in the server until there is a frame to hand over.
@@ -348,13 +359,30 @@
         const packet = await response.json();
         await show(packet);
         acknowledged = packet.frame_number;
+        lastGoodAt = Date.now();
       } catch (error) {
-        // The server going away is the ordinary end of a job once this window
-        // has drawn something: `close()` shuts the channel and the server
-        // together, so whether a window sees a clean 204 or a failed fetch is a
-        // race. Both mean the same thing and both must close the window --
-        // treating only the 204 as the end left the loser of that race on
-        // screen forever, showing a dead frame and an error.
+        // A failed fetch is not proof the job ended.
+        //
+        // This used to close the window on the first one, on the reasoning that
+        // `close()` shuts the channel and the server together so a failed fetch
+        // and a clean 204 mean the same thing. They do not. `/next` long-polls
+        // with no server-side deadline, so an idle connection can be dropped by
+        // the stack at any moment -- and the window then closed itself minutes
+        // into a job that ran on for another eight. Measured on ABYSS on
+        // 2026-09-21: every attempt lost its window between thirteen seconds and
+        // six minutes in, each one logged as `exit code 0` because the browser
+        // had shut down cleanly when the page asked it to.
+        //
+        // So retry, and let the server's absence prove itself. A job that has
+        // really ended refuses the connection immediately, so the retries cost
+        // no time; a dropped long-poll reconnects and the window keeps drawing.
+        if (drawnAnything && Date.now() - lastGoodAt < PUMP_GIVE_UP_MS) {
+          note.textContent = 'reconnecting to the worker...';
+          note.hidden = false;
+          await new Promise((wake) => setTimeout(wake, PUMP_RETRY_MS));
+          continue;
+        }
+
         finish(drawnAnything
           ? 'the run has finished'
           : `display stopped: ${error.message}`);

@@ -456,6 +456,32 @@ The human is the programmer; the agent is the assistant.
 <!-- marp:shared end -->
 
 
+## This checkout is the one that runs — check the path
+
+**Every MARP repository lives under `Workspace/MARP/`.** This one is
+`Workspace/MARP/marp-inference-worker`, and its virtualenv is `.venv312`.
+
+`Workspace/` also contains **an old sibling clone at
+`Workspace/marp-inference-worker`, with its own `.venv`.** It is stale. Nothing
+runs it. Editing it has no effect on anything.
+
+On 2026-09-19 a fix to `tracking_engine.py` was written, tested and committed in
+that stale clone while the running inference worker executed *this* one. The
+tests passed. The commit was clean. The change could never have taken effect, and
+the only reason it was caught was that the worker process's command line named a
+path that did not match where the editing had happened.
+
+**Before editing, confirm the path starts with `Workspace/MARP/`.** Before
+trusting a virtualenv, ask it where the package comes from:
+
+```
+.venv312\Scripts\python.exe -c "import marp_inference_worker as m; print(m.__file__)"
+```
+
+It must print a path under `Workspace/MARP/marp-inference-worker/src/`. The
+umbrella's `services/repos.yml` is the registry; a directory not listed there is
+not a component, whatever it is called.
+
 ## This repository
 
 ## Project Overview

@@ -116,42 +116,58 @@ def tooltip_for(state: str, status: dict) -> str:
 _MARK = resources.files("marp_inference_worker.watch") / "marp-mark.png"
 
 
+# The disc the mark sits on: navy-900 from the platform's own token scale.
+# The mark is bright cyan and green, which disappears against a light taskbar,
+# so it is given a dark ground rather than being recoloured. navy-1000 is
+# nearly black and loses its edge on a dark taskbar; this one holds on both.
+_DISC = (0x03, 0x10, 0x1F)
+
+
 # _image()
-# Builds the tray bitmap: the MARP mark, badged with the current state.
+# Builds the tray bitmap: the MARP mark on a dark disc, badged with the state.
 # Inputs: an RGB tuple for the badge.
 # Output: a PIL image.
 #
-# The mark alone cannot say whether the worker is paused, and a plain coloured
-# dot does not say whose worker it is, so it is both -- the logo, with a small
-# dot in the corner. At the 16 pixels a tray actually renders, the dot is the
-# part that reads at a glance and the mark is the part that identifies it.
+# The disc is what makes the logo readable on any taskbar. The badge is what
+# the disc costs: once the icon is the logo it can no longer say whether the
+# worker is paused, and that is the one thing a volunteer should be able to see
+# without clicking. So the tray carries the dot and the browser favicon does
+# not -- state matters here and nowhere else.
 #
-# Falls back to the bare dot if the mark cannot be loaded. An icon that is less
-# pretty is worth more than no icon, which is what an exception here would mean.
+# Falls back to a bare dot if the mark cannot be loaded. A plainer icon is
+# worth more than no icon, which is what an exception here would mean.
 def _image(colour: tuple[int, int, int]):
 
     from PIL import Image, ImageDraw
 
     size = 64
     image = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(image)
 
     try:
         with resources.as_file(_MARK) as path:
             mark = Image.open(path).convert("RGBA")
 
-        # Fit the mark inside the square, keeping its proportions, and leave the
-        # bottom-right corner clear for the badge.
-        mark.thumbnail((size - 10, size - 10), Image.LANCZOS)
+        draw.ellipse((0, 0, size - 1, size - 1), fill=_DISC + (255,))
+
+        # Trim the transparent padding baked into the source file before
+        # scaling. Without this the fraction below is measured against the
+        # padding as well as the mark, so the M came out noticeably smaller
+        # than the number suggests -- and unreadable at tray size.
+        bounds = mark.getbbox()
+        if bounds:
+            mark = mark.crop(bounds)
+
+        # Four fifths of the disc. More and the M's legs run past the edge.
+        mark.thumbnail((int(size * 0.80), int(size * 0.80)), Image.LANCZOS)
         image.paste(mark, ((size - mark.width) // 2, (size - mark.height) // 2), mark)
-        badge = (size - 26, size - 26, size - 2, size - 2)
+        badge = (size - 19, size - 19, size - 1, size - 1)
     except Exception:
         badge = (4, 4, size - 4, size - 4)
 
-    draw = ImageDraw.Draw(image)
-
-    # Outlined in white so the badge stays visible against the mark and against
-    # a light or a dark taskbar alike.
-    draw.ellipse(badge, fill=colour + (255,), outline=(255, 255, 255, 255), width=3)
+    # Outlined so the badge stays visible against the disc and against a light
+    # or a dark taskbar alike.
+    draw.ellipse(badge, fill=colour + (255,), outline=(255, 255, 255, 255), width=2)
     return image
 
 

@@ -18,7 +18,9 @@ def read_action() -> str:
     if not path.is_file():
         return "running"
     try:
-        action = str(json.loads(path.read_text(encoding="utf-8")).get("action"))
+        # `utf-8-sig`: this file is the volunteer's, and anything on Windows that writes it
+        # -- PowerShell, Notepad -- leaves a byte-order mark.
+        action = str(json.loads(path.read_text(encoding="utf-8-sig")).get("action"))
     except (OSError, ValueError):
         return "finish"
     return action if action in VALID_ACTIONS else "finish"

@@ -154,7 +154,9 @@ def main() -> None:
             if not coordinator:
                 raise RuntimeError("coordinator URL is required for activation")
             state_dir = Path(args.state_dir or os.environ.get(_STATE_DIR_ENV) or (Path("data") / "worker"))
-            activate(coordinator, code_path.read_text(encoding="utf-8").strip(), state_dir)
+            # Written by the installer, so it may carry a byte-order mark; left in, it would
+            # become part of the code and enrolment would be refused.
+            activate(coordinator, code_path.read_text(encoding="utf-8-sig").strip(), state_dir)
         finally:
             code_path.unlink(missing_ok=True)
         return

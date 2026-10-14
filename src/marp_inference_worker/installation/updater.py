@@ -100,7 +100,11 @@ class UpdateInstaller:
 
             staging.replace(target)
             active_path = self.install_root / "active.json"
-            active = json.loads(active_path.read_text(encoding="utf-8")) if active_path.is_file() else {}
+            # `utf-8-sig`, because the Windows installer writes these files with a byte-order
+            # mark and plain `utf-8` dies on its first byte. Every update on every Windows
+            # volunteer failed here with "Unexpected UTF-8 BOM"; the launcher beside this
+            # already read them this way (2026-10-14).
+            active = json.loads(active_path.read_text(encoding="utf-8-sig")) if active_path.is_file() else {}
             _atomic_json(self.state_dir / "pending-update.json", {
                 "previous_release": active.get("release"),
                 "target_release": release_key,

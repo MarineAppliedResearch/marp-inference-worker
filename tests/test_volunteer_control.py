@@ -13,6 +13,9 @@
 # json reads the envelope the parent writes for the child.
 import json
 
+# os supplies this process's pid, which stands in for a live tray.
+import os
+
 # time measures that a pause really blocks, and lets the clock be moved on.
 import time
 
@@ -603,3 +606,39 @@ def test_a_keepalive_that_fails_does_not_strand_the_job(tmp_path: Path) -> None:
     context.wait_while_paused(while_waiting=explode)
 
     assert context.should_stop() is True
+
+
+# test_a_second_launch_does_not_add_a_second_icon()
+# Verifies the tray's single-instance lock.
+# Inputs: tmp_path. Output: pytest pass/fail.
+# A volunteer opening the shortcut twice should get one icon, not two.
+def test_a_second_launch_does_not_add_a_second_icon(tmp_path: Path) -> None:
+
+    from marp_inference_worker.installation import launcher
+
+    assert launcher._tray_is_running(tmp_path) is False
+
+    # The lock names this process, which is alive and is python.
+    (tmp_path / "tray.pid").write_text(str(os.getpid()), encoding="utf-8")
+    assert launcher._tray_is_running(tmp_path) is True
+
+    assert launcher._start_tray(8010, tmp_path) is None
+
+
+# test_a_dead_lock_does_not_stop_the_icon_coming_back()
+# Verifies a stale pid file is ignored.
+# Inputs: tmp_path. Output: pytest pass/fail.
+#
+# A launcher that was killed cannot clean up after itself, so the lock outlives
+# it. Treating a stale lock as "a tray is running" would mean no icon at all,
+# which is the failure this whole feature exists to avoid -- strictly worse
+# than the duplicate icon the lock is there to prevent.
+def test_a_dead_lock_does_not_stop_the_icon_coming_back(tmp_path: Path) -> None:
+
+    from marp_inference_worker.installation import launcher
+
+    # A pid that cannot be running: 0 is not a real process on Windows, and
+    # garbage must be treated the same way.
+    for content in ("0", "", "not-a-pid", "999999999"):
+        (tmp_path / "tray.pid").write_text(content, encoding="utf-8")
+        assert launcher._tray_is_running(tmp_path) is False, content

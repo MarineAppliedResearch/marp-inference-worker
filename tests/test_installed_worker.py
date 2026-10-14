@@ -88,6 +88,33 @@ def test_update_is_verified_and_staged_beside_the_active_release(monkeypatch, tm
     }
 
 
+def test_update_reads_an_active_json_the_windows_installer_wrote(monkeypatch, tmp_path) -> None:
+    """A byte-order mark in active.json must not stop an update.
+
+    The Windows installer writes these files through PowerShell, which prefixes them with a
+    byte-order mark. The updater read active.json as plain utf-8 and every update on every
+    Windows volunteer failed with "Unexpected UTF-8 BOM" -- found by running a real update
+    against an installed worker on 2026-10-14, not by reading the code. The launcher beside
+    it already had its own test for exactly this.
+    """
+    package = _package()
+    client = _serve(monkeypatch, package)
+    install_root = tmp_path / "install"
+    state_dir = tmp_path / "state"
+    install_root.mkdir()
+    (install_root / "active.json").write_bytes(
+        b"\xef\xbb\xbf" + b'{"release":"0.1.0-cuda12.6"}'
+    )
+
+    try:
+        UpdateInstaller(state_dir, install_root).stage(_release(package))
+    finally:
+        client.close()
+
+    pending = json.loads((state_dir / "pending-update.json").read_text(encoding="utf-8"))
+    assert pending["previous_release"] == "0.1.0-cuda12.6"
+
+
 def test_update_rejects_path_traversal(monkeypatch, tmp_path) -> None:
     package = _package(extra_name="../outside.txt")
     client = _serve(monkeypatch, package)

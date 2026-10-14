@@ -23,6 +23,10 @@ import httpx
 # threading runs the status poll beside the icon's own event loop.
 import threading
 
+# resources finds the MARP mark inside the installed package, which is the only
+# way to reach it once the worker is installed rather than run from a checkout.
+from importlib import resources
+
 
 # How often the tray asks the worker what it is doing.
 # Slow enough to be free, fast enough that the icon is not visibly stale after
@@ -106,22 +110,48 @@ def tooltip_for(state: str, status: dict) -> str:
     return "MARP worker - running. Waiting for work."
 
 
+# The MARP mark, which already travels with the package for the watch window.
+# The tray shows the same logo as everything else rather than a shape of its
+# own: a volunteer should recognise whose software is on their machine.
+_MARK = resources.files("marp_inference_worker.watch") / "marp-mark.png"
+
+
 # _image()
-# Builds the icon bitmap in the given colour.
-# Inputs: an RGB tuple.
+# Builds the tray bitmap: the MARP mark, badged with the current state.
+# Inputs: an RGB tuple for the badge.
 # Output: a PIL image.
-# Drawn rather than shipped as a file so the tray has nothing to find at
-# runtime: a missing asset beside a frozen executable is a silent no-icon.
+#
+# The mark alone cannot say whether the worker is paused, and a plain coloured
+# dot does not say whose worker it is, so it is both -- the logo, with a small
+# dot in the corner. At the 16 pixels a tray actually renders, the dot is the
+# part that reads at a glance and the mark is the part that identifies it.
+#
+# Falls back to the bare dot if the mark cannot be loaded. An icon that is less
+# pretty is worth more than no icon, which is what an exception here would mean.
 def _image(colour: tuple[int, int, int]):
 
     from PIL import Image, ImageDraw
 
     size = 64
     image = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+
+    try:
+        with resources.as_file(_MARK) as path:
+            mark = Image.open(path).convert("RGBA")
+
+        # Fit the mark inside the square, keeping its proportions, and leave the
+        # bottom-right corner clear for the badge.
+        mark.thumbnail((size - 10, size - 10), Image.LANCZOS)
+        image.paste(mark, ((size - mark.width) // 2, (size - mark.height) // 2), mark)
+        badge = (size - 26, size - 26, size - 2, size - 2)
+    except Exception:
+        badge = (4, 4, size - 4, size - 4)
+
     draw = ImageDraw.Draw(image)
 
-    # A filled circle still reads at 16 pixels, which is what the tray shows.
-    draw.ellipse((4, 4, size - 4, size - 4), fill=colour + (255,))
+    # Outlined in white so the badge stays visible against the mark and against
+    # a light or a dark taskbar alike.
+    draw.ellipse(badge, fill=colour + (255,), outline=(255, 255, 255, 255), width=3)
     return image
 
 

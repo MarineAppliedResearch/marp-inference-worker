@@ -67,6 +67,16 @@ class WorkerState:
         self._pause_reason: str | None = None
         self._screen_mode = "off"
 
+        # Whether the job in flight is suspended, which is narrower than being
+        # paused. `finish` and `stop` also pause the worker and must NOT
+        # suspend: `finish` means let the running job complete.
+        self._suspended = False
+
+        # When the suspension began, or None. The five-minute release is
+        # measured from here rather than from a timer, so a worker that is
+        # restarted while paused does not quietly get another five minutes.
+        self._suspended_since: float | None = None
+
         # The jobs currently running, as the runner described them.
         self._jobs: list[dict[str, Any]] = []
 
@@ -181,7 +191,8 @@ class WorkerState:
     # Output: none.
     # Use this from the loopback API for the machine's own operator, and from
     # the runner when a heartbeat says pause. Pause stops new work; it does not
-    # touch a job already running (A5).
+    # touch a job already running (A5). Suspending the running job is the
+    # volunteer's own `pause` operator action, which is a different thing.
     def set_paused(self, paused: bool, reason: str | None = None) -> None:
 
         with self._lock:
@@ -202,6 +213,29 @@ class WorkerState:
             self._operator_action = action
             self._paused = action != "running"
             self._pause_reason = None if action == "running" else f"operator selected {action}"
+
+            # Only the volunteer's own `pause` suspends the job in flight.
+            self._suspended = action == "pause"
+            if not self._suspended:
+                self._suspended_since = None
+            elif self._suspended_since is None:
+                # Only the first pause starts the clock. Re-selecting pause, as
+                # a repeated menu click does, must not extend the wait.
+                self._suspended_since = time.time()
+
+
+    # suspended_for()
+    # How long the job in flight has been suspended, in seconds.
+    # Inputs: none.
+    # Output: the seconds, or None when nothing is suspended.
+    # The runner uses this both to hold the job and to decide it has been held
+    # long enough that the attempt should go back to the coordinator (#57 R7).
+    def suspended_for(self) -> float | None:
+
+        with self._lock:
+            if self._suspended_since is None:
+                return None
+            return time.time() - self._suspended_since
 
     def operator_action(self) -> str:
         with self._lock:

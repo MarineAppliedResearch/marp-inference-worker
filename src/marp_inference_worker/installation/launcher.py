@@ -4,6 +4,7 @@ import json
 import argparse
 import os
 import subprocess
+import threading
 import time
 from pathlib import Path, PurePosixPath
 
@@ -74,10 +75,38 @@ def _set_running_screen_mode(port: int, mode: str) -> bool:
         return False
 
 
+# _start_tray()
+# Puts the worker's icon in the system tray, if this machine has one.
+# Inputs: the worker's API port.
+# Output: None.
+# Runs on its own daemon thread so the supervision loop below is untouched by
+# it. Every failure is swallowed deliberately (#57 R9): a headless machine, a
+# Linux box with no status area, or a missing pystray must leave the worker
+# running exactly as it did before. An icon is not worth a worker.
+def _start_tray(port: int) -> None:
+
+    def run() -> None:
+        try:
+            from marp_inference_worker.installation.tray import WorkerTray
+
+            WorkerTray(port).run()
+        except Exception:
+            # Nowhere useful to report this: the worker's own log belongs to the
+            # child process, and a volunteer cannot act on it either way.
+            pass
+
+    threading.Thread(target=run, daemon=True, name="marp-tray").start()
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Start the active MARP worker release")
     parser.add_argument("--screen", choices=("off", "window", "fullscreen"))
-    parser.add_argument("--control", choices=("finish", "stop", "resume"))
+    parser.add_argument("--control", choices=("pause", "finish", "stop", "resume"))
+
+    # The tray is on by default: a volunteer with no sign the worker is running
+    # is the whole of #57. The switch is for a service account or a headless box
+    # where there is nothing to put an icon in.
+    parser.add_argument("--no-tray", action="store_true")
     args = parser.parse_args()
     local_app_data = Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local")
     install_root = Path(os.environ.get("MARP_WORKER_INSTALL_ROOT") or local_app_data / "MARP" / "Worker")
@@ -100,6 +129,9 @@ def main() -> int:
         return 0
     if args.screen and _set_running_screen_mode(port, args.screen):
         return 0
+
+    if not args.no_tray:
+        _start_tray(port)
 
     while True:
         active = _read_json(active_path)

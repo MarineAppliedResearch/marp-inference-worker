@@ -648,6 +648,13 @@ class TrackingEngine(BaseEngine):
                             },
                         )
 
+                        # A pause arrives here too, and blocks. The model stays
+                        # loaded and the decoder keeps its position, so resuming
+                        # carries on from this frame rather than reprocessing
+                        # any of them (#57 R5, R6). It returns if the pause is
+                        # turned into a stop, which the check below then sees.
+                        ctx.wait_while_paused()
+
                         # Cancellation arrives here and nowhere else. Breaking
                         # rather than raising means the tracks gathered so far
                         # are still closed and written below, so a cancelled job

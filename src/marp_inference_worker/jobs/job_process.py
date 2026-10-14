@@ -70,6 +70,12 @@ class JobProcess:
         # a decode or a CUDA call part way through.
         self.stop_file = self.workspace / "STOP"
 
+        # The parent creates this one to suspend the job where it stands, for
+        # the volunteer who wants their machine back (#57 R5). Same mechanism as
+        # STOP and for the same reasons; the difference is that it is removable,
+        # so the job carries on from where it paused rather than unwinding.
+        self.pause_file = self.workspace / "PAUSE"
+
         # Filled in by start().
         self._process: subprocess.Popen[str] | None = None
         self._reader: threading.Thread | None = None
@@ -140,6 +146,7 @@ class JobProcess:
                     "lease_epoch": self.lease_epoch,
                     "workspace": str(self.workspace),
                     "stop_file": str(self.stop_file),
+                    "pause_file": str(self.pause_file),
                     "spec": self.spec,
                 },
                 indent=2,
@@ -319,6 +326,29 @@ class JobProcess:
         if not self.stop_requested:
             self.stop_requested_at = time.monotonic()
         self.stop_requested = True
+
+    # request_pause()
+    # Suspends the job where it stands, without unwinding it.
+    # Inputs: none.
+    # Output: none.
+    # Use this when the volunteer pauses. The child blocks at its next progress
+    # checkpoint with the model still loaded, so resuming costs nothing and no
+    # frame is processed twice. Idempotent: pausing a paused job is a no-op.
+    def request_pause(self) -> None:
+
+        self.pause_file.touch(exist_ok=True)
+
+
+    # release_pause()
+    # Lets a paused job carry on.
+    # Inputs: none.
+    # Output: none.
+    # Removing the file is the whole signal. Tolerates the file being absent,
+    # because resuming a job that was never paused must not be an error.
+    def release_pause(self) -> None:
+
+        self.pause_file.unlink(missing_ok=True)
+
 
     def stop_elapsed_s(self) -> float:
         if self.stop_requested_at is None:

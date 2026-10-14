@@ -136,6 +136,10 @@ def test_context_protocol_is_the_only_thing_engines_are_given() -> None:
         "resume_from",
         "publish_artifact",
         "should_stop",
+        # #57. Inbound like should_stop, and allowed for the same reason: it
+        # answers "should I keep going", which tells the engine nothing about
+        # MARP. Still a closed list -- it grew by one, deliberately.
+        "wait_while_paused",
     }
 
 

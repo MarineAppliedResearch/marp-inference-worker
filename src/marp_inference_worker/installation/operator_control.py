@@ -5,7 +5,10 @@ import os
 from pathlib import Path
 
 
-VALID_ACTIONS = {"running", "finish", "stop"}
+# "pause" is the volunteer's own, added for #57: suspend the job where it stands
+# and give me my machine back. It is deliberately not "finish", which means the
+# opposite -- let the running job complete and take nothing new after it.
+VALID_ACTIONS = {"running", "pause", "finish", "stop"}
 
 
 def state_path() -> Path:

@@ -53,16 +53,17 @@ def _events(stream: StringIO) -> list[dict]:
     return [json.loads(line) for line in stream.getvalue().splitlines() if line.strip()]
 
 
-# test_context_offers_exactly_the_six_documented_calls()
+# test_context_offers_exactly_the_documented_calls()
 # Verifies the context's public surface.
 # Inputs: none.
 # Output: pytest pass/fail result.
 #
-# Proves R7's "exactly" clause. An engine is meant to have these and no more; a
-# seventh public call would be a way for engine code to learn something about
-# MARP, which is the thing the contract exists to prevent. emit_terminal is
-# excluded deliberately -- it belongs to the child entry point, not the engine.
-def test_context_offers_exactly_the_six_documented_calls() -> None:
+# Proves R7's "exactly" clause. An engine is meant to have these and no more; an
+# undocumented public call would be a way for engine code to learn something
+# about MARP, which is the thing the contract exists to prevent. emit_terminal
+# is excluded deliberately -- it belongs to the child entry point, not the
+# engine.
+def test_context_offers_exactly_the_documented_calls() -> None:
 
     public = {
         name
@@ -82,6 +83,10 @@ def test_context_offers_exactly_the_six_documented_calls() -> None:
         "resume_from",
         "publish_artifact",
         "should_stop",
+        # #57. Inbound like should_stop, and allowed for the same reason: it
+        # answers "should I keep going", which tells the engine nothing about
+        # MARP. The list grew from six to seven; it is still a closed list.
+        "wait_while_paused",
     }
 
 

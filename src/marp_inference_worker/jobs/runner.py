@@ -94,6 +94,14 @@ _STOP_GRACE_S = 60.0
 _UPDATE_CHECK_INTERVAL_S = 60.0
 
 
+# How long a paused job is held before it is stopped and handed back.
+# A volunteer pausing for a video call gets their machine back and keeps their
+# job; one who walks away does not hold a GPU and an attempt indefinitely.
+# Settled with Isaac on 2026-10-14 (#57 R7). The volunteer who wants their GPU
+# now does not wait for this -- that is the release action, #57 R10.
+_PAUSE_RELEASE_S = 300.0
+
+
 # _failure_reason()
 # Builds the one-line explanation the coordinator records against an attempt.
 # Inputs: the outcome name and the child's terminal payload.
@@ -975,6 +983,11 @@ class JobRunner:
                 if not job.stop_requested:
                     job.request_yield()
 
+        # Carry the worker's paused flag down to the jobs themselves. Pause used
+        # to stop new work arriving and leave a running job on the GPU, which is
+        # the opposite of why somebody presses it (#57 R5).
+        self._apply_pause_to_running_jobs()
+
         # Iterate over a copy: finishing a job mutates the mapping.
         for slot_index, job in list(self._jobs_by_slot.items()):
 
@@ -1059,6 +1072,48 @@ class JobRunner:
     # Output: none.
     # Use this before the batch is posted upstream. A warning is not a fault --
     # the job carries on -- so it lands in the notice rather than the error.
+    # _apply_pause_to_running_jobs()
+    # Suspends or resumes the jobs in flight to match the volunteer's choice.
+    # Inputs: none; reads the shared state and the running jobs.
+    # Output: none.
+    # Runs on every service pass, so it is also what resumes a job when the
+    # volunteer comes back, and what turns a pause nobody lifted into a proper
+    # stop once it has been held past _PAUSE_RELEASE_S (#57 R5, R6, R7).
+    def _apply_pause_to_running_jobs(self) -> None:
+
+        paused_for = self._state.suspended_for()
+
+        # Not paused: make sure nothing is left suspended. Releasing is cheap
+        # and idempotent, and doing it unconditionally is what makes a missed
+        # resume impossible rather than unlikely.
+        if paused_for is None:
+            for job in self._jobs_by_slot.values():
+                job.release_pause()
+            return
+
+        # Held long enough that the attempt should go back rather than sit on a
+        # GPU nobody is using. request_stop() is the same path a coordinator
+        # cancel takes, so the job unwinds and reports its partial work.
+        if paused_for >= _PAUSE_RELEASE_S:
+            for job in self._jobs_by_slot.values():
+                if not job.stop_requested:
+                    self._state.note(
+                        f"paused for {int(paused_for)}s; releasing {job.attempt_id} "
+                        "back to the coordinator"
+                    )
+                    # Released, not suspended: the job has to run to unwind and
+                    # write what it has, which it cannot do while blocked.
+                    job.release_pause()
+                    job.request_stop()
+            return
+
+        for job in self._jobs_by_slot.values():
+            # A job already asked to stop is left to finish doing it. Pausing it
+            # now would block the unwind and lose the partial results.
+            if not job.stop_requested:
+                job.request_pause()
+
+
     def _surface_warnings(self, events: list[dict[str, Any]]) -> None:
 
         for event in events:

@@ -15,6 +15,12 @@ lap
 cython-bbox
 cython
 filterpy
+# The system-tray icon the volunteer controls the worker from (#57), and the
+# library that draws its bitmap. Pillow already arrives through ultralytics;
+# it is named here because tray.py imports it directly, and a dependency you
+# import is one you declare rather than one you inherit.
+pystray
+pillow
 torch==2.11.0+cu128
 torchvision==0.26.0+cu128
 

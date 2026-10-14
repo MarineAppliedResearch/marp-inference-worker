@@ -121,7 +121,7 @@ class JobContext(Protocol):
     # loaded so resuming costs nothing (#57).
     # Inputs: none.
     # Output: True if it waited at all, False if the worker was running.
-    def wait_while_paused(self) -> bool: ...
+    def wait_while_paused(self, while_waiting=None) -> bool: ...
 
 
 # BaseEngine

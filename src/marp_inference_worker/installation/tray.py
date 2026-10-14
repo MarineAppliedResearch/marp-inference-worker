@@ -45,9 +45,14 @@ _TIMEOUT_SECONDS = 4.0
 #
 # Give me my GPU now is deliberately not in here. It is an action rather than a
 # state -- you press it and land in Paused -- and the menu shows it separately.
+# The action names are the ones /status/control accepts, not the ones the
+# worker stores. It takes `resume` and turns it into the stored `running`;
+# sending `running` straight at it is rejected, which is what made Pause work
+# and un-pause do nothing at all. test_every_action_the_tray_sends_is_accepted
+# is what stops that coming back.
 _STATES = {
-    "background": ("Background", "running", "off"),
-    "foreground": ("Foreground", "running", "window"),
+    "background": ("Background", "resume", "off"),
+    "foreground": ("Foreground", "resume", "window"),
     "paused": ("Paused", "pause", None),
 }
 

@@ -220,14 +220,14 @@ def test_the_three_states_map_onto_actions_the_worker_already_has() -> None:
 
     assert tray.choose("background") is True
     assert sent == [
-        ("/status/control", {"action": "running"}),
+        ("/status/control", {"action": "resume"}),
         ("/status/screen", {"mode": "off"}),
     ]
 
     sent.clear()
     assert tray.choose("foreground") is True
     assert sent == [
-        ("/status/control", {"action": "running"}),
+        ("/status/control", {"action": "resume"}),
         ("/status/screen", {"mode": "window"}),
     ]
 
@@ -506,3 +506,100 @@ def test_the_current_state_is_ticked() -> None:
     ticked = [str(item.text) for item in tray.build_menu() if item.checked]
 
     assert ticked == ["Paused"]
+
+
+# test_every_action_the_tray_sends_is_accepted_by_the_endpoint()
+# Verifies the tray and /status/control agree on the words.
+# Inputs: none. Output: pytest pass/fail.
+#
+# The tray sent `running` to resume -- the name the worker *stores* -- and the
+# endpoint only accepts `resume` and turns it into that. So Pause worked,
+# un-pause was rejected with a 422, and the tray showed nothing because it
+# swallows a failed POST. Found by Isaac pausing a real job on 2026-10-14.
+#
+# Every test above asserted the calls the tray makes, so they all passed: they
+# checked the tray against itself. This checks it against the other side, by
+# reading the endpoint's own accepted values rather than a copy of them.
+def test_every_action_the_tray_sends_is_accepted_by_the_endpoint() -> None:
+
+    from typing import get_args
+
+    from marp_inference_worker.api.status_routes import ControlRequest
+
+    accepted = set(get_args(ControlRequest.model_fields["action"].annotation))
+
+    sent = {action for _label, action, _screen in tray_module._STATES.values()}
+
+    # release_gpu() sends its own action and is not in _STATES, so name it here
+    # rather than leaving the one destructive call uncovered.
+    sent.add("stop")
+
+    assert sent <= accepted, (
+        f"the tray sends {sorted(sent - accepted)}, which /status/control "
+        f"rejects; it accepts {sorted(accepted)}"
+    )
+
+
+# test_the_watch_window_is_kept_fed_while_paused()
+# Verifies the window survives a pause of any length.
+# Inputs: tmp_path. Output: pytest pass/fail.
+#
+# The watch page closes itself when its long poll goes unanswered -- it retries
+# for thirty seconds and then gives up (#52). A pause can last five minutes, so
+# without a keepalive the volunteer's machine ends up running a job with no
+# window, which is the one thing #57 exists to prevent. Isaac, 2026-10-14, on
+# seeing it happen: "it's very important that this doesn't just run without a
+# window".
+#
+# Asserts the callback is actually invoked while blocked, not merely accepted.
+def test_the_watch_window_is_kept_fed_while_paused(tmp_path: Path) -> None:
+
+    stop_file = tmp_path / "STOP"
+    pause_file = tmp_path / "PAUSE"
+    pause_file.touch()
+    context = ChildJobContext(
+        params={},
+        checkpoint_dir=tmp_path / "work",
+        stop_file=stop_file,
+        pause_file=pause_file,
+    )
+
+    fed: list[int] = []
+
+    def release() -> None:
+        # Long enough that the keepalive must fire more than once.
+        time.sleep(1.2)
+        pause_file.unlink()
+
+    threading.Thread(target=release, daemon=True).start()
+    context.wait_while_paused(while_waiting=lambda: fed.append(1))
+
+    assert len(fed) >= 2, f"the window was fed {len(fed)} times during a 1.2s pause"
+
+
+# test_a_keepalive_that_fails_does_not_strand_the_job()
+# Verifies the job stays cancellable when the window has gone.
+# Inputs: tmp_path. Output: pytest pass/fail.
+# The window is a nicety; a paused job that cannot be stopped is not.
+def test_a_keepalive_that_fails_does_not_strand_the_job(tmp_path: Path) -> None:
+
+    stop_file = tmp_path / "STOP"
+    pause_file = tmp_path / "PAUSE"
+    pause_file.touch()
+    context = ChildJobContext(
+        params={},
+        checkpoint_dir=tmp_path / "work",
+        stop_file=stop_file,
+        pause_file=pause_file,
+    )
+
+    def explode() -> None:
+        raise RuntimeError("the watch window has gone")
+
+    threading.Thread(
+        target=lambda: (time.sleep(0.5), stop_file.touch()), daemon=True
+    ).start()
+
+    context.wait_while_paused(while_waiting=explode)
+
+    assert context.should_stop() is True

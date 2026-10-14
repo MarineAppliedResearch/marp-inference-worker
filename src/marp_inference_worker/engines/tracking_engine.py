@@ -653,7 +653,26 @@ class TrackingEngine(BaseEngine):
                         # carries on from this frame rather than reprocessing
                         # any of them (#57 R5, R6). It returns if the pause is
                         # turned into a stop, which the check below then sees.
-                        ctx.wait_while_paused()
+                        # Re-offer the frame already on screen for as long as
+                        # the pause lasts. The window closes itself when its
+                        # long poll goes unanswered, so without this a pause
+                        # leaves the volunteer's machine holding a job with no
+                        # window -- which is exactly what the tray exists to
+                        # stop. Nothing new is drawn; the picture simply stays.
+                        def keep_window_alive(
+                            held_frame=frame,
+                            held_tracks=live_tracks,
+                        ) -> None:
+                            if watch is not None:
+                                watch.present(
+                                    held_frame,
+                                    held_frame.index,
+                                    held_tracks,
+                                    range_start=start_frame,
+                                    range_end=end_frame,
+                                )
+
+                        ctx.wait_while_paused(while_waiting=keep_window_alive)
 
                         # Cancellation arrives here and nowhere else. Breaking
                         # rather than raising means the tracks gathered so far

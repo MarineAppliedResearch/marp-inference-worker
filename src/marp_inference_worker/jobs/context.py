@@ -318,7 +318,13 @@ class ChildJobContext:
     # It keeps watching the stop file, because a paused job must stay
     # cancellable -- that is what lets a pause held too long be turned into a
     # proper stop rather than a hang (R7).
-    def wait_while_paused(self) -> bool:
+    #
+    # `while_waiting` is called on each poll. The engine uses it to keep the
+    # watch window fed: that window closes itself when nothing arrives, so a
+    # pause with no keepalive leaves the volunteer's machine working with no
+    # window, which is the thing the tray exists to prevent. The context knows
+    # nothing about windows -- it just calls back.
+    def wait_while_paused(self, while_waiting=None) -> bool:
 
         # The common case is not paused, and it must cost one stat and nothing
         # else: this runs on the same cadence as the progress report.
@@ -335,6 +341,15 @@ class ChildJobContext:
             # should_stop() check unwind it in the usual way.
             if self.should_stop():
                 break
+
+            if while_waiting is not None:
+                try:
+                    while_waiting()
+                except Exception:
+                    # A keepalive that fails must not strand a paused job. The
+                    # window is a nicety; staying cancellable is not.
+                    pass
+
             time.sleep(_PAUSE_POLL_SECONDS)
 
         if waited and not self._stop_cached:

@@ -450,3 +450,59 @@ def test_the_service_pass_actually_applies_the_pause() -> None:
     JobRunner._service_running_jobs(stub)
 
     assert applied == [True]
+
+
+# test_the_menu_builds_and_its_actions_are_wired()
+# Verifies the menu pystray is actually handed, not just the logic behind it.
+# Inputs: none. Output: pytest pass/fail.
+#
+# Written after a real install came up with no icon and no error. The actions
+# were `lambda _icon, _item, key=key:` -- a default argument to capture the loop
+# variable -- and pystray inspects an action's signature and refuses anything
+# that is not exactly (icon, item). The menu raised ValueError before it was
+# built, and the launcher's deliberate swallow (R9) turned that into silence.
+#
+# Every test here passed throughout, because none of them built the menu. This
+# one does, and it needs no desktop: constructing a Menu is pure Python, and
+# only run() wants a display and a message pump.
+def test_the_menu_builds_and_its_actions_are_wired() -> None:
+
+    tray = tray_module.WorkerTray(port=8010)
+    sent: list[tuple[str, dict]] = []
+    tray._post = lambda path, body: (sent.append((path, body)), True)[1]
+
+    items = list(tray.build_menu())
+    labels = [str(item.text) for item in items]
+
+    assert labels[:3] == ["Background", "Foreground", "Paused"]
+    assert labels[-1] == "Give me my GPU now"
+
+    # MenuItem.__call__ takes the icon and dispatches to the action itself, so
+    # invoking the item is invoking it exactly as pystray does -- and an action
+    # whose signature pystray would reject never gets this far, because the
+    # build above raises.
+    for item in items:
+        if str(item.text) == "Foreground":
+            item(None)
+    assert ("/status/screen", {"mode": "window"}) in sent
+
+    sent.clear()
+    for item in items:
+        if str(item.text) == "Give me my GPU now":
+            item(None)
+    assert sent == [("/status/control", {"action": "stop"})]
+
+
+# test_the_current_state_is_ticked()
+# Verifies R2's "one of which is always shown as the current one".
+# Inputs: none. Output: pytest pass/fail.
+# The checked callable takes exactly (item) and is rejected the same way if it
+# does not, so this covers the other half of the signature contract.
+def test_the_current_state_is_ticked() -> None:
+
+    tray = tray_module.WorkerTray(port=8010)
+    tray._state = "paused"
+
+    ticked = [str(item.text) for item in tray.build_menu() if item.checked]
+
+    assert ticked == ["Paused"]

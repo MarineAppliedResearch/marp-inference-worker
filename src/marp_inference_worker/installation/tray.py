@@ -248,6 +248,48 @@ class WorkerTray:
             self._refresh(status)
 
 
+    # build_menu()
+    # Builds the tray menu: the three states, then the immediate release.
+    # Inputs: none.
+    # Output: a pystray.Menu.
+    # Separate from run() so it can be built and checked without a desktop --
+    # run() needs a display and a message pump, this needs neither.
+    def build_menu(self):
+
+        import pystray
+
+        # One builder for the three radio items, so a state cannot be added to
+        # the menu without also being in _STATES.
+        #
+        # Closures, not lambdas with a default argument to capture `key`.
+        # pystray inspects an action's signature and refuses anything that does
+        # not take exactly (icon, item) -- a `key=key` default counts as a third
+        # parameter, so the menu raised ValueError before it was ever built and
+        # the launcher's swallow turned that into a worker with no icon and no
+        # error. Found on a real install, not by reading.
+        def item(key: str):
+            label = _STATES[key][0]
+
+            def activate(icon, menu_item) -> None:
+                self.choose(key)
+
+            def is_current(menu_item) -> bool:
+                return self._state == key
+
+            return pystray.MenuItem(label, activate, checked=is_current, radio=True)
+
+        def release(icon, menu_item) -> None:
+            self.release_gpu()
+
+        return pystray.Menu(
+            item("background"),
+            item("foreground"),
+            item("paused"),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem("Give me my GPU now", release),
+        )
+
+
     # run()
     # Shows the icon and blocks until the tray is stopped.
     # Inputs: none.
@@ -258,30 +300,11 @@ class WorkerTray:
 
         import pystray
 
-        # One builder for the three radio items, so a state cannot be added to
-        # the menu without also being in _STATES.
-        def item(key: str):
-            label = _STATES[key][0]
-            return pystray.MenuItem(
-                label,
-                lambda _icon, _item, key=key: self.choose(key),
-                checked=lambda _item, key=key: self._state == key,
-                radio=True,
-            )
-
-        menu = pystray.Menu(
-            item("background"),
-            item("foreground"),
-            item("paused"),
-            pystray.Menu.SEPARATOR,
-            pystray.MenuItem("Give me my GPU now", lambda _icon, _item: self.release_gpu()),
-        )
-
         self._icon = pystray.Icon(
             "marp-worker",
             icon=_image(colour_for(self._state)),
             title=tooltip_for(self._state, {}),
-            menu=menu,
+            menu=self.build_menu(),
         )
 
         poller = threading.Thread(target=self._poll, daemon=True, name="marp-tray-poll")

@@ -1,126 +1,105 @@
 ---
-task: MarineAppliedResearch/marp-inference-worker#60
-repos: [marp-inference-worker]
+task: MarineAppliedResearch/marp-inference-worker#67
+repos: [marp-inference-worker, MARP_API]
 status: design
 needs: []
 ---
 
 ## Goal
 
-Somebody watching a donated machine work can see where in the video this job is, how long
-it has been going, and roughly how much longer it has left. Today the window shows the
-frame being worked on and a 3-pixel bar at the very bottom, which says "some fraction of
-something" and nothing more -- not which part of the video this job owns, not where the
-run started, not whether it is ten minutes or three hours from finishing.
+A model is trained by giving the job to the worker pool, the same way inference is given to
+it. Today training happens in `src/old_scripts/model_training_live.py`, on one person's
+machine, against a dataset folder only that machine has, writing to the database directly.
+Afterwards nobody can say which weights came from which data without asking the person who
+ran it. When this is done, a training run is queued in MARP, leased by a worker, watched
+while it runs, and ends in weights MARP has registered and the pool can run inference with.
 
 ## Requirements
 
-- **R1** -- The watch window carries a timeline showing the frame range this job is
-  working and the playhead inside it. Frame numbers are stated, not only drawn.
-- **R2** -- A resumed attempt reads as a resumed attempt rather than as a job that skipped
-  its first frames: what an earlier attempt already covered is visibly distinct from what
-  this one is doing.
-- **R3** -- Elapsed time for this attempt, and an estimate of time remaining, both in the
-  window. The estimate is from frames actually finished, not from wall clock alone.
-- **R4** -- The timeline is still correct when the job's window is a slice of a longer
-  video, and degrades to the window alone when the container will not report a length.
-- **R5** -- Nothing on the timeline sets the pace of inference. It is drawn from data the
-  window already receives and already polls; no new per-frame work on the engine's thread.
-- **R6** -- (tooltip; see A3) The tray tooltip says how far through the running job is, so
-  Background mode is not blind.
+- **R1** — A job spec can describe a training job. `video` and `range` are required today
+  and a training job has neither; it has a dataset, starting weights and hyperparameters.
+  An inference spec keeps validating exactly as it does now.
+- **R2** — The worker fetches the dataset from a locator the job spec carries and verifies
+  it against a hash before use, the same way a model artifact is fetched and verified. It
+  does not know what is serving that locator and holds no credential for it.
+- **R3** — Training runs behind the existing `BaseEngine` contract — `preflight()` then
+  `run(ctx, spec)` — so the runner, the slots, the lease, the stop file and the pause file
+  need no training-specific cases.
+- **R4** — Progress and metrics are reported per epoch through `ctx.report_progress()` and
+  `ctx.report_metrics()`, from Ultralytics' own epoch callbacks. The unit is epochs, not
+  frames.
+- **R5** — A training attempt stops and pauses at an epoch boundary, and a stop reports the
+  epochs completed rather than losing them.
+- **R6** — The trained weights are handed over with `ctx.publish_artifact()` and carry the
+  class names they were trained on, because the tracking engine refuses weights whose
+  vocabulary disagrees with what MARP registered for the model.
+- **R7** — A dataset is cached once per worker and shared by every attempt that uses it.
+  It is not copied into each attempt's workspace. See #65: per-attempt copies of shared
+  bytes are what filled a volunteer's disk, and a dataset is far larger than a browser
+  profile.
+- **R8** — Nothing on the training path imports the Jellyfin client, extending the existing
+  `test_nothing_on_the_job_path_imports_jellyfin` boundary.
 
 ## Open assumptions
 
-- [x] **A1 - product/UI - blocking** -- answered 2026-10-15: **(b)+(c)**. The bar is the
-      whole video, the job's window is marked inside it, what an earlier attempt covered
-      is dim and this attempt's part is bright. The question was:
-      What does the full width of the timeline represent?
-      (a) **this attempt's window only** -- `start_frame`..`end_frame` as the worker
-      receives it, which for a resumed job is already the remaining part;
-      (b) **the job's whole window**, with the part earlier attempts covered drawn dim and
-      this attempt's part bright -- this is what the issue describes, and it needs A2;
-      (c) **the whole video**, with the job's window marked inside it and the playhead
-      within that -- the worker already knows the video's length from the container.
-      (b) and (c) combine: the whole video, the job's window marked, this attempt's start
-      ticked. Recommendation: **(b)+(c)**, because it is the only reading in which "where
-      the job actually started" means anything, and the video-length context is free.
-
-- [x] **A2 - cross-repository - blocking** -- answered 2026-10-15: **yes, add it**. The
-      coordinator puts the job's own window start on the copy it hands over; the stored
-      spec stays untouched. Second branch and second pull request in MARP_API, and the
-      worker tolerates its absence so the two can merge in either order. The question was:
-      Only if A1 includes (b). The worker cannot
-      tell a resumed attempt from a fresh one: `applyResumePoint` in MARP_API hands over a
-      *copy* of the spec with `range.start_frame` moved to the resume point, deliberately,
-      and the original start is not in anything the worker receives. So (b) needs one
-      extra field on the leased spec copy -- the job's own `start_frame` -- which is a
-      change in MARP_API, a second branch and a second pull request. Is that worth it, or
-      do we take (a)/(c) and keep this to one repository?
-
-- [x] **A3 - product/UI - blocking** -- answered 2026-10-15: **yes, in the tooltip**.
-      Does the tray tooltip carry a percentage as well,
-      or does the timeline live only in the window? Recommendation: **yes, in the
-      tooltip** -- in Background mode the tooltip is the only thing a volunteer can see,
-      and `tooltip_for()` already reads `/status`, which already carries `progress`.
-
-- [ ] **A4 - product/UI - non-blocking** -- One timeline per window, or one combined view
-      of every slot? Recommendation: **one per window**. Each slot already gets its own
-      watch window, tiled by `_tile(slot_index, slot_count)`, and each is a different
-      video; a combined view would put four unrelated videos' ranges on one axis. The
-      machine-wide number that is worth having -- frames per second across all slots -- is
-      already in the top bar.
-
-- [ ] **A5 - behavioural - non-blocking** -- Where does "time remaining" come from? The
-      page already measures a 10-second rolling frame rate for the `fps` readout, and
-      `/status` carries this attempt's `progress.done` and `elapsed_s`, whose ratio is the
-      attempt's average rate. Recommendation: **the attempt average**, falling back to the
-      rolling rate before there is enough of it -- an estimate that jumps around is an
-      estimate nobody reads, and the average steadies as the job goes on.
+- [ ] **A1 · architectural · blocking** — How does the dataset reach the worker? The
+      proposal is the A8 shape: MARP resolves the dataset and the job spec carries a
+      locator plus a hash, exactly as `video.url` does, so the worker never learns where
+      datasets live and the coming file server is a change on MARP's side only. The
+      alternatives are the worker being given per-frame URLs and labels and assembling the
+      YOLO tree itself, or dataset building becoming its own job kind. Which?
+- [ ] **A2 · architectural · blocking** — One training job that runs all three phases, or
+      one job per phase with the coordinator chaining them and passing each phase's weights
+      to the next? Chaining falls out of the existing lease, retry and resume machinery;
+      one long job does not.
+- [ ] **A3 · scientific · blocking** — What is the phase order?
+      `runTrainingPipeline`'s own docstring says *"1. crops 2. frames 3. mixed"* and the
+      line below it runs `phases = ["crops", "mixed", "frames"]`. The two have disagreed
+      inside one function for as long as the file has existed, so neither can be taken as
+      the intended one.
+- [ ] **A4 · performance/concurrency · blocking** — A training run is hours and the lease
+      is built for minutes: heartbeat every 10s, and a quiet attempt is reclaimed. Does a
+      training attempt hold its lease for the whole run, or publish a checkpoint and resume
+      after a restart? `ctx.resume_from` exists for the second and is hard-coded to `None`
+      today.
+- [ ] **A5 · cross-repository · blocking** — Who turns finished weights into an `ml_models`
+      row with its `model_species`, and when? The worker can only publish an artifact; the
+      registration is MARP's (`MarineAppliedResearch/MARP_API#265`).
+- [ ] **A6 · performance/concurrency · non-blocking** — Does a training job take the whole machine, rather
+      than one of the slots `_live_slot_count()` derived? That function measures frames per
+      second and a training job reports epochs, so it would read a healthy run as a stalled
+      one.
+- [ ] **A7 · environment · non-blocking** — Where does the shared dataset cache live, and what evicts it?
+      Model weights cache under the install's `models/cache`; a dataset is far larger and
+      the same choice may not suit.
 
 ## Decisions
 
-- **2026-10-15** -- Display only. Every number already flows: `report_progress` fires every
-  `_PROGRESS_EVERY_FRAMES` frames, `/status` reports each running job's `progress`, and the
-  frame packet already carries `range_start` and `range_end`. Nothing new is measured.
+- **2026-10-15** — The spec is written against the existing `BaseEngine` contract rather
+  than a second job path. `report_metrics` is already unschema'd for Ultralytics' varying
+  metric names, and `resume_from` was documented for training from the start, so the
+  contract was built expecting this.
 
 ## Plan
 
-1. Settle A1-A3.
-2. Carry the video's length to the window. `geometry.total_frames` is already read in
-   `tracking_engine.py`; it reaches the page through the frame packet, beside the range.
-3. Draw the timeline in `live.html`: the band, the window inside it, the attempt's start,
-   the playhead, and the frame numbers under it.
-4. Elapsed and remaining, from `/status` in `refreshFooter`, which already polls.
-5. If A3 is yes: the percentage into `tooltip_for()` in `installation/tray.py`.
-6. If A2 is yes: the job's own start on the leased spec copy, in MARP_API, on its own
-   branch and its own pull request, with the worker tolerating its absence.
+Written after A1–A5 are answered; the shape of every step depends on them.
 
 ## Acceptance criteria
 
-- With a job running, the window shows the job's range, the playhead inside it, and both
-  frame numbers; the bar moves as the job runs.
-- A job that resumes part-way through its window shows the earlier part as already covered
-  rather than starting its bar part-filled with no explanation.
-- Elapsed counts up and the remaining estimate falls; neither is blank once the job has
-  run long enough to have a rate.
-- A video whose container reports no frame count still draws a usable timeline.
-- Frame rate with the window open is unchanged, slot for slot, from before this change.
+- A training job spec validates, and an inference job spec is unaffected.
+- A training attempt reports epochs as they finish and is visible while it runs.
+- A stop part-way through reports the epochs completed, not a failure.
+- The weights land in MARP as an artifact that can be registered and then run.
+- A second attempt on the same worker reuses the cached dataset rather than fetching it
+  again.
 
 ## Test plan
 
-`.marp/verification.md`, written at G3. Two things in it are worth reading before the
-rest: R3 and R5 have no automated test and say so, and the render section is the only
-tier that can see the page draw.
+Filled in at G3, after the gate.
 
 ## Status
 
-- **Gate:** verifying
-- **Notes:** A1-A3 answered 2026-10-15. A4 stands as recommended. **A5 was implemented
-  the other way round from its recommendation**, and the reason is a fact found after it
-  was written: `progress.elapsed_s` counts from when the job *process* started, so the
-  model load, the seek and every second of a pause are inside it. Dividing by it
-  understates the rate and inflates the estimate, worst on exactly the paused job somebody
-  is looking at the window to understand. So the rolling rate leads and the average is the
-  fallback. The coordinator's half is MARP_API branch `lease-says-where-the-job-began`,
-  which has no issue of its own -- one is needed there, or this can be referenced from
-  #60.
+- **Gate:** design
+- **Notes:** G1. Blocking assumptions A1–A5 are with Isaac; nothing is implemented until
+  they are answered. The coordinator half is `MarineAppliedResearch/MARP_API#265` and the
+  cross-repository tracking issue is `MarineAppliedResearch/MARP#36`.

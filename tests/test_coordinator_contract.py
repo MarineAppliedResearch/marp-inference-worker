@@ -898,3 +898,77 @@ def test_a_settings_report_to_an_unreachable_coordinator_still_raises(coordinato
         client.post_events(attempt_id="228", worker_id="65", lease_epoch=1,
                            events=[{"seq": 0, "kind": "settings", "engine": "marp_tracking",
                                     "settings": {}, "ignored": {}}])
+
+
+# test_a_resumed_lease_keeps_the_job_start_the_coordinator_sent()
+# Verifies the job's own window start survives validation and the re-dump.
+# Inputs: none.
+# Output: pytest pass/fail result.
+#
+# The runner does not hand the child the mapping the coordinator sent: it
+# rebuilds it with `envelope.spec.model_dump()`, so a field the spec model does
+# not declare is dropped silently between the lease and the job. That is a trap
+# worth a test of its own, because both sides pass without it -- the coordinator
+# sends `job_start_frame`, MARP's suite proves it sent it, the worker's suite
+# proves nothing about it, and the watch window never sees it (#60 R2).
+def test_a_resumed_lease_keeps_the_job_start_the_coordinator_sent() -> None:
+
+    envelope = AttemptEnvelope.model_validate({
+        "attempt_id": 228,
+        "worker_id": 65,
+        "lease_epoch": 2,
+        "spec": {
+            "engine": "mock",
+            "model": {"name": "m.pt", "sha256": "a" * 64},
+            "video": {
+                "url": "http://media.invalid/v.mp4",
+                "source_name": "v.mp4",
+                "jellyfin_item_id": "item-1",
+            },
+            # A resumed lease: MARP moved `start_frame` to the resume point and
+            # says where the job itself began.
+            "range": {"start_frame": 12000, "end_frame": 30000,
+                      "job_start_frame": 0},
+            "params": {},
+            "reduction": {"name": "v3_dirpad", "version": 1},
+        },
+    })
+
+    assert envelope.spec.range.job_start_frame == 0
+
+    # The shape the child is actually given, which is where it was being lost.
+    spec = envelope.spec.model_dump(mode="json")
+
+    assert spec["range"]["job_start_frame"] == 0
+    assert spec["range"]["start_frame"] == 12000
+
+
+# test_a_lease_without_a_job_start_is_a_job_that_starts_where_it_says()
+# Verifies the field is optional, in both directions.
+# Inputs: none.
+# Output: pytest pass/fail result.
+#
+# A fresh job has no earlier attempt, and a coordinator older than #60 sends
+# nothing at all. Neither is a validation failure, and neither may stop a job
+# running -- the window simply has nothing earlier to draw.
+def test_a_lease_without_a_job_start_is_a_job_that_starts_where_it_says() -> None:
+
+    envelope = AttemptEnvelope.model_validate({
+        "attempt_id": 1,
+        "worker_id": 1,
+        "lease_epoch": 1,
+        "spec": {
+            "engine": "mock",
+            "model": {"name": "m.pt", "sha256": "a" * 64},
+            "video": {
+                "url": "http://media.invalid/v.mp4",
+                "source_name": "v.mp4",
+                "jellyfin_item_id": "item-1",
+            },
+            "range": {"start_frame": 0, "end_frame": 300},
+            "params": {},
+            "reduction": {"name": "v3_dirpad", "version": 1},
+        },
+    })
+
+    assert envelope.spec.range.job_start_frame is None

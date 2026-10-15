@@ -104,6 +104,20 @@ class FrameRange(BaseModel):
     # This frame belongs to the NEXT piece, and this job must not process it.
     end_frame: int = Field(gt=0)
 
+    # Where the job's own window begins, which is not where this attempt does.
+    #
+    # The coordinator moves `start_frame` forward to the resume point when it
+    # leases a job somebody already worked on, so a resumed attempt is handed a
+    # range that begins part-way in and cannot tell that from a fresh job. This
+    # carries the original, for the watch window to draw the earlier attempt's
+    # work as already covered (#60 R2).
+    #
+    # Optional, and declared here for a reason that is easy to miss: the runner
+    # rebuilds the spec with `model_dump()`, so a field this model does not
+    # declare is dropped between the lease and the job -- the coordinator would
+    # send it, both sides' tests would pass, and the window would never see it.
+    job_start_frame: int | None = Field(default=None, ge=0)
+
     # Reject an inverted or empty range at the boundary rather than mid-decode.
     @model_validator(mode="after")
     def _check_order(self) -> "FrameRange":

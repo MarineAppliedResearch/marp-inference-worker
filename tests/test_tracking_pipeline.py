@@ -1518,3 +1518,185 @@ def test_the_summary_says_how_long_it_took(tmp_path, monkeypatch) -> None:
     assert "elapsed_s" in summary
     assert isinstance(summary["elapsed_s"], float)
     assert summary["elapsed_s"] >= 0
+
+
+# _watch_window_built_for()
+# Runs the tracking engine over one frame with a watch window, and reports what
+# that window was constructed with.
+# Inputs: the pytest temporary directory, monkeypatch, and the job's range.
+# Output: the keyword arguments the engine passed to WatchDisplay.
+#
+# Everything the engine needs is faked except the engine: a real video, a real
+# model and a real tracker are all beside the point for what the window is
+# told, and none of them is available without a GPU and a dive.
+def _watch_window_built_for(tmp_path: Path, monkeypatch, frame_range: dict) -> dict:
+
+    from types import SimpleNamespace
+
+    from marp_inference_worker import watch as watch_package
+    from marp_inference_worker.engines import tracking_engine
+    from marp_inference_worker.media.frame_range_reader import DecodedFrame, VideoGeometry
+
+    built: list[dict] = []
+
+    # FakeWatch
+    # Records what the engine asked for and draws nothing.
+    class FakeWatch:
+        def __init__(self, **kwargs):
+            built.append(kwargs)
+
+        def start(self):
+            return False
+
+    monkeypatch.setattr(watch_package, "WatchDisplay", FakeWatch)
+
+    class Context:
+        def __init__(self):
+            self.params = {
+                "model_path": str(tmp_path / "model.pt"),
+                "device": "cpu",
+                # The runner's own flag, which is the whole decision.
+                "_watch_screen_mode": "window",
+            }
+            self.checkpoint_dir = tmp_path / "checkpoints"
+            self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+        def log(self, _message, level="info"):
+            return None
+
+        def report_progress(self, _done, _total, _unit, phase=None):
+            return None
+
+        def report_metrics(self, **_fields):
+            return None
+
+        def report_settings(self, _engine, _settings, _ignored):
+            return None
+
+        def should_stop(self):
+            return False
+
+        def publish_artifact(self, _path, _kind):
+            return "0" * 64
+
+    class Detector:
+        def load_weights(self, _path, _device):
+            return SimpleNamespace(names={})
+
+        def infer_stream(self, _model, frames, _confidence, _predict_options=None):
+            for frame in frames:
+                yield SimpleNamespace(frame=frame, detections=[])
+
+        def unload_all(self):
+            return None
+
+    class Accumulator:
+        active_track_count = 0
+        discarded_track_count = 0
+
+        def __init__(self, track_buffer):
+            self.track_buffer = track_buffer
+
+        def take_aged_out(self, _frame_index):
+            return []
+
+        def finish_range(self):
+            return []
+
+    def frame_stream(_capture, _geometry, start, _end, on_seek_complete=None):
+        on_seek_complete()
+        yield DecodedFrame(index=start, time_s=start / 30.0, image="image")
+
+    monkeypatch.setattr(tracking_engine, "resolve_device", lambda *_args: "cpu")
+    monkeypatch.setattr(
+        tracking_engine,
+        "open_video",
+        # 54,000 frames: half an hour of video, of which a job owns a slice.
+        lambda _source: (SimpleNamespace(release=lambda: None),
+                         VideoGeometry(1920, 1080, 30.0, 54000)),
+    )
+    monkeypatch.setattr(tracking_engine, "iter_frame_range", frame_stream)
+    monkeypatch.setattr(
+        tracking_engine,
+        "create_tracker",
+        lambda _params: (
+            SimpleNamespace(update=lambda *_args: []),
+            SimpleNamespace(as_dict={"track_buffer": 30}),
+        ),
+    )
+    monkeypatch.setattr(tracking_engine, "TrackAccumulator", Accumulator)
+
+    ctx = Context()
+    engine = tracking_engine.TrackingEngine()
+    engine._detector = Detector()
+    engine.run(
+        ctx,
+        {
+            "range": frame_range,
+            "video": {"url": "fake://video", "source_name": "video.mp4"},
+            "params": ctx.params,
+            "reduction": {"name": "v3_dirpad", "version": "1"},
+        },
+    )
+
+    assert built, "the engine never built a watch window"
+    return built[0]
+
+
+# test_the_watch_window_is_told_the_video_length_and_the_jobs_own_start()
+# Verifies #60 R1, R2 and R4 where the two numbers are actually chosen.
+# Inputs: the pytest temporary directory and monkeypatch.
+# Output: pytest pass/fail result.
+#
+# The engine is the only place that holds both: the container's frame count,
+# from opening the video, and the job's own window, from the spec. The window
+# cannot derive either one, so a timeline with no axis would look exactly like
+# a timeline with a stuck playhead.
+def test_the_watch_window_is_told_the_video_length_and_the_jobs_own_start(
+    tmp_path: Path, monkeypatch
+) -> None:
+
+    # A resumed lease: this attempt runs from 12,000, the job from zero.
+    built = _watch_window_built_for(
+        tmp_path, monkeypatch,
+        {"start_frame": 12000, "end_frame": 12001, "job_start_frame": 0},
+    )
+
+    assert built["video_frames"] == 54000
+    assert built["job_start_frame"] == 0
+
+
+# test_a_fresh_job_begins_where_this_attempt_does()
+# Verifies the absent field is not a hole in the display (#60 R2).
+# Inputs: the pytest temporary directory and monkeypatch.
+# Output: pytest pass/fail result.
+#
+# No earlier attempt, or a coordinator older than #60: either way the job began
+# where this attempt did, and the window must be told that rather than left to
+# guess from a null.
+def test_a_fresh_job_begins_where_this_attempt_does(tmp_path: Path, monkeypatch) -> None:
+
+    built = _watch_window_built_for(
+        tmp_path, monkeypatch, {"start_frame": 12000, "end_frame": 12001},
+    )
+
+    assert built["job_start_frame"] == 12000
+
+
+# test_a_job_start_after_this_attempt_is_ignored()
+# Verifies the engine does not trust a nonsensical resume point (#60 R2).
+# Inputs: the pytest temporary directory and monkeypatch.
+# Output: pytest pass/fail result.
+#
+# A job start later than this attempt's own start would draw an inverted band
+# and a percentage over a negative span. It cannot happen from a coordinator
+# that is working; it is refused here anyway, because a display reading a field
+# out of a job spec has no way to ask.
+def test_a_job_start_after_this_attempt_is_ignored(tmp_path: Path, monkeypatch) -> None:
+
+    built = _watch_window_built_for(
+        tmp_path, monkeypatch,
+        {"start_frame": 12000, "end_frame": 12001, "job_start_frame": 20000},
+    )
+
+    assert built["job_start_frame"] == 12000

@@ -100,6 +100,37 @@ def state_from_status(status: dict) -> str:
 # Output: the text.
 # R1 asks for words, not just a colour: a volunteer should be able to find out
 # what their machine is doing without clicking anything.
+def _percent_through(job: dict) -> int | None:
+
+    # The job's own window, not this attempt's. A resumed attempt is handed a
+    # range that already starts part-way in, and a tooltip that called that 0%
+    # would report a job somebody else half finished as not started.
+    frame_range = job.get("range") or {}
+    progress = job.get("progress") or {}
+
+    try:
+        start = int(frame_range["start_frame"])
+        end = int(frame_range["end_frame"])
+        done = int(progress["done"])
+    except (KeyError, TypeError, ValueError):
+        return None
+
+    job_start = frame_range.get("job_start_frame")
+
+    try:
+        job_start = int(job_start) if job_start is not None else start
+    except (TypeError, ValueError):
+        job_start = start
+
+    job_start = min(job_start, start)
+    span = end - job_start
+
+    if span <= 0:
+        return None
+
+    return max(0, min(100, round((start + done - job_start) * 100 / span)))
+
+
 def tooltip_for(state: str, status: dict) -> str:
 
     # `active_jobs` is what /status calls it. Reading `jobs` found nothing, so
@@ -115,6 +146,15 @@ def tooltip_for(state: str, status: dict) -> str:
 
     if running:
         plural = "job" if running == 1 else "jobs"
+
+        # How far through, in the tooltip, because in Background mode there is
+        # no window and this is the only thing a volunteer can see at all. The
+        # watch window's timeline says the same thing properly (#60 R6).
+        shares = [_percent_through(job) for job in (status.get("active_jobs") or [])]
+        shares = [f"{share}%" for share in shares if share is not None]
+
+        if shares:
+            return f"MARP worker - running {running} {plural}, {', '.join(shares)} through."
         return f"MARP worker - running {running} {plural}."
     return "MARP worker - running. Waiting for work."
 

@@ -682,3 +682,100 @@ def test_the_tray_only_reads_fields_the_worker_actually_reports() -> None:
 
     assert "waiting for work" not in text, text
     assert "1 job" in text, text
+
+
+# test_the_tooltip_says_how_far_through_the_job_is()
+# Verifies #60 R6 against the payload /status really reports.
+# Inputs: none. Output: pytest pass/fail.
+#
+# In Background mode there is no window, so the tooltip is the whole interface.
+# Both halves of this are built by the real code -- `JobProcess.current_progress`
+# makes the progress mapping and `JobRunner._describe_jobs` makes the job entry
+# -- because a tooltip tested against a hand-written dict agrees with whatever
+# the tray expects and says nothing about what the worker sends. That is exactly
+# how it came to read `jobs` while /status said `active_jobs`.
+def test_the_tooltip_says_how_far_through_the_job_is() -> None:
+    from types import SimpleNamespace
+
+    from marp_inference_worker.jobs.job_process import JobProcess
+    from marp_inference_worker.jobs.runner import JobRunner
+
+    # A resumed attempt: the job runs 0..30,000, an earlier attempt covered the
+    # first 12,000, and this one has done 3,000 of the 18,000 it was handed.
+    holder = SimpleNamespace(
+        _lock=threading.Lock(),
+        progress={"done": 3000, "total": 18000, "unit": "frames", "phase": "inferring"},
+        slot_index=0,
+        started_at=time.time() - 600,
+    )
+    progress = JobProcess.current_progress(holder)
+
+    job = SimpleNamespace(
+        attempt_id="3170",
+        slot_index=0,
+        spec={
+            "_job_id": "4659",
+            "engine": "tracking",
+            "range": {"start_frame": 12000, "end_frame": 30000, "job_start_frame": 0},
+            "video": {"source_name": "v.mp4"},
+            "model": {"name": "m.pt"},
+            "session_context": {},
+        },
+        current_progress=lambda: progress,
+        stop_requested=False,
+        yield_requested=False,
+    )
+
+    status = WorkerState().describe()
+    status["active_jobs"] = JobRunner._describe_jobs(
+        SimpleNamespace(_jobs_by_slot={0: job})
+    )
+
+    text = tray_module.tooltip_for("background", status)
+
+    # 15,000 of 30,000: the earlier attempt's frames count, because they are
+    # done and the volunteer is being told how far through the job is.
+    assert "50%" in text, text
+    assert "1 job" in text, text
+
+
+# test_a_fresh_job_is_measured_from_its_own_start()
+# Verifies the tooltip without the coordinator's job start (#60 R6).
+# Inputs: none. Output: pytest pass/fail.
+#
+# A fresh job has no earlier attempt and an older coordinator sends no
+# `job_start_frame` at all. Neither may make the percentage wrong or absent.
+def test_a_fresh_job_is_measured_from_its_own_start() -> None:
+    from types import SimpleNamespace
+
+    from marp_inference_worker.jobs.job_process import JobProcess
+    from marp_inference_worker.jobs.runner import JobRunner
+
+    holder = SimpleNamespace(
+        _lock=threading.Lock(),
+        progress={"done": 4500, "total": 18000, "unit": "frames", "phase": "inferring"},
+        slot_index=0,
+        started_at=time.time() - 600,
+    )
+    job = SimpleNamespace(
+        attempt_id="3171",
+        slot_index=0,
+        spec={
+            "_job_id": "4660",
+            "engine": "tracking",
+            "range": {"start_frame": 0, "end_frame": 18000},
+            "video": {"source_name": "v.mp4"},
+            "model": {"name": "m.pt"},
+            "session_context": {},
+        },
+        current_progress=lambda: JobProcess.current_progress(holder),
+        stop_requested=False,
+        yield_requested=False,
+    )
+
+    status = WorkerState().describe()
+    status["active_jobs"] = JobRunner._describe_jobs(
+        SimpleNamespace(_jobs_by_slot={0: job})
+    )
+
+    assert "25%" in tray_module.tooltip_for("background", status)

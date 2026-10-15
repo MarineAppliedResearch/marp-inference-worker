@@ -932,6 +932,8 @@ class WatchDisplay:
         species_names: list[str] | None = None,
         slot_index: int = 0,
         slot_count: int = 1,
+        video_frames: int | None = None,
+        job_start_frame: int | None = None,
     ) -> None:
         self._mode = screen_mode
         # Which of the worker's windows this is, and how many there are. Only
@@ -949,6 +951,17 @@ class WatchDisplay:
         self._profile_dir: Path | None = None
         self._model_name = model_name
         self._species_names = list(species_names or [])
+        # How long the whole video is, as the container reports it, and where
+        # this job's own window begins. Both are fixed for the life of the job,
+        # so they are held here rather than passed with every frame.
+        #
+        # They are what turns the bar at the bottom of the window from "some
+        # fraction of something" into a position: the window the job owns, drawn
+        # inside the video it is a slice of (#60 R1, R4).
+        self._video_frames = int(video_frames) if video_frames else None
+        self._job_start_frame = (
+            int(job_start_frame) if job_start_frame is not None else None
+        )
         self._channel = _FrameChannel()
         self._server: _WatchServer | None = None
         self._process: subprocess.Popen[bytes] | None = None
@@ -1306,6 +1319,13 @@ class WatchDisplay:
             "frame_number": int(frame_number),
             "range_start": int(range_start) if range_start is not None else None,
             "range_end": int(range_end) if range_end is not None else None,
+            # The video this window is a slice of, and where the job began
+            # rather than where this attempt did. A resumed attempt is handed a
+            # range that already starts part-way in, so without the job's own
+            # start the window cannot tell "somebody else did the first twelve
+            # thousand frames" from "this job skipped them" (#60 R2).
+            "video_frames": self._video_frames,
+            "job_start_frame": self._job_start_frame,
             "job_id": self._job_id,
             "attempt_id": self._attempt_id,
             "model_name": self._model_name,

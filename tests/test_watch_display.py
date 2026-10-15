@@ -936,3 +936,87 @@ def test_an_uninspectable_profile_is_treated_as_gone(tmp_path) -> None:
 
     display._profile_dir = None
     assert display._profile_in_use() is False
+
+
+# test_a_frame_packet_carries_the_video_length_and_the_job_start()
+# Verifies the timeline's two fixed points reach the page (#60 R1, R2, R4).
+# Inputs: tmp_path.
+# Output: pytest pass/fail result.
+#
+# Without the video's length the bar has no axis, and without the job's own
+# start a resumed attempt is indistinguishable from a job that skipped its
+# first frames -- which is the one thing the timeline exists to answer.
+def test_a_frame_packet_carries_the_video_length_and_the_job_start(tmp_path: Path) -> None:
+    import numpy as np
+
+    display = WatchDisplay(
+        "window", tmp_path / "jobs" / "77", lambda _message: None,
+        job_id="4659", attempt_id="3170",
+        video_frames=54000, job_start_frame=0,
+    )
+    published: list[dict] = []
+    display._channel.publish = lambda packet, **_: published.append(packet) or True
+
+    frame = SimpleNamespace(image=np.zeros((8, 8, 3), dtype=np.uint8))
+
+    # A resumed attempt: handed 12,000 onwards of a job that began at zero.
+    assert display.present(frame, 12500, [], range_start=12000, range_end=30000) is True
+
+    assert published[0]["video_frames"] == 54000
+    assert published[0]["job_start_frame"] == 0
+    assert published[0]["range_start"] == 12000
+    assert published[0]["range_end"] == 30000
+
+
+# test_the_page_reads_the_fields_the_window_actually_publishes()
+# Verifies the page and the publisher agree on every timeline field name.
+# Inputs: tmp_path.
+# Output: pytest pass/fail result.
+#
+# The page is the only consumer of the frame packet and nothing executes it in
+# this suite, so a renamed field breaks the timeline in exactly the way the
+# `jobs`/`active_jobs` mix-up broke the tooltip: silently, with every test
+# green. The key names come from a real published packet rather than a list
+# written out here, so this cannot agree with a publisher that has moved on.
+def test_the_page_reads_the_fields_the_window_actually_publishes(tmp_path: Path) -> None:
+    import numpy as np
+
+    display = WatchDisplay(
+        "window", tmp_path / "jobs" / "77", lambda _message: None,
+        video_frames=54000, job_start_frame=0,
+    )
+    published: list[dict] = []
+    display._channel.publish = lambda packet, **_: published.append(packet) or True
+
+    frame = SimpleNamespace(image=np.zeros((8, 8, 3), dtype=np.uint8))
+    display.present(frame, 12500, [], range_start=12000, range_end=30000)
+
+    markup = (WatchDisplay._packaged_player_root() / "live.html").read_text(encoding="utf-8")
+
+    for field in ("frame_number", "range_start", "range_end",
+                  "video_frames", "job_start_frame"):
+        assert field in published[0], f"the window no longer publishes {field}"
+        assert field in markup, f"the page never reads {field}"
+
+
+# test_every_element_the_page_reaches_for_exists_on_it()
+# Verifies the script's element ids against the page's own markup.
+# Inputs: none.
+# Output: pytest pass/fail result.
+#
+# `getElementById` returns null for a name that is not there, and the failure
+# is a TypeError inside the frame pump -- which the pump catches and treats as
+# the worker having gone away, so a typo in an id closes the window and reports
+# "the run has finished". Nothing else in this suite executes the page.
+def test_every_element_the_page_reaches_for_exists_on_it() -> None:
+    import re
+
+    markup = (WatchDisplay._packaged_player_root() / "live.html").read_text(encoding="utf-8")
+
+    wanted = set(re.findall(r"getElementById\('([^']+)'\)", markup))
+    wanted |= set(re.findall(r"place\('([^']+)'", markup))
+    wanted |= set(re.findall(r"setText\('([^']+)'", markup))
+    declared = set(re.findall(r'id="([^"]+)"', markup))
+
+    assert wanted, "no element lookups found; this test has stopped testing anything"
+    assert wanted <= declared, f"the page reaches for ids it does not have: {sorted(wanted - declared)}"

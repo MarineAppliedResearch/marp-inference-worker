@@ -1,148 +1,95 @@
----
-task: MarineAppliedResearch/marp-inference-worker#57
-status: verified-at-the-tiers-that-can-see-it
----
+# Verification — marp-inference-worker#60, the watch window's timeline
 
-## What was run
+## What each test proves
 
-`pytest` in this worktree's own `.venv312`, 2026-10-14:
+| Requirement | Test | Tier | Proves |
+| --- | --- | --- | --- |
+| R1 | `test_a_frame_packet_carries_the_video_length_and_the_job_start` | unit | the axis and the playhead's bounds reach the page at all |
+| R1 | `test_the_watch_window_is_told_the_video_length_and_the_jobs_own_start` | unit (engine) | the engine chooses both numbers from the container and the spec |
+| R1, R4 | `test_the_page_reads_the_fields_the_window_actually_publishes` | contract | the page reads the names the publisher really publishes |
+| R2 | `test_a_resumed_lease_keeps_the_job_start_the_coordinator_sent` | contract | the coordinator's field survives validation **and the runner's re-dump** |
+| R2 | `test_a_lease_without_a_job_start_is_a_job_that_starts_where_it_says` | contract | its absence is not a validation failure |
+| R2 | `test_a_fresh_job_begins_where_this_attempt_does` | unit (engine) | a fresh job is drawn as starting where it starts |
+| R2 | `test_a_job_start_after_this_attempt_is_ignored` | unit (engine) | a nonsensical resume point cannot invert the bar |
+| R2 | MARP_API `tells the worker where the job itself began` | api | the lease actually carries it, from the coordinator's side |
+| R2 | MARP_API `says nothing about a job start on a first lease` | api | a fresh lease is not made to look resumed |
+| R1, R2, R3 | the browser render, below | render | the only tier that can see the page draw |
+| R5 | — | — | no new per-frame work: the page reads the packet it already received and the `/status` poll it already made. Argued, not tested; see *Known gaps* |
+| R6 | `test_the_tooltip_says_how_far_through_the_job_is` | unit | the tooltip, built from the real `_describe_jobs` and the real `current_progress` |
+| R6 | `test_a_fresh_job_is_measured_from_its_own_start` | unit | the percentage without the coordinator's field |
+| — | `test_every_element_the_page_reaches_for_exists_on_it` | contract | no `getElementById` in the page names an id the page does not have |
 
-```
-304 passed, 4 skipped, 1 warning in 66.09s
-```
+## Requirements with no test
 
-`tests/test_volunteer_control.py` is the new file: 17 tests.
+**R3** has no automated test. Elapsed and the estimate are read from `/status` and
+formatted in the page, and nothing in this suite executes the page — so the evidence for
+R3 is the render below, which is a human looking at it.
 
-## Each requirement, and the test that proves it
+**R5** is an argument rather than a test: the timeline adds two constants to a packet that
+was already being sent and reads a `/status` poll that was already being made, so there is
+nothing new on the engine's thread. A frame-rate measurement on real hardware would prove
+it properly, and is listed as a gap.
 
-| | Requirement | Test |
-| --- | --- | --- |
-| R1 | tray appears, tooltip says the state in words | `tooltip_for` covered; the icon itself is **not** covered -- see below |
-| R2 | three states, current one marked | `test_the_tray_reads_the_worker_rather_than_its_own_memory` |
-| R3 | Background is normal and takes work | `test_the_three_states_map_onto_actions_the_worker_already_has` |
-| R4 | Foreground retargets the running job | same test: asserts the `/status/screen` call, which is the existing retarget path |
-| R5 | pause suspends the job in flight | `test_pause_suspends_the_job_and_resuming_lets_it_carry_on`, `test_pause_reaches_the_job_in_flight`, `test_the_service_pass_actually_applies_the_pause` |
-| R6 | resuming carries on, nothing reprocessed | `test_pause_suspends_...` (blocks on the real file and returns when it goes), `test_resuming_releases_every_job`, `test_resuming_clears_the_release_clock` |
-| R7 | released after five minutes | `test_a_pause_held_too_long_hands_the_attempt_back` |
-| R8 | the choice is durable across a restart | `test_pause_is_a_durable_choice` |
-| R9 | no tray is not a failure | **not covered** -- see below |
-| R10 | give me my GPU now | `test_give_me_my_gpu_now_releases_rather_than_suspends` |
+## Edge cases
 
-## Proved red before green
+- **A resumed attempt**, which is the case the issue is about: the window must show the
+  earlier attempt's frames as covered, not as frames this job skipped. Drawn as a dim
+  band, a tick at the resume point, and the words `resumed at 12,000` — three signals,
+  because shading alone was too quiet when looked at.
+- **A container that reports no frame count.** Some streams do. The axis falls back to the
+  job's own window, which is all the window can honestly draw.
+- **A container reporting fewer frames than the job's range.** Not trusted either, same
+  fallback: a video shorter than the work asked of it is a number to disbelieve.
+- **A job start later than this attempt's start.** Impossible from a working coordinator;
+  ignored rather than drawn inverted, because a page reading a field out of a job spec has
+  no way to ask.
+- **A paused job.** No rate, so the estimate is omitted rather than invented.
+- **A frame number from the previous job arriving late.** The playhead never moves behind
+  where this attempt began.
 
-Three tests were run against the pre-#57 behaviour, with the pause removed from
-the context and the call removed from the service pass:
+## Regression coverage
 
-```
-FAILED tests/test_volunteer_control.py::test_pause_suspends_the_job_and_resuming_lets_it_carry_on
-FAILED tests/test_volunteer_control.py::test_a_paused_job_can_still_be_stopped
-FAILED tests/test_volunteer_control.py::test_the_service_pass_actually_applies_the_pause
-3 failed, 14 passed
-```
+- `test_a_resumed_lease_keeps_the_job_start_the_coordinator_sent` is the trap this change
+  would otherwise have walked into. The runner does not hand the child the mapping the
+  coordinator sent: it rebuilds it with `envelope.spec.model_dump()`, so a field the spec
+  model does not declare is dropped silently. Both repositories' suites pass without it —
+  MARP's proves it sent the field, the worker's proves nothing about it, and the window
+  never sees it. Proved red by removing the declaration from `FrameRange`.
+- `test_the_page_reads_the_fields_the_window_actually_publishes` and
+  `test_the_tooltip_says_how_far_through_the_job_is` both build their input from the real
+  producer rather than a hand-written dict. That is the `jobs` / `active_jobs` defect from
+  #57, where the tray read a key `/status` does not have and every test agreed with it.
 
-`test_the_service_pass_actually_applies_the_pause` exists **because of** that run.
-The first attempt at this file tested `_apply_pause_to_running_jobs` directly, and
-those tests stayed green when the call to it was deleted -- they proved the method
-worked and not that anything ran it. That is the tier trap in the testing doctrine,
-caught here rather than in a bug report.
+## The render
 
-## Run on real hardware, 2026-10-14
-
-Isaac drove the tray on his own machine against job 14370 and 14371, real
-inference on an RTX 4080 SUPER through the installed worker. Measured
-alongside with `nvidia-smi` and the worker's own `/status`.
-
-| | What happened |
-| --- | --- |
-| R5 pause suspends the job | utilisation fell within one progress checkpoint; the job stayed held, not failed |
-| R6 resume continues | 5,010 -> 19,470 frames on 14370; 4,620 -> 22,320 on 14371 after a release. No frame reprocessed, no restart |
-| R10 release frees the card | **1558 MiB -> 634 MiB**, which is the model unloaded rather than merely idle |
-| R10 work is not thrown away | the attempt recorded `yielded`, and the job carried `resume_from_frame = 4620`; the retry carried on from there |
-| the window survives a pause | paused twice with the live view open; it held both times and closed only on release, which is correct |
-
-The sample that caught the release, from the watcher running alongside:
-
-```
-16:46:13 action/frames:[running 3450] gpu:[51 %, 1558 MiB] chrome:37
-16:46:34 action/frames:[stop    4590] gpu:[1 %,   634 MiB] chrome:26
-16:47:14 action/frames:[running  420] gpu:[20 %, 1558 MiB] chrome:38
-```
-
-**Four defects were found by using it that the suite had passed over**, and each
-now has a test at a tier that can see it:
-
-1. pystray refuses a menu action whose signature is not exactly `(icon, item)`.
-   The menu raised before the icon existed and the launcher's swallow hid it.
-2. `pystray` reached `pyproject.toml` but not `packaging/requirements-*.in`,
-   which is what the installer resolves from. The artifact built, installed and
-   ran with no icon.
-3. The tray sent `running` to resume; the endpoint accepts `resume`. Pause
-   worked, un-pause was rejected with a 422 the tray swallowed.
-4. Pausing closed the live window permanently -- the page gives up when its
-   long poll goes unanswered, and a pause outlasts that.
-
-Three of those passed a green suite because the tests asserted the calls the
-tray makes -- they checked it against itself rather than against the thing it
-talks to. That is the lesson from this task, and
-`test_every_action_the_tray_sends_is_accepted_by_the_endpoint` is the shape of
-the answer: read the other side's own declaration, never a copy of it.
-
-## The five-minute release, run twice, 2026-10-15
-
-Isaac paused a real job at 10:49 and left the worker alone. It fired on time
-and freed the card -- **and failed the requirement**:
+No automated tier executes `live.html`, so it was run: the real page, the real display
+server, and synthetic frames in place of a GPU
+(`scratchpad/timeline_preview.py`, not committed). Two cases, both read back out of the
+DOM rather than judged by eye:
 
 ```
-10:54:12  "paused for 303s; releasing 12753 back to the coordinator"  vram 1563 -> 640 MiB
+resumed job, 54,000-frame video, job 0..30,000, attempt from 12,000
+  tltrack  = [10, 1004]   the whole video
+  tlwindow = [10,  557.8] 55.6% -- 30,000/54,000
+  tlearlier= [10,  223.1] 22.2% -- 12,000/54,000
+  tlfill   = [233.1, 11]  from the resume point to the playhead
+  tlhead   = [243.1,  2]  23.2% -- frame 12,528
+  legend: 0 | frame 12,592 - 42% of this job - resumed at 12,000
+             - 16s elapsed - ~7m left | 54,000
+
+fresh job, container reports no frame count, job 12,000..30,000
+  tlwindow fills the track, tlearlier is empty, tlstart is hidden
+  legend: 12,000 | frame 12,496 - 3% of this job - 12s elapsed - ~7m left | 30,000
 ```
 
-| | first run | after the fix |
-| --- | --- | --- |
-| job state | `cancelled` -- dead, nobody picks it up | `queued` |
-| `yields_made` | 0 | 1 |
-| `resume_from_frame` | `None` -- twelve thousand frames lost | 1560 |
-| attempt | `cancelled` | `yielded` |
+## Known gaps
 
-The escalation called `request_stop()` where the volunteer's own *Give me my
-GPU now* calls `request_yield()`. One flag apart, and that flag decides whether
-the coordinator gets the attempt back with its resume point or the job dies
-with the work in it. The comment justifying it said `request_stop()` was *"the
-same path a coordinator cancel takes"* -- which is exactly why it was wrong.
-
-**The test passed throughout**, because it asserted the job was stopped. It
-was; it was simply the wrong kind of stop. The stand-in job now tells a yield
-from a bare stop, and `npx`-style clock-moving still cannot see this: the
-second run is what proves it, and it is the reason this requirement needed a
-real five minutes rather than a faster test.
-
-The invisibility of the lost range is tracked separately as
-`MarineAppliedResearch/MARP_API#257` -- the worker bug is fixed, but nothing in
-the coordinator would have said that range was still owed.
-
-## What is NOT covered, and why
-
-- **The tray icon itself.** No test drives a real notify-icon: that needs a
-  desktop session and a window manager, which this tier does not have. What is
-  tested is everything behind it -- the state reading, the tooltip text, the
-  colours, and the exact HTTP calls each menu item makes. **Somebody has to look
-  at the actual icon**, and that is in the acceptance list below.
-- **R9, running without a tray.** The launcher swallows every tray failure, which
-  by construction cannot be observed from inside the process that swallowed it.
-  Verified by reading, not by test. A Linux machine with no status area is the
-  real check.
-- *(settled -- see the five-minute run below)*
-- **A volunteer's first install**, as opposed to a reinstall over an existing
-  one. Everything here ran on a machine that already had a worker.
-
-## For the human to check on a real machine
-
-1. Install and look at the tray. Is there an icon, and does hovering say something
-   true?
-2. Start a job. Pause it. Does `nvidia-smi` utilisation drop, and does the job
-   survive?
-3. Resume. Does it carry on from where it was rather than restarting?
-4. Pause and walk away for five minutes. Does the attempt go back to the
-   coordinator with no fault reported?
-5. Press *Give me my GPU now* during a job. Does `nvidia-smi` **used memory** drop?
-6. Switch to Foreground mid-job. Does the live view appear for that job?
-7. Kill the worker while paused and restart it. Does it come back paused?
+- **No GPU and no real video.** The render above used synthetic frames, so what is
+  unproven is the same list as always: that the numbers are right while a real engine is
+  producing them, and that the window's frame rate is unchanged (R5).
+- **The estimate is not calibrated.** It is the observed rate times the frames left, and
+  it will swing while a model loads or a job is paused. Nobody has watched one run to the
+  end against the clock.
+- **Four slots at once has not been looked at.** Each window draws its own job (A4), which
+  is what the tiling already does, but four windows with four timelines is a layout nobody
+  has seen yet.

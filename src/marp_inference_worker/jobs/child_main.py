@@ -56,6 +56,12 @@ def main(argv: list[str]) -> int:
     # The workspace this job owns, and the file the parent creates to stop it.
     workspace = Path(envelope["workspace"])
     stop_file = Path(envelope["stop_file"])
+
+    # A worker started before #57 writes no pause file into the envelope. Fall
+    # back to the conventional name beside the stop file rather than failing:
+    # an envelope is written by the same version that reads it, but a job that
+    # survives an update should not die on a missing key.
+    pause_file = Path(envelope.get("pause_file") or stop_file.with_name("PAUSE"))
     spec = envelope["spec"]
 
     # Set Ultralytics' runtime environment before anything imports it. This is
@@ -75,6 +81,7 @@ def main(argv: list[str]) -> int:
         params=spec.get("params") or {},
         checkpoint_dir=workspace / "work",
         stop_file=stop_file,
+        pause_file=pause_file,
         resume_from=None,
         stream=sys.stdout,
     )

@@ -1,2 +1,4 @@
 [console_scripts]
 marp-worker = marp_inference_worker.worker_main:main
+marp-worker-activate = marp_inference_worker.installation.activation:main
+marp-worker-launcher = marp_inference_worker.installation.launcher:main

@@ -4,6 +4,7 @@ import json
 import argparse
 import os
 import subprocess
+import threading
 import time
 from pathlib import Path, PurePosixPath
 
@@ -74,10 +75,83 @@ def _set_running_screen_mode(port: int, mode: str) -> bool:
         return False
 
 
+# _tray_is_running()
+# Whether this machine already has a tray icon up.
+# Inputs: the state directory.
+# Output: True when a live process holds the lock.
+#
+# The lock is a pid file rather than a flag, because a launcher that was killed
+# cannot clean up after itself -- and a stale flag would mean no icon at all,
+# which is the failure this whole file exists to avoid. A pid that no longer
+# exists, or that belongs to something else now, is treated as no tray.
+def _tray_is_running(state_dir: Path) -> bool:
+
+    lock = state_dir / "tray.pid"
+    try:
+        pid = int(lock.read_text(encoding="utf-8-sig").strip())
+    except (OSError, ValueError):
+        return False
+
+    try:
+        import psutil
+
+        return psutil.pid_exists(pid) and "python" in psutil.Process(pid).name().lower()
+    except Exception:
+        # Cannot tell. Say no: a second icon is untidy, no icon is the bug.
+        return False
+
+
+# _start_tray()
+# Puts the worker's icon in the system tray, if this machine has one.
+# Inputs: the worker's API port and the state directory.
+# Output: the tray's thread, or None when one is already running.
+#
+# Runs on its own daemon thread so the supervision loop below is untouched by
+# it. Every failure is swallowed deliberately (#57 R9): a headless machine, a
+# Linux box with no status area, or a missing pystray must leave the worker
+# running exactly as it did before. An icon is not worth a worker.
+#
+# Called on both paths out of main(), including the one that finds a worker
+# already running and only retargets its screen. That path used to return
+# before this, so a volunteer who opened the shortcut while the worker was up
+# got no icon at all -- the exact complaint #57 was filed about.
+def _start_tray(port: int, state_dir: Path):
+
+    if _tray_is_running(state_dir):
+        return None
+
+    try:
+        state_dir.mkdir(parents=True, exist_ok=True)
+        (state_dir / "tray.pid").write_text(str(os.getpid()), encoding="utf-8")
+    except OSError:
+        # Without the lock a second shortcut could add a second icon. Still
+        # better than no icon, so carry on.
+        pass
+
+    def run() -> None:
+        try:
+            from marp_inference_worker.installation.tray import WorkerTray
+
+            WorkerTray(port).run()
+        except Exception:
+            # Nowhere useful to report this: the worker's own log belongs to the
+            # child process, and a volunteer cannot act on it either way.
+            pass
+
+    thread = threading.Thread(target=run, daemon=True, name="marp-tray")
+    thread.start()
+    return thread
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Start the active MARP worker release")
     parser.add_argument("--screen", choices=("off", "window", "fullscreen"))
-    parser.add_argument("--control", choices=("finish", "stop", "resume"))
+    parser.add_argument("--control", choices=("pause", "finish", "stop", "resume"))
+
+    # The tray is on by default: a volunteer with no sign the worker is running
+    # is the whole of #57. The switch is for a service account or a headless box
+    # where there is nothing to put an icon in.
+    parser.add_argument("--no-tray", action="store_true")
     args = parser.parse_args()
     local_app_data = Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local")
     install_root = Path(os.environ.get("MARP_WORKER_INSTALL_ROOT") or local_app_data / "MARP" / "Worker")
@@ -98,8 +172,25 @@ def main() -> int:
         )
         response.raise_for_status()
         return 0
+    # A worker is already up: retarget its screen, make sure it has an icon,
+    # and stay alive only for as long as the tray needs. Returning straight
+    # away here is what left a running worker with no icon.
     if args.screen and _set_running_screen_mode(port, args.screen):
+        if args.no_tray:
+            return 0
+
+        tray = _start_tray(port, state_dir)
+        if tray is None:
+            return 0
+
+        # Wait on the thread itself, not on the lock: the lock holds this
+        # process's own pid, so reading it back would say "running" forever
+        # even once the tray had gone.
+        tray.join()
         return 0
+
+    if not args.no_tray:
+        _start_tray(port, state_dir)
 
     while True:
         active = _read_json(active_path)

@@ -1,31 +1,30 @@
 Metadata-Version: 2.4
 Name: marp-inference-worker
-Version: 0.1.0
+Version: 0.1.1
 Summary: Agnostic MARP inference worker service.
-Requires-Python: >=3.10
+Requires-Python: <3.13,>=3.12
 License-File: LICENSE
 Requires-Dist: fastapi
 Requires-Dist: uvicorn[standard]
 Requires-Dist: pydantic
 Requires-Dist: httpx
-Requires-Dist: ultralytics
+Requires-Dist: ultralytics==8.4.145
+Requires-Dist: opencv-python
 Requires-Dist: psutil
 Requires-Dist: nvidia-ml-py
 Requires-Dist: loguru
 Requires-Dist: scipy
 Requires-Dist: lap
-Requires-Dist: scikit-image
-Requires-Dist: thop
-Requires-Dist: ninja
-Requires-Dist: tabulate
-Requires-Dist: tensorboard
-Requires-Dist: motmetrics
-Requires-Dist: filterpy
-Requires-Dist: h5py
 Requires-Dist: cython-bbox
-Requires-Dist: sortedcontainers
+Requires-Dist: cython
+Requires-Dist: filterpy
 Provides-Extra: dev
 Requires-Dist: pytest; extra == "dev"
 Requires-Dist: httpx; extra == "dev"
 Requires-Dist: ruff; extra == "dev"
+Provides-Extra: build
+Requires-Dist: pyinstaller==6.22.2; extra == "build"
+Provides-Extra: windows-cu126
+Requires-Dist: torch==2.14.0+cu126; extra == "windows-cu126"
+Requires-Dist: torchvision==0.29.0+cu126; extra == "windows-cu126"
 Dynamic: license-file

@@ -816,7 +816,18 @@ def test_orphaned_windows_are_closed_at_startup(monkeypatch, tmp_path: Path) -> 
     # Scoped to this worker's own workspace root, so it can never reach the
     # volunteer's browser or a second worker's windows on the same machine.
     query = next(" ".join(call) for call in calls if "Win32_Process" in " ".join(call))
-    assert str((tmp_path / "jobs").resolve()).replace("\\", "\\\\") in query
+    assert str((tmp_path / "jobs").resolve()) in query
+
+    # **Filtered in PowerShell, never in WQL.** `Win32_Process` does not support
+    # `LIKE`: the provider accepts the query and returns nothing, so the WQL form
+    # matched no process ever and read as "nothing to clean up". Measured on
+    # 2026-09-19 against a Chromium holding a known profile -- WQL returned 0,
+    # `Where-Object -like` returned 12, with single and doubled backslashes alike.
+    #
+    # This assertion used to require the doubled-backslash WQL form, which is to
+    # say it required the defect.
+    assert "-like" in query
+    assert "CommandLine LIKE" not in query
 
     # A machine with nothing left over is left alone.
     calls.clear()

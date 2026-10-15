@@ -18,6 +18,13 @@ dependencies = [
     "ultralytics==8.4.145",
     "opencv-python",
     "psutil",
+    # The system-tray icon and its menu (#57). A volunteer had no way to tell
+    # the worker was running or to get their machine back; pystray supplies the
+    # platform notify-icon and Pillow draws the bitmap for it. Both are pure
+    # Python with no compiler, and the tray is optional at runtime -- the
+    # launcher swallows an import error so a headless machine still works.
+    "pystray",
+    "pillow",
     "nvidia-ml-py",
     "loguru",
     "scipy",

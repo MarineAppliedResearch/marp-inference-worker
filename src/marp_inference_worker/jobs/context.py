@@ -34,6 +34,12 @@ from typing import Any, Mapping
 _STOP_CACHE_SECONDS = 0.25
 
 
+# How long the paused job sleeps between looks at the pause file.
+# Short enough that resuming feels immediate, long enough that a worker paused
+# over lunch is not stat-ing a file thousands of times a minute.
+_PAUSE_POLL_SECONDS = 0.25
+
+
 # How many bytes are read at a time when hashing an artifact.
 # Results files can be large, so hashing streams rather than loading the file.
 _HASH_CHUNK_BYTES = 1024 * 1024
@@ -76,6 +82,7 @@ class ChildJobContext:
         stop_file: Path,
         resume_from: Path | None = None,
         stream: Any = None,
+        pause_file: Path | None = None,
     ) -> None:
 
         # The engine's own settings, straight from the job spec.
@@ -86,6 +93,11 @@ class ChildJobContext:
 
         # The parent creates this file to ask the job to stop.
         self._stop_file = stop_file
+
+        # The parent creates this one to suspend the job without ending it, and
+        # removes it to let the job carry on. Defaults beside the stop file so a
+        # test building a context by hand does not have to know about it.
+        self._pause_file = pause_file or stop_file.with_name("PAUSE")
 
         # Milestone 1 always passes None; training is what will use it.
         self._resume_from = resume_from
@@ -293,3 +305,53 @@ class ChildJobContext:
         # The parent creates the file; its existence is the whole signal.
         self._stop_cached = self._stop_file.exists()
         return self._stop_cached
+
+
+    # wait_while_paused()
+    # Blocks here for as long as the volunteer has the worker paused.
+    # Inputs: none.
+    # Output: True if the job was paused at all, False if it never waited.
+    # Call this from the engine's existing progress checkpoint, which is already
+    # the one place the frame loop yields. The model stays loaded while it
+    # waits, so resuming costs nothing and no frame is processed twice (R5, R6).
+    #
+    # It keeps watching the stop file, because a paused job must stay
+    # cancellable -- that is what lets a pause held too long be turned into a
+    # proper stop rather than a hang (R7).
+    #
+    # `while_waiting` is called on each poll. The engine uses it to keep the
+    # watch window fed: that window closes itself when nothing arrives, so a
+    # pause with no keepalive leaves the volunteer's machine working with no
+    # window, which is the thing the tray exists to prevent. The context knows
+    # nothing about windows -- it just calls back.
+    def wait_while_paused(self, while_waiting=None) -> bool:
+
+        # The common case is not paused, and it must cost one stat and nothing
+        # else: this runs on the same cadence as the progress report.
+        if not self._pause_file.exists():
+            return False
+
+        self.log("paused by the operator; the model stays loaded", level="info")
+        waited = False
+
+        while self._pause_file.exists():
+            waited = True
+
+            # A stop beats a pause. Returning lets the engine's own
+            # should_stop() check unwind it in the usual way.
+            if self.should_stop():
+                break
+
+            if while_waiting is not None:
+                try:
+                    while_waiting()
+                except Exception:
+                    # A keepalive that fails must not strand a paused job. The
+                    # window is a nicety; staying cancellable is not.
+                    pass
+
+            time.sleep(_PAUSE_POLL_SECONDS)
+
+        if waited and not self._stop_cached:
+            self.log("resumed by the operator", level="info")
+        return waited

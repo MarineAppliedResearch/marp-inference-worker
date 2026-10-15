@@ -43,8 +43,16 @@ class PauseRequest(BaseModel):
     reason: str | None = None
 
 
+# ControlRequest
+# What the machine's own operator wants the worker to do, as a durable choice.
+#
+# The four are not interchangeable and the tray relies on the difference:
+#   pause   suspend the running job where it stands, keep the model loaded
+#   finish  let the running job complete, then take nothing more
+#   stop    yield the running job now, which unloads it and frees the VRAM
+#   resume  go back to taking work
 class ControlRequest(BaseModel):
-    action: Literal["finish", "stop", "resume"]
+    action: Literal["pause", "finish", "stop", "resume"]
 
 
 class ScreenRequest(BaseModel):

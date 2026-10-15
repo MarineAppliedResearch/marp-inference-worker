@@ -114,6 +114,15 @@ class JobContext(Protocol):
     # Output: True when the engine should unwind and return.
     def should_stop(self) -> bool: ...
 
+    # wait_while_paused()
+    # Blocks for as long as the machine's operator has the worker paused.
+    # Engines call it beside should_stop(), on the same cadence: it is the one
+    # place a frame loop already yields, and blocking there keeps the model
+    # loaded so resuming costs nothing (#57).
+    # Inputs: none.
+    # Output: True if it waited at all, False if the worker was running.
+    def wait_while_paused(self, while_waiting=None) -> bool: ...
+
 
 # BaseEngine
 # The shared interface for every engine the worker can dispatch a job to.

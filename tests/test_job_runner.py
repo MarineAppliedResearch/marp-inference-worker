@@ -119,7 +119,14 @@ class FakeCoordinator:
 
     # heartbeat()
     # Records the heartbeat and returns the scripted action.
-    def heartbeat(self, attempt_id, worker_id, lease_epoch, progress, state="running") -> dict[str, Any]:
+    #
+    # `telemetry` is recorded as well as accepted. A fake that merely swallowed
+    # the argument would let the runner stop sending the GPU reading without a
+    # single test noticing, and that reading is the whole reason the field
+    # exists -- it is the only observation of a machine taken while it works.
+    def heartbeat(
+        self, attempt_id, worker_id, lease_epoch, progress, state="running", telemetry=None
+    ) -> dict[str, Any]:
 
         self.heartbeats.append(
             {
@@ -128,6 +135,7 @@ class FakeCoordinator:
                 "lease_epoch": lease_epoch,
                 "progress": progress,
                 "state": state,
+                "telemetry": telemetry,
             }
         )
 

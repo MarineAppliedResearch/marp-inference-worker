@@ -347,7 +347,8 @@ class CoordinatorClient:
 
     # heartbeat()
     # Holds a lease and collects the coordinator's instruction for that job.
-    # Inputs: attempt envelope fields and the current progress snapshot.
+    # Inputs: attempt envelope fields, the current progress snapshot, and
+    # optionally the machine's GPU readings.
     # Output: response mapping carrying `action`.
     # Use this on a fixed interval while a job runs. This is the only place
     # cancel, pause and abandon can reach the worker (R5).
@@ -358,6 +359,7 @@ class CoordinatorClient:
         lease_epoch: int,
         progress: dict[str, Any],
         state: str = "running",
+        telemetry: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
 
         # All three lease fields go on every state-changing call (A1).
@@ -373,6 +375,12 @@ class CoordinatorClient:
             "state": state,
             "progress": progress,
         }
+
+        # Omitted rather than sent as null when this machine has no GPU, so an
+        # older coordinator sees exactly the body it saw before and a newer one
+        # can tell "did not report" from "reported nothing".
+        if telemetry is not None:
+            body["telemetry"] = telemetry
 
         # A 204 here means the coordinator has nothing to add, so continue.
         result = self._post(f"/attempts/{attempt_id}/heartbeat", body)

@@ -972,3 +972,63 @@ def test_a_lease_without_a_job_start_is_a_job_that_starts_where_it_says() -> Non
     })
 
     assert envelope.spec.range.job_start_frame is None
+
+# A heartbeat carries the machine's GPU readings, when it has any.
+#
+# MARP already receives a full hardware snapshot on every poll and stores it
+# against the attempt that poll opens -- but that is the instant *before* the
+# machine starts work, so averaged over a day of real jobs it reads half a
+# percent utilization. A reading only says anything about a working GPU if it is
+# taken while the work runs, and the heartbeat is the only thing that happens
+# then. This is the field that makes the dashboard's utilization chart possible.
+def test_heartbeat_carries_gpu_telemetry_when_there_is_any(coordinator) -> None:
+
+    client, recorder = coordinator
+
+    reading = {
+        "devices": [
+            {
+                "device_index": 0,
+                "name": "NVIDIA GeForce RTX 4080 SUPER",
+                "gpu_utilization_percent": 96,
+                "memory_used_bytes": 14763950080,
+                "memory_total_bytes": 17171480576,
+                "temperature_c": 71,
+                "power_usage_watts": 312.4,
+                "power_limit_watts": 320,
+            }
+        ]
+    }
+
+    client.heartbeat(
+        attempt_id="228",
+        worker_id="65",
+        lease_epoch=1,
+        progress={"done": 120},
+        telemetry=reading,
+    )
+
+    body = recorder.for_path("/heartbeat")[-1]["body"]
+
+    assert body["telemetry"] == reading
+
+    # The lease fields still travel with it. A telemetry field that displaced
+    # any of them would be a heartbeat the coordinator refuses.
+    assert body["attempt_id"] == "228"
+    assert body["lease_epoch"] == 1
+    assert body["progress"] == {"done": 120}
+
+
+# A machine with no GPU omits the field rather than sending null.
+#
+# Omitted, so an older coordinator receives exactly the body it received before
+# this change, and a newer one can tell "did not report" from "reported nothing".
+def test_heartbeat_omits_telemetry_when_the_machine_has_no_gpu(coordinator) -> None:
+
+    client, recorder = coordinator
+
+    client.heartbeat(attempt_id="228", worker_id="65", lease_epoch=1, progress={"done": 5})
+
+    body = recorder.for_path("/heartbeat")[-1]["body"]
+
+    assert "telemetry" not in body

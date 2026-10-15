@@ -973,6 +973,7 @@ def test_a_lease_without_a_job_start_is_a_job_that_starts_where_it_says() -> Non
 
     assert envelope.spec.range.job_start_frame is None
 
+
 # A heartbeat carries the machine's GPU readings, when it has any.
 #
 # MARP already receives a full hardware snapshot on every poll and stores it

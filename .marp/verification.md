@@ -87,6 +87,38 @@ talks to. That is the lesson from this task, and
 `test_every_action_the_tray_sends_is_accepted_by_the_endpoint` is the shape of
 the answer: read the other side's own declaration, never a copy of it.
 
+## The five-minute release, run twice, 2026-10-15
+
+Isaac paused a real job at 10:49 and left the worker alone. It fired on time
+and freed the card -- **and failed the requirement**:
+
+```
+10:54:12  "paused for 303s; releasing 12753 back to the coordinator"  vram 1563 -> 640 MiB
+```
+
+| | first run | after the fix |
+| --- | --- | --- |
+| job state | `cancelled` -- dead, nobody picks it up | `queued` |
+| `yields_made` | 0 | 1 |
+| `resume_from_frame` | `None` -- twelve thousand frames lost | 1560 |
+| attempt | `cancelled` | `yielded` |
+
+The escalation called `request_stop()` where the volunteer's own *Give me my
+GPU now* calls `request_yield()`. One flag apart, and that flag decides whether
+the coordinator gets the attempt back with its resume point or the job dies
+with the work in it. The comment justifying it said `request_stop()` was *"the
+same path a coordinator cancel takes"* -- which is exactly why it was wrong.
+
+**The test passed throughout**, because it asserted the job was stopped. It
+was; it was simply the wrong kind of stop. The stand-in job now tells a yield
+from a bare stop, and `npx`-style clock-moving still cannot see this: the
+second run is what proves it, and it is the reason this requirement needed a
+real five minutes rather than a faster test.
+
+The invisibility of the lost range is tracked separately as
+`MarineAppliedResearch/MARP_API#257` -- the worker bug is fixed, but nothing in
+the coordinator would have said that range was still owed.
+
 ## What is NOT covered, and why
 
 - **The tray icon itself.** No test drives a real notify-icon: that needs a
@@ -98,9 +130,7 @@ the answer: read the other side's own declaration, never a copy of it.
   by construction cannot be observed from inside the process that swallowed it.
   Verified by reading, not by test. A Linux machine with no status area is the
   real check.
-- **The five minutes.** Still the weakest of the five. The release is tested
-  with the clock moved on, and the hardware run above never left a pause
-  standing long enough to fire it. Pausing and walking away is the only check.
+- *(settled -- see the five-minute run below)*
 - **A volunteer's first install**, as opposed to a reinstall over an existing
   one. Everything here ran on a machine that already had a worker.
 

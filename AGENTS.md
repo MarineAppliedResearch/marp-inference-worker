@@ -456,6 +456,32 @@ The human is the programmer; the agent is the assistant.
 <!-- marp:shared end -->
 
 
+## Two paths can be one directory — check before you delete
+
+An agent running inside the Claude desktop app sees `%LOCALAPPDATA%` **and** the
+app's `AppData\Local\Packages\Claude_*\LocalCache\Local\` as separate trees.
+They are not. They are the same directory under two names, and `stat` proves it:
+
+```
+stat -c "%d:%i" "$A" "$B"      # identical device:inode means one directory
+```
+
+On 2026-10-15 this cost a working installation. Two listings of the worker's
+install looked like two parallel copies totalling 17.58 GB; it was one copy of
+4.6 GB counted twice. Deleting "the duplicate" deleted the real one, took the
+managed Python's standard library with it, and the next install then failed with
+`ModuleNotFoundError: No module named 'encodings'` -- which reads as a broken
+installer and was not.
+
+It also produced three confident wrong diagnoses before that, because file
+timestamps and directory listings read through the junction do not line up with
+what a process on the other name is doing.
+
+**So: before deleting anything under `AppData\Local`, compare inodes.** And
+prefer having the human run an installer by hand over running it from here --
+an install launched from an agent is fighting a layer that a volunteer's
+double-click never touches, so its result says little about the real thing.
+
 ## This checkout is the one that runs — check the path
 
 **Every MARP repository lives under `Workspace/MARP/`.** This one is

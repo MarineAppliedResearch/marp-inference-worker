@@ -254,11 +254,17 @@ $UvArchive = Join-Path $DownloadRoot 'uv.zip'
 Get-VerifiedArchive $UvLock $UvArchive
 $UvRoot = Join-Path $DownloadRoot 'uv'
 if (Test-Path -LiteralPath $UvRoot) { Remove-Item -LiteralPath $UvRoot -Recurse -Force }
-# -Force as well as the removal above, because the removal was not enough on
-# its own and we could not establish why. A reinstall over an existing install
-# died here -- "the file uv\uv.exe already exists" -- leaving a complete new
-# version that was never switched to, while Inno had already reported the
-# install a success, so nothing downstream could tell. Measured 2026-10-14.
+# -Force as well as the removal above. A reinstall died here once -- "the file
+# uv\uv.exe already exists" -- leaving a complete new version that was never
+# switched to, because the bootstrap stops before it writes active.json.
+#
+# **That run was almost certainly not a real defect.** It was launched from an
+# agent whose %LOCALAPPDATA% is junctioned into an MSIX LocalCache, so the same
+# directory was reachable by two names and the removal and the extraction were
+# not necessarily looking at the same path. A volunteer double-clicking the
+# installer has no such layer. Kept anyway: an extraction that overwrites is
+# correct regardless, since the archive is verified against its lock above, so
+# whatever is already there is either identical or stale.
 #
 # An extraction that overwrites is correct whatever the cause: the archive is
 # verified against its lock above, so whatever is already there is either

@@ -56,7 +56,7 @@ from marp_inference_worker.models.model_spec import ArtifactSpec, ModelSpec
 
 # Hardware discovery, so capabilities are discovered and not configured.
 from marp_inference_worker.system import device as device_module
-from marp_inference_worker.system.resource_monitor import get_system_resources
+from marp_inference_worker.system.resource_monitor import get_gpu_telemetry, get_system_resources
 
 # The reduction registry, reported in capabilities.
 from marp_inference_worker.reduction import keyframes as keyframe_reduction
@@ -1016,11 +1016,16 @@ class JobRunner:
                     lease_epoch=job.lease_epoch,
                     events=events,
                 )
+                # The GPU reading goes with the regular beat, which is the only
+                # moment anything observes this machine while it is actually
+                # working. NVML is read here rather than in the job process, so
+                # a job that wedges still reports the hardware it is wedging.
                 response = self._client.heartbeat(
                     attempt_id=job.attempt_id,
                     worker_id=job.worker_id,
                     lease_epoch=job.lease_epoch,
                     progress=job.current_progress(),
+                    telemetry=get_gpu_telemetry(),
                 )
             except CoordinatorError as error:
                 # A failed heartbeat is not a reason to kill a running job: the

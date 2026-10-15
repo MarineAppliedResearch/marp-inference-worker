@@ -34,6 +34,31 @@ from typing import Callable
 import psutil
 
 
+# Collect just the per-GPU readings, for a heartbeat.
+# Inputs: none.
+# Outputs: {"devices": [...]} or None when this machine reports no GPU.
+# Use this rather than get_system_resources() on the heartbeat loop. A heartbeat
+# goes every ten seconds and wants the GPU numbers; it does not want the CPU,
+# disk, network and torch blocks travelling with them ten times a minute.
+#
+# Why it has to be the heartbeat: the full snapshot already reaches MARP on every
+# poll and is stored against the attempt that poll opens, which is the moment
+# *before* the machine starts work. Averaged over a day of real jobs that reads
+# half a percent utilization, so a chart drawn from it would show a GPU farm that
+# is permanently idle. The reading only means anything taken while work runs.
+def get_gpu_telemetry() -> dict[str, Any] | None:
+
+    nvidia = _get_nvidia_resources()
+    devices = nvidia.get("devices") or []
+
+    # None rather than an empty list, so the coordinator can tell "this machine
+    # has no GPU" from "this machine has one and it reported nothing".
+    if not devices:
+        return None
+
+    return {"devices": devices}
+
+
 # Build one coordinator-friendly resource snapshot for this worker.
 # Inputs: none.
 # Outputs: JSON-serializable dictionary of system resource metrics.

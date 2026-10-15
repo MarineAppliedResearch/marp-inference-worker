@@ -38,8 +38,12 @@ it properly, and is listed as a gap.
   because shading alone was too quiet when looked at.
 - **A container that reports no frame count.** Some streams do. The axis falls back to the
   job's own window, which is all the window can honestly draw.
-- **A container reporting fewer frames than the job's range.** Not trusted either, same
-  fallback: a video shorter than the work asked of it is a number to disbelieve.
+- **A container reporting fewer frames than the job's range.** Normal rather than
+  suspicious, and the first real job proved it: jobs here are queued as `0..60000` over
+  dives of about 27,000 frames and the run stops when the frames do. The axis takes
+  whichever is longer, so the video's length still places the job inside the dive. The
+  first version refused to trust the count in this case and fell back to the job's window
+  on the very first real run — the video axis would have been something almost nobody saw.
 - **A job start later than this attempt's start.** Impossible from a working coordinator;
   ignored rather than drawn inverted, because a page reading a field out of a job spec has
   no way to ask.
@@ -82,14 +86,62 @@ fresh job, container reports no frame count, job 12,000..30,000
   legend: 12,000 | frame 12,496 - 3% of this job - 12s elapsed - ~7m left | 30,000
 ```
 
+## The real run
+
+2026-10-15, on the 4080 SUPER, against the development coordinator on a branch carrying
+the `job_start_frame` half. Worker run from this checkout, one slot, screen `window`.
+Dive `20260611_161158_Fwd.mp4`, which the container reports as 27,721 frames.
+
+| | |
+| --- | --- |
+| job 19338, frames 20,000-28,000 | ran at 78.8 f/s; the range runs past the end of the video and the attempt finished at 27,781 |
+| job 19343, frames 10,000-20,000 | paused at 16:01:50 with 8,820 done, released at 16:06:50, resumed, finished |
+
+What the window showed, read off the captures:
+
+```
+running   frame 17,360 - 74% of this job - 2m elapsed - ~59s left     axis 0..27,721
+paused    the window stayed open and kept drawing (#57 R5), the bar held still
+resumed   frame 19,616 - 96% of this job - resumed at 18,820 - 10s elapsed - ~14s left
+```
+
+The tray tooltip, against the live `/status` rather than a fixture:
+
+```
+'MARP worker - running 1 job, 78% through.'
+```
+
+And the coordinator's own record of the two attempts, which is what the dim band is drawn
+from:
+
+```
+attempt 17129  yielded    completed_through_frame 18,820
+attempt 17130  succeeded  completed_through_frame 20,000
+job 19343      succeeded  resume_from_frame 18,820
+```
+
+**Two defects, both found here and neither visible to any test:**
+
+- **The video axis would almost never have appeared.** The first rule was to trust the
+  container's count only when it was at least as long as the job's range. Jobs here are
+  queued as `0..60000` over a 27,721-frame dive, so the count failed that test on the very
+  first real job and the bar fell back to the job's own window. It takes whichever is
+  longer now.
+- **A paused job went on counting down.** `~26s left`, with the volunteer's pause on and
+  nothing moving. The rolling rate falls to zero but the attempt average behind it does
+  not, so the fallback kept projecting. The page reads `/status`'s own `paused` flag now
+  and says `paused` instead. A timeline that counts down through a pause contradicts the
+  feature the pause belongs to.
+
 ## Known gaps
 
-- **No GPU and no real video.** The render above used synthetic frames, so what is
-  unproven is the same list as always: that the numbers are right while a real engine is
-  producing them, and that the window's frame rate is unchanged (R5).
-- **The estimate is not calibrated.** It is the observed rate times the frames left, and
-  it will swing while a model loads or a job is paused. Nobody has watched one run to the
-  end against the clock.
+- **R5 is still unmeasured.** The real run above went at 78.8 f/s with a window open,
+  which is in the band this machine has always produced, but nothing was run headless
+  beside it on the same range to compare. That is the measurement R5 wants and it has not
+  been made.
+- **The estimate is not calibrated.** It read `~59s left` with 2,640 frames to go at
+  about 70 f/s, which is right, but nobody has watched one run to the end against a clock.
+  It will still swing while a model loads.
 - **Four slots at once has not been looked at.** Each window draws its own job (A4), which
   is what the tiling already does, but four windows with four timelines is a layout nobody
   has seen yet.

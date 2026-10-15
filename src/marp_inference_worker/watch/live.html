@@ -341,6 +341,7 @@
   let attemptElapsed = null;
   let attemptProgress = null;
   let windowedRate = null;
+  let workerPaused = false;
 
   // Seconds to something a person reads at a glance. Minutes above ninety
   // seconds, because an estimate that counts seconds down from an hour away is
@@ -385,13 +386,19 @@
 
     const { jobStart, attemptStart, windowEnd, videoFrames } = span;
 
-    // The axis is the whole video when the container reported a length that can
-    // contain the job. A stream that reports nothing, or a count smaller than
-    // the range we were asked to process, is not trusted -- the axis is then
-    // the job's own window, which is all this window can honestly draw.
-    const wholeVideo = typeof videoFrames === 'number' && videoFrames >= windowEnd;
+    // The axis is the whole video whenever the container will say how long it
+    // is, and the job's own window when it will not -- which is all this window
+    // can honestly draw for a stream that reports nothing.
+    //
+    // `max` rather than the count alone, because a job's range routinely runs
+    // past the end of its video: jobs here are queued as `0..60000` over dives
+    // of about 27,000 frames, and the run simply stops when the frames do. This
+    // first read `videoFrames >= windowEnd` and fell back to the window on the
+    // very first real job, which would have made the video axis something
+    // almost nobody ever saw. Found by running it, not by reading it.
+    const wholeVideo = typeof videoFrames === 'number' && videoFrames > 0;
     const axisFrom = wholeVideo ? 0 : jobStart;
-    const axisTo = wholeVideo ? videoFrames : windowEnd;
+    const axisTo = wholeVideo ? Math.max(videoFrames, windowEnd) : windowEnd;
     const width = axisTo - axisFrom;
 
     if (!(width > 0)) return;
@@ -441,11 +448,19 @@
 
     if (elapsed) parts.push(`${elapsed} elapsed`);
 
-    const left = humanDuration(remainingSeconds(now));
+    // A paused job is not twenty-six seconds from finishing, and saying so
+    // while the volunteer has deliberately stopped it contradicts the pause
+    // they just chose. The rolling rate does fall to zero, but the attempt
+    // average behind it does not, so this has to be said rather than inferred:
+    // seen on a real pause, 2026-10-15.
+    if (workerPaused) {
+      parts.push('paused');
+    } else {
+      const left = humanDuration(remainingSeconds(now));
 
-    // Omitted rather than guessed at. A paused job has no rate, and inventing
-    // one would put a number on screen that only moves away from the truth.
-    if (left) parts.push(`~${left} left`);
+      // Omitted rather than guessed at, when there is no rate to go on.
+      if (left) parts.push(`~${left} left`);
+    }
 
     setText('tlmid', parts.join(' · '));
   }
@@ -719,6 +734,9 @@
       if (response.ok) {
         const status = await response.json();
         const jobs = status.active_jobs || [];
+
+        // The volunteer's own pause, which the timeline has to respect.
+        workerPaused = status.paused === true;
 
         // Match on the attempt this window is drawing, not simply the first
         // job: with several slots there are several, and they are different

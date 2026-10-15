@@ -642,3 +642,30 @@ def test_a_dead_lock_does_not_stop_the_icon_coming_back(tmp_path: Path) -> None:
     for content in ("0", "", "not-a-pid", "999999999"):
         (tmp_path / "tray.pid").write_text(content, encoding="utf-8")
         assert launcher._tray_is_running(tmp_path) is False, content
+
+
+# test_the_tray_only_reads_fields_the_worker_actually_reports()
+# Verifies the tray's reading of /status against the real payload.
+# Inputs: none. Output: pytest pass/fail.
+#
+# The tray counted `status["jobs"]`; /status calls it `active_jobs`. So the
+# tooltip said "waiting for work" with a job on screen -- confidently wrong
+# about the one thing a volunteer reads it for. Isaac, 2026-10-15: "it says
+# marp, running - waiting for work, even though a video is running."
+#
+# The other tray tests hand-build a status dict, so they agree with whatever
+# the tray expects. This one builds the payload the worker really produces,
+# which is the only way a wrong key shows up.
+def test_the_tray_only_reads_fields_the_worker_actually_reports() -> None:
+
+    real = WorkerState().describe()
+
+    for field in ("operator_action", "paused", "screen_mode", "active_jobs"):
+        assert field in real, f"/status no longer reports {field}; the tray reads it"
+
+    # With a job reported, the tooltip must say so rather than claiming idle.
+    real["active_jobs"] = [{"attempt_id": "a"}]
+    text = tray_module.tooltip_for("background", real)
+
+    assert "waiting for work" not in text, text
+    assert "1 job" in text, text

@@ -102,7 +102,11 @@ def state_from_status(status: dict) -> str:
 # what their machine is doing without clicking anything.
 def tooltip_for(state: str, status: dict) -> str:
 
-    running = len(status.get("jobs") or [])
+    # `active_jobs` is what /status calls it. Reading `jobs` found nothing, so
+    # the tooltip said "waiting for work" while a job was on screen -- which is
+    # worse than no tooltip, because it is confidently wrong about the one
+    # thing a volunteer looks at it to learn.
+    running = len(status.get("active_jobs") or [])
 
     if state == "paused":
         if running:

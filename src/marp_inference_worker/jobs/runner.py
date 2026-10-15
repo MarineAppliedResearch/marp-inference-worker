@@ -1092,8 +1092,20 @@ class JobRunner:
             return
 
         # Held long enough that the attempt should go back rather than sit on a
-        # GPU nobody is using. request_stop() is the same path a coordinator
-        # cancel takes, so the job unwinds and reports its partial work.
+        # GPU nobody is using.
+        #
+        # request_yield(), not request_stop(). They differ by one flag and that
+        # flag is the whole meaning: a yield hands the attempt back with its
+        # resume point, so this worker or another carries on from there, while a
+        # bare stop is a cancel and the job dies with the work still in it.
+        #
+        # This read request_stop(), justified by a comment saying it was "the
+        # same path a coordinator cancel takes" -- which is exactly why it was
+        # wrong. A real five-minute pause left job 14372 `cancelled`, with
+        # `yields_made = 0`, `resume_from_frame = None` and twelve thousand
+        # frames thrown away. Measured 2026-10-15. The volunteer's own "Give me
+        # my GPU now" already yields; a pause they merely walked away from must
+        # not be treated more harshly than the button they pressed on purpose.
         if paused_for >= _PAUSE_RELEASE_S:
             for job in self._jobs_by_slot.values():
                 if not job.stop_requested:
@@ -1104,7 +1116,7 @@ class JobRunner:
                     # Released, not suspended: the job has to run to unwind and
                     # write what it has, which it cannot do while blocked.
                     job.release_pause()
-                    job.request_stop()
+                    job.request_yield()
             return
 
         for job in self._jobs_by_slot.values():

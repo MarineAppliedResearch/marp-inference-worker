@@ -313,6 +313,7 @@ class _FakeJob:
 
         self.attempt_id = attempt_id
         self.stop_requested = False
+        self.yield_requested = False
         self.calls: list[str] = []
 
     def request_pause(self) -> None:
@@ -324,6 +325,13 @@ class _FakeJob:
     def request_stop(self) -> None:
         self.calls.append("stop")
         self.stop_requested = True
+
+    # The real JobProcess sets a flag and then stops; the flag is what makes it
+    # a yield rather than a cancel, so the stand-in has to carry it too.
+    def request_yield(self) -> None:
+        self.calls.append("yield")
+        self.yield_requested = True
+        self.request_stop()
 
 
 # _runner_with()
@@ -385,7 +393,12 @@ def test_a_pause_held_too_long_hands_the_attempt_back(monkeypatch) -> None:
 
     _runner_with(state, {0: job})._apply_pause_to_running_jobs()
 
-    assert job.calls == ["release", "stop"]
+    # A yield, not a bare stop. The difference is the whole point: a yield
+    # hands the attempt back with its resume point, a stop cancels the job and
+    # the work in it goes with it. Asserting only that it stopped is what let a
+    # real five-minute pause throw away twelve thousand frames.
+    assert job.calls == ["release", "yield", "stop"]
+    assert job.yield_requested is True
     assert job.stop_requested is True
 
 

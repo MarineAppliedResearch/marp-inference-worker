@@ -16,6 +16,10 @@
 # json writes the results file, one observation per line.
 import json
 
+# time measures how long an attempt actually took, which the coordinator records
+# and the dashboard shows (#62).
+import time
+
 # Path types the results file and the model artifact.
 from pathlib import Path
 
@@ -337,6 +341,13 @@ class TrackingEngine(BaseEngine):
         start_frame = int(frame_range["start_frame"])
         end_frame = int(frame_range["end_frame"])
         expected_frames = end_frame - start_frame
+
+        # When this attempt began. Wall clock rather than CPU time: what is
+        # being answered is "how long did this machine take over it", which is
+        # what a volunteer's donation is measured in and what the dashboard
+        # shows. Monotonic so a clock adjustment mid-job cannot make it
+        # negative.
+        started_at = time.monotonic()
 
         # The slot the runner pinned this job to, and the device it resolves to.
         #
@@ -717,9 +728,23 @@ class TrackingEngine(BaseEngine):
                 "engine": self.engine_name,
                 "device": device,
                 "range": {"start_frame": start_frame, "end_frame": end_frame},
+
+                # What was actually covered, said plainly rather than left for
+                # the reader to derive. `start_frame + frames_processed` is the
+                # same number, but only while the frames are contiguous from
+                # the start of the range -- an assumption the summary should
+                # not force on whoever reads it (#62).
+                #
+                # Half-open, matching `range` and `completed_through_frame`:
+                # `end_frame` is one past the last frame finished.
+                "processed_range": {
+                    "start_frame": start_frame,
+                    "end_frame": start_frame + frames_processed,
+                },
                 "frames_expected": expected_frames,
                 "frames_processed": frames_processed,
                 "frames_short_of_range": expected_frames - frames_processed,
+                "elapsed_s": round(time.monotonic() - started_at, 3),
                 "detections_seen": detections_seen,
                 "observations": observations_written,
                 "tracks_discarded_too_short": accumulator.discarded_track_count,

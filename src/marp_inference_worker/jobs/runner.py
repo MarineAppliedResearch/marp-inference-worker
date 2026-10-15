@@ -1204,12 +1204,31 @@ class JobRunner:
                 "stderr": job.collect_stderr(),
             }
 
+        # How far this attempt actually got, reported on **every** outcome that
+        # did any work rather than only on a yield.
+        #
+        # It used to be computed inside the `yield_requested` branch below, so a
+        # succeeded attempt said nothing about what it covered -- and a job
+        # submitted 0-60,000 that finished at 22,320 because the video ran out
+        # looked, from the record, exactly like one that had done all 60,000.
+        # On the development database that left 3,042 succeeded attempts and
+        # 3,739 failed ones with no coverage recorded at all, against 7 yielded
+        # ones that had it (#62, MarineAppliedResearch/MARP_API#257).
+        summary = payload.get("summary") or {}
         completed_through_frame = None
+
+        processed_range = summary.get("processed_range") or {}
+        if processed_range.get("end_frame") is not None:
+            completed_through_frame = int(processed_range["end_frame"])
+        elif summary.get("frames_processed") is not None:
+            # An engine that reports a count but not an interval. Derivable only
+            # while the frames are contiguous from the start of the range, which
+            # is why the engine now states the interval instead.
+            start_frame = int((job.spec.get("range") or {}).get("start_frame", 0))
+            completed_through_frame = start_frame + int(summary["frames_processed"])
+
         if job.yield_requested:
             outcome = "yielded"
-            summary = payload.get("summary") or {}
-            start_frame = int((job.spec.get("range") or {}).get("start_frame", 0))
-            completed_through_frame = start_frame + int(summary.get("frames_processed", 0))
 
         # Offer the results file by hash before reporting the outcome. The
         # coordinator answers `already_have` or names somewhere to put it, so

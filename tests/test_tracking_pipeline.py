@@ -1366,3 +1366,155 @@ def test_infer_stream_applies_the_options_it_is_given() -> None:
     # Confidence keeps its own argument; the option map must not shadow it.
     assert seen["conf"] == 0.001
     assert seen["verbose"] is False
+
+
+# _drive_engine()
+# Runs the real TrackingEngine over a given number of decodable frames.
+# Inputs: tmp_path, monkeypatch, the range asked for, and how many frames the
+# video actually yields. Output: the engine's terminal summary.
+#
+# Everything heavy is stubbed -- no GPU, no model, no video -- because what is
+# under test is the bookkeeping the engine reports, not inference.
+def _drive_engine(tmp_path, monkeypatch, start: int, end: int, frames_available: int) -> dict:
+
+    from types import SimpleNamespace
+
+    from marp_inference_worker.engines import tracking_engine
+    from marp_inference_worker.media.frame_range_reader import DecodedFrame, VideoGeometry
+
+    class Context:
+        def __init__(self):
+            self.params = {"model_path": str(tmp_path / "model.pt"), "device": "cpu"}
+            self.checkpoint_dir = tmp_path
+
+        def log(self, _message, level="info"):
+            return None
+
+        def report_progress(self, *_args, **_kwargs):
+            return None
+
+        def report_metrics(self, **_fields):
+            return None
+
+        def report_settings(self, _engine, _settings, _ignored):
+            return None
+
+        def should_stop(self):
+            return False
+
+        def wait_while_paused(self, while_waiting=None):
+            return False
+
+        def publish_artifact(self, _path, _kind):
+            return "0" * 64
+
+    class Detector:
+        def load_weights(self, _path, _device):
+            return SimpleNamespace(names={})
+
+        def infer_stream(self, _model, frames, _confidence, _predict_options=None):
+            for frame in frames:
+                yield SimpleNamespace(frame=frame, detections=[])
+
+        def unload_all(self):
+            return None
+
+    class Capture:
+        def release(self):
+            return None
+
+    class Accumulator:
+        active_track_count = 0
+        discarded_track_count = 0
+
+        def __init__(self, track_buffer):
+            self.track_buffer = track_buffer
+
+        def take_aged_out(self, _frame_index):
+            return []
+
+        def finish_range(self):
+            return []
+
+    # The video runs out after `frames_available`, however much was asked for.
+    def frame_stream(_capture, _geometry, begin, _end, on_seek_complete=None):
+        if on_seek_complete:
+            on_seek_complete()
+        for offset in range(frames_available):
+            yield DecodedFrame(index=begin + offset, time_s=(begin + offset) / 30.0, image="image")
+
+    monkeypatch.setattr(tracking_engine, "resolve_device", lambda *_args: "cpu")
+    monkeypatch.setattr(
+        tracking_engine,
+        "open_video",
+        lambda _source: (Capture(), VideoGeometry(1920, 1080, 30.0, 100)),
+    )
+    monkeypatch.setattr(tracking_engine, "iter_frame_range", frame_stream)
+    monkeypatch.setattr(
+        tracking_engine,
+        "create_tracker",
+        lambda _params: (
+            SimpleNamespace(update=lambda *_args: []),
+            SimpleNamespace(as_dict={"track_buffer": 30}),
+        ),
+    )
+    monkeypatch.setattr(tracking_engine, "TrackAccumulator", Accumulator)
+
+    ctx = Context()
+    engine = tracking_engine.TrackingEngine()
+    engine._detector = Detector()
+    return engine.run(
+        ctx,
+        {
+            "range": {"start_frame": start, "end_frame": end},
+            "video": {"url": "fake://video", "source_name": "video.mp4"},
+            "params": ctx.params,
+            "reduction": {"name": "v3_dirpad", "version": "1"},
+        },
+    )
+
+
+# test_the_summary_says_which_frames_were_actually_processed()
+# Verifies R2a: the attempt reports what it covered, not what it was asked for.
+# Inputs: tmp_path, monkeypatch. Output: pytest pass/fail.
+#
+# This is the case the issue was opened on. Job 14371 was submitted 0-60,000
+# and succeeded at 22,320 because the video ran out, and nothing recorded that
+# it had covered a third of what was asked -- so coverage computed from
+# `spec.range` would call the video done.
+#
+# Half-open, matching `range` and the coordinator's `completed_through_frame`.
+def test_the_summary_says_which_frames_were_actually_processed(tmp_path, monkeypatch) -> None:
+
+    summary = _drive_engine(tmp_path, monkeypatch, start=10, end=1000, frames_available=7)
+
+    assert summary["range"] == {"start_frame": 10, "end_frame": 1000}
+    assert summary["processed_range"] == {"start_frame": 10, "end_frame": 17}
+    assert summary["frames_processed"] == 7
+    assert summary["frames_short_of_range"] == 983
+
+
+# test_a_full_range_reports_the_range_it_was_given()
+# Verifies the ordinary case still agrees with itself.
+# Inputs: tmp_path, monkeypatch. Output: pytest pass/fail.
+# When nothing stops early, what was processed and what was asked are the same
+# interval -- so a coverage view sees no spurious gap on a completed job.
+def test_a_full_range_reports_the_range_it_was_given(tmp_path, monkeypatch) -> None:
+
+    summary = _drive_engine(tmp_path, monkeypatch, start=100, end=105, frames_available=5)
+
+    assert summary["processed_range"] == summary["range"]
+    assert summary["frames_short_of_range"] == 0
+
+
+# test_the_summary_says_how_long_it_took()
+# Verifies R2a's second half: elapsed time rides along for the dashboard.
+# Inputs: tmp_path, monkeypatch. Output: pytest pass/fail.
+# Wall clock, monotonic, so a clock adjustment mid-job cannot make it negative.
+def test_the_summary_says_how_long_it_took(tmp_path, monkeypatch) -> None:
+
+    summary = _drive_engine(tmp_path, monkeypatch, start=0, end=3, frames_available=3)
+
+    assert "elapsed_s" in summary
+    assert isinstance(summary["elapsed_s"], float)
+    assert summary["elapsed_s"] >= 0

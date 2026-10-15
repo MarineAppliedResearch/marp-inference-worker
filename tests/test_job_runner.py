@@ -1948,3 +1948,36 @@ def test_a_worker_starts_at_one_job_and_grows_into_the_machine(monkeypatch) -> N
     for expected in (2, 3, 4, 4):
         derived._last_slot_decision_at = 0.0
         assert derived._live_slot_count() == expected
+
+
+# test_a_succeeded_attempt_reports_what_it_covered()
+# Verifies coverage is reported on success, not only on a yield.
+# Inputs: tmp_path. Output: pytest pass/fail.
+#
+# `completed_through_frame` used to be computed inside the yield branch, so a
+# succeeded attempt said nothing about what it had covered. On the development
+# database that left 3,042 succeeded attempts and 3,739 failed ones with no
+# coverage recorded at all, against 7 yielded ones that had it -- and a job
+# submitted 0-60,000 that finished at 22,320 because the video ran out was
+# indistinguishable, in the record, from one that did all 60,000.
+#
+# The mock engine reports a frame count and no interval, so this also covers
+# the fallback for an engine that has not been taught to state one.
+#
+# Refs #62, MarineAppliedResearch/MARP_API#257.
+def test_a_succeeded_attempt_reports_what_it_covered(tmp_path: Path) -> None:
+
+    coordinator = FakeCoordinator(offers=[_job_for(tmp_path, "attempt-covered", frames=5)])
+    runner, _state = _runner(coordinator, tmp_path)
+    runner.ensure_enrolled()
+
+    assert runner._poll_once() is True
+    assert _wait_until(runner, lambda: len(coordinator.results) == 1), "job never reported"
+
+    result = coordinator.results[0]
+    assert result["outcome"] == "succeeded"
+
+    # Half-open and absolute: the mock job starts at frame 1000 and does 5.
+    # This is the number MARP resumes from, so an off-by-one here silently
+    # skips or repeats a frame on every hand-over.
+    assert result["completed_through_frame"] == 1005

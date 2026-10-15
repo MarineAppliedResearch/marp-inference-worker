@@ -59,15 +59,51 @@
     position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%);
     color: #9fb0c0; text-align: center;
   }
-  #progress {
-    position: absolute; left: 0; bottom: 0; height: 3px;
-    background: #2f81f7; width: 0;
+  /* The timeline, along the bottom. It answers "where in the video is this,
+     and how much is left", which the 3-pixel bar it replaces could not: that
+     bar drew a fraction of a range nobody could see the bounds of.
+     Its height is a variable because the footer and the watermark stack on
+     top of it, and three numbers that disagree is how a watermark ends up
+     sitting over a label. */
+  :root { --timeline-h: 36px; }
+  #timeline {
+    position: absolute; left: 0; right: 0; bottom: 0;
+    padding: 6px 10px 7px; background: #0b0f14ee;
+    font-size: 10px; line-height: 1.3; color: #8b9bab;
+    pointer-events: none; font-variant-numeric: tabular-nums;
   }
+  /* The whole video, when the container will say how long it is. */
+  #tltrack {
+    position: relative; height: 8px; border-radius: 4px; background: #16202b;
+  }
+  /* The slice of it this job owns. */
+  #tlwindow { position: absolute; top: 0; bottom: 0; background: #1f3350; border-radius: 4px; }
+  /* What an earlier attempt already covered, before this one was handed the
+     rest. Dimmer than this attempt's fill, because it is somebody else's
+     work and this window did not watch it happen. */
+  #tlearlier { position: absolute; top: 0; bottom: 0; background: #2f81f74d; }
+  /* Where this attempt picked the job up. Shading alone is too quiet a signal
+     for the thing the timeline exists to say -- that the frames behind the
+     playhead were somebody else's run and not frames this one skipped. */
+  #tlstart {
+    position: absolute; top: -3px; bottom: -3px; width: 1px;
+    margin-left: -1px; background: #8b9bab; display: none;
+  }
+  /* What this attempt has done. */
+  #tlfill { position: absolute; top: 0; bottom: 0; background: #2f81f7; }
+  /* The playhead. The same green as the track count above, which is the
+     colour this page already uses for "now". */
+  #tlhead {
+    position: absolute; top: -3px; bottom: -3px; width: 2px;
+    margin-left: -1px; background: #7ee787; border-radius: 1px;
+  }
+  #tllegend { display: flex; justify-content: space-between; gap: 12px; margin-top: 4px; }
+  #tllegend .mid { color: #c9d6e2; }
   /* The footer. Deliberately small: it is provenance for somebody glancing at
      a donated machine, not a dashboard. It sits above the progress bar rather
      than over the video, so it never hides an organism. */
   #footer {
-    position: absolute; left: 0; right: 0; bottom: 3px; padding: 4px 10px;
+    position: absolute; left: 0; right: 0; bottom: var(--timeline-h); padding: 4px 10px;
     display: flex; gap: 14px; align-items: baseline; flex-wrap: wrap;
     font-size: 10px; line-height: 1.3; color: #8b9bab;
     background: linear-gradient(#0b0f1400, #0b0f14e6);
@@ -80,7 +116,7 @@
      video through and large enough to recognise across a room. Never over the
      centre of frame, where the animals are. */
   #mark {
-    position: absolute; left: 12px; bottom: 26px;
+    position: absolute; left: 12px; bottom: calc(var(--timeline-h) + 23px);
     /* The mark is near square (599x525), not the wide wordmark -- a wordmark
        shrunk into a taskbar slot is an illegible smear, and the M reads at any
        size. Sized so it stays small in a quarter-screen tile. */
@@ -112,7 +148,20 @@
   <span><span class="k">video</span> <span class="v" id="video">–</span></span>
   <span><span class="k">model</span> <span class="v" id="fmodel">–</span></span>
 </div>
-<div id="progress"></div>
+<div id="timeline">
+  <div id="tltrack">
+    <div id="tlwindow"></div>
+    <div id="tlearlier"></div>
+    <div id="tlfill"></div>
+    <div id="tlstart"></div>
+    <div id="tlhead"></div>
+  </div>
+  <div id="tllegend">
+    <span id="tlfrom">–</span>
+    <span class="mid" id="tlmid">–</span>
+    <span id="tlto">–</span>
+  </div>
+</div>
 
 <script>
   const view = document.getElementById('view');
@@ -261,12 +310,159 @@
     onScreen = (packet.tracks || []).length;
     renderDetections();
 
+    // The timeline's fixed points ride on every frame rather than being
+    // fetched once. The window can be opened, reloaded or re-tiled at any
+    // moment in a job, and the packet is the only thing it is guaranteed to
+    // get; a one-off handshake would leave a reloaded window with no axis.
     const { range_start: from, range_end: to } = packet;
+
     if (typeof from === 'number' && typeof to === 'number' && to > from) {
-      const done = (packet.frame_number - from) / (to - from);
-      document.getElementById('progress').style.width =
-        `${Math.max(0, Math.min(1, done)) * 100}%`;
+      span = {
+        attemptStart: from,
+        windowEnd: to,
+        // Absent on a fresh job, and absent from a coordinator too old to
+        // send it: then the job began where this attempt did, which is true.
+        jobStart: typeof packet.job_start_frame === 'number'
+          ? Math.min(packet.job_start_frame, from) : from,
+        videoFrames: typeof packet.video_frames === 'number' ? packet.video_frames : null,
+      };
     }
+
+    playhead = packet.frame_number;
+    drawTimeline();
+  }
+
+
+  // What the timeline is drawing. The axis comes from the frame packet and the
+  // clock from `/status`, which arrive on different schedules, so both are kept
+  // here and either one can trigger a redraw.
+  let span = null;
+  let playhead = null;
+  let attemptElapsed = null;
+  let attemptProgress = null;
+  let windowedRate = null;
+  let workerPaused = false;
+
+  // Seconds to something a person reads at a glance. Minutes above ninety
+  // seconds, because an estimate that counts seconds down from an hour away is
+  // precision the estimate does not have.
+  function humanDuration(seconds) {
+    if (typeof seconds !== 'number' || !isFinite(seconds) || seconds < 0) return null;
+    if (seconds < 90) return `${Math.round(seconds)}s`;
+
+    const minutes = Math.round(seconds / 60);
+
+    if (minutes < 60) return `${minutes}m`;
+    return `${Math.floor(minutes / 60)}h ${String(minutes % 60).padStart(2, '0')}m`;
+  }
+
+  // How long the rest of this job's window should take, in seconds.
+  //
+  // From the rolling rate in preference to the attempt's average, which is a
+  // correction to what this was first specified as. `progress.elapsed_s` counts
+  // from the moment the job process started, so the model load, the seek to the
+  // range, and every second the volunteer held the job paused are all inside
+  // it -- dividing by it understates the rate and inflates every estimate, most
+  // on exactly the paused job somebody is looking at the window to understand.
+  function remainingSeconds(now) {
+    let rate = windowedRate !== null && windowedRate > 0 ? windowedRate : null;
+
+    if (rate === null && attemptProgress) {
+      const done = Number(attemptProgress.done) || 0;
+      const elapsed = Number(attemptProgress.elapsed_s) || 0;
+
+      // Only once there is enough of both to divide by.
+      if (done > 0 && elapsed > 5) rate = done / elapsed;
+    }
+
+    if (!rate || !span) return null;
+    return Math.max(0, span.windowEnd - now) / rate;
+  }
+
+  // Draw the bar: the video, the job's window inside it, what an earlier
+  // attempt covered, what this one has covered, and where the playhead is.
+  function drawTimeline() {
+    if (!span) return;
+
+    const { jobStart, attemptStart, windowEnd, videoFrames } = span;
+
+    // The axis is the whole video whenever the container will say how long it
+    // is, and the job's own window when it will not -- which is all this window
+    // can honestly draw for a stream that reports nothing.
+    //
+    // `max` rather than the count alone, because a job's range routinely runs
+    // past the end of its video: jobs here are queued as `0..60000` over dives
+    // of about 27,000 frames, and the run simply stops when the frames do. This
+    // first read `videoFrames >= windowEnd` and fell back to the window on the
+    // very first real job, which would have made the video axis something
+    // almost nobody ever saw. Found by running it, not by reading it.
+    const wholeVideo = typeof videoFrames === 'number' && videoFrames > 0;
+    const axisFrom = wholeVideo ? 0 : jobStart;
+    const axisTo = wholeVideo ? Math.max(videoFrames, windowEnd) : windowEnd;
+    const width = axisTo - axisFrom;
+
+    if (!(width > 0)) return;
+
+    const at = (frame) =>
+      `${(Math.max(0, Math.min(1, (frame - axisFrom) / width)) * 100).toFixed(3)}%`;
+    const place = (id, fromFrame, toFrame) => {
+      const element = document.getElementById(id);
+      element.style.left = at(fromFrame);
+      element.style.width = `calc(${at(toFrame)} - ${at(fromFrame)})`;
+    };
+
+    // Never behind where this attempt began: a frame number from the previous
+    // job, arriving one packet late, would otherwise drag the playhead back.
+    const now = playhead === null ? attemptStart : Math.max(attemptStart, playhead);
+
+    place('tlwindow', jobStart, windowEnd);
+    place('tlearlier', jobStart, attemptStart);
+    place('tlfill', attemptStart, now);
+    document.getElementById('tlhead').style.left = at(now);
+
+    // The tick only means something when there is earlier work to divide from
+    // this attempt's; on a fresh job it would sit on the playhead's own start
+    // and read as a second playhead.
+    const resumed = attemptStart > jobStart;
+    const startTick = document.getElementById('tlstart');
+
+    startTick.style.display = resumed ? 'block' : 'none';
+    startTick.style.left = at(attemptStart);
+
+    setText('tlfrom', grouped(axisFrom));
+    setText('tlto', grouped(axisTo));
+
+    // Through the job, not through this attempt. Somebody who picks up a job
+    // that is already half done should see it half done.
+    const throughJob = (now - jobStart) / Math.max(1, windowEnd - jobStart);
+    const parts = [
+      `frame ${grouped(now)}`,
+      `${Math.round(Math.max(0, Math.min(1, throughJob)) * 100)}% of this job`,
+    ];
+
+    // Said in words as well as drawn, because the one reading somebody must
+    // not come away with is that the job skipped these frames.
+    if (resumed) parts.push(`resumed at ${grouped(attemptStart)}`);
+
+    const elapsed = humanDuration(attemptElapsed);
+
+    if (elapsed) parts.push(`${elapsed} elapsed`);
+
+    // A paused job is not twenty-six seconds from finishing, and saying so
+    // while the volunteer has deliberately stopped it contradicts the pause
+    // they just chose. The rolling rate does fall to zero, but the attempt
+    // average behind it does not, so this has to be said rather than inferred:
+    // seen on a real pause, 2026-10-15.
+    if (workerPaused) {
+      parts.push('paused');
+    } else {
+      const left = humanDuration(remainingSeconds(now));
+
+      // Omitted rather than guessed at, when there is no rate to go on.
+      if (left) parts.push(`~${left} left`);
+    }
+
+    setText('tlmid', parts.join(' · '));
   }
 
   async function show(packet) {
@@ -539,6 +735,9 @@
         const status = await response.json();
         const jobs = status.active_jobs || [];
 
+        // The volunteer's own pause, which the timeline has to respect.
+        workerPaused = status.paused === true;
+
         // Match on the attempt this window is drawing, not simply the first
         // job: with several slots there are several, and they are different
         // videos in different sessions.
@@ -552,6 +751,9 @@
         }
 
         const rates = frameRates(jobs);
+
+        // The same measurement the readout shows, kept for the estimate.
+        windowedRate = rates.mine;
         setText('fps', rates.mine === null ? null : rates.mine.toFixed(1));
         setText('fpsall', rates.all === null ? null : rates.all.toFixed(1));
 
@@ -563,6 +765,13 @@
           setText('stype', context.type);
           setText('video', mine.video_source);
           setText('fmodel', mine.model_name);
+
+          // The clock half of the timeline. It is redrawn from here as well as
+          // from each frame, so elapsed keeps counting on a job whose frames
+          // arrive slowly -- or, while paused, do not arrive at all.
+          attemptProgress = mine.progress || null;
+          attemptElapsed = Number((mine.progress || {}).elapsed_s);
+          drawTimeline();
         }
       }
     } catch { /* decoration only */ }

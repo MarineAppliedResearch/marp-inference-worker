@@ -1,5 +1,5 @@
 ---
-task: MarineAppliedResearch/marp-inference-worker#57
+task: MarineAppliedResearch/marp-inference-worker#60
 repos: [marp-inference-worker]
 status: design
 needs: []
@@ -7,128 +7,120 @@ needs: []
 
 ## Goal
 
-A volunteer who installs the worker can see it is running, and can tell it to get off
-their machine without uninstalling it. Today the worker enrols and starts taking jobs with
-nothing on screen to say so, and the only controls are a command line. After this, there
-is a tray icon whose picture says what the worker is doing, and a menu with three states
-the volunteer chooses between: **Pause**, **Background**, **Foreground**.
+Somebody watching a donated machine work can see where in the video this job is, how long
+it has been going, and roughly how much longer it has left. Today the window shows the
+frame being worked on and a 3-pixel bar at the very bottom, which says "some fraction of
+something" and nothing more -- not which part of the video this job owns, not where the
+run started, not whether it is ten minutes or three hours from finishing.
 
 ## Requirements
 
-- **R1** — A tray icon appears whenever the worker is running, and disappears when it
-  stops. Hovering it says the worker's state in words.
-- **R2** — The tray menu offers three states, one of which is always shown as the current
-  one — Pause, Background, Foreground — plus the immediate release in R10, which is an
-  action rather than a state.
-- **R3** — **Background** is the normal state. The worker takes jobs and never puts a
-  window in front of anybody. This is what a fresh install starts in.
-- **R4** — **Foreground** shows the live view of the work in progress, the way
-  `--screen window` already does, and switching to it while a job is running retargets
-  that job rather than waiting for the next one.
-- **R5** — **Pause** suspends the job in flight within one progress interval, so the GPU
-  stops computing and the volunteer can use their machine. It also stops new work
-  arriving, which `free_slots()` already does. The model stays loaded, which is what makes
-  R6 free.
-- **R6** — Leaving Pause resumes the suspended job where it stopped. The job is not
-  restarted and no frames are reprocessed.
-- **R7** — A paused job still paused after **five minutes** is stopped properly and
-  handed back to the coordinator, so the VRAM and the attempt are both released rather
-  than held indefinitely. Five minutes is a named constant, not a literal in a loop.
-- **R10** — The volunteer does not have to wait those five minutes. A second menu item —
-  **Give me my GPU now** — does the same release immediately: the job stops, the model is
-  unloaded, the VRAM is freed and the attempt goes back to the coordinator. This is the
-  one to press before starting a game; plain Pause is the one to press before a video
-  call.
-- **R8** — The volunteer's choice is durable. A worker restarted while paused comes back
-  paused, not running.
-- **R9** — A machine with no tray (headless, a service account, Linux without a status
-  area) runs exactly as it does today. Absence of a tray is never a startup failure.
+- **R1** -- The watch window carries a timeline showing the frame range this job is
+  working and the playhead inside it. Frame numbers are stated, not only drawn.
+- **R2** -- A resumed attempt reads as a resumed attempt rather than as a job that skipped
+  its first frames: what an earlier attempt already covered is visibly distinct from what
+  this one is doing.
+- **R3** -- Elapsed time for this attempt, and an estimate of time remaining, both in the
+  window. The estimate is from frames actually finished, not from wall clock alone.
+- **R4** -- The timeline is still correct when the job's window is a slice of a longer
+  video, and degrades to the window alone when the container will not report a length.
+- **R5** -- Nothing on the timeline sets the pace of inference. It is drawn from data the
+  window already receives and already polls; no new per-frame work on the engine's thread.
+- **R6** -- (tooltip; see A3) The tray tooltip says how far through the running job is, so
+  Background mode is not blind.
 
 ## Open assumptions
 
-- [x] **A1 · architectural · blocking** — answered 2026-10-14: **yes, `pystray`**, rather
-      than hand-rolling `Shell_NotifyIconW` through `ctypes`. Pure Python, no compiler,
-      about thirty lines against a few hundred for a native notify-icon and its message
-      pump, and it works on Linux too. It brings `Pillow` with it, which is what builds
-      the icon bitmap.
-- [x] **A2 · behavioural · blocking** — answered 2026-10-14: **five minutes**, and the
-      volunteer gets a way to skip the wait. See R7 and R10.
-- [ ] **A3 · product/UI · non-blocking** — Does the icon itself change with state (three
-      pictures: working, paused, watching), or does only the tooltip and the menu's tick
-      change? Proposed: the icon changes, because the point of R1 is that a glance tells
-      you.
-- [ ] **A4 · behavioural · non-blocking** — Is Foreground sticky for later jobs, or only
-      for the one being watched? Proposed: sticky — it is a state, not a one-off action,
-      and `config["screen"]` is already durable.
-- [ ] **A5 · product/UI · non-blocking** — Does the menu also offer Quit? Proposed: no.
-      Stopping the worker for good is the installer's job; a Quit that a volunteer presses
-      by accident looks identical to the worker being broken.
+- [x] **A1 - product/UI - blocking** -- answered 2026-10-15: **(b)+(c)**. The bar is the
+      whole video, the job's window is marked inside it, what an earlier attempt covered
+      is dim and this attempt's part is bright. The question was:
+      What does the full width of the timeline represent?
+      (a) **this attempt's window only** -- `start_frame`..`end_frame` as the worker
+      receives it, which for a resumed job is already the remaining part;
+      (b) **the job's whole window**, with the part earlier attempts covered drawn dim and
+      this attempt's part bright -- this is what the issue describes, and it needs A2;
+      (c) **the whole video**, with the job's window marked inside it and the playhead
+      within that -- the worker already knows the video's length from the container.
+      (b) and (c) combine: the whole video, the job's window marked, this attempt's start
+      ticked. Recommendation: **(b)+(c)**, because it is the only reading in which "where
+      the job actually started" means anything, and the video-length context is free.
+
+- [x] **A2 - cross-repository - blocking** -- answered 2026-10-15: **yes, add it**. The
+      coordinator puts the job's own window start on the copy it hands over; the stored
+      spec stays untouched. Second branch and second pull request in MARP_API, and the
+      worker tolerates its absence so the two can merge in either order. The question was:
+      Only if A1 includes (b). The worker cannot
+      tell a resumed attempt from a fresh one: `applyResumePoint` in MARP_API hands over a
+      *copy* of the spec with `range.start_frame` moved to the resume point, deliberately,
+      and the original start is not in anything the worker receives. So (b) needs one
+      extra field on the leased spec copy -- the job's own `start_frame` -- which is a
+      change in MARP_API, a second branch and a second pull request. Is that worth it, or
+      do we take (a)/(c) and keep this to one repository?
+
+- [x] **A3 - product/UI - blocking** -- answered 2026-10-15: **yes, in the tooltip**.
+      Does the tray tooltip carry a percentage as well,
+      or does the timeline live only in the window? Recommendation: **yes, in the
+      tooltip** -- in Background mode the tooltip is the only thing a volunteer can see,
+      and `tooltip_for()` already reads `/status`, which already carries `progress`.
+
+- [ ] **A4 - product/UI - non-blocking** -- One timeline per window, or one combined view
+      of every slot? Recommendation: **one per window**. Each slot already gets its own
+      watch window, tiled by `_tile(slot_index, slot_count)`, and each is a different
+      video; a combined view would put four unrelated videos' ranges on one axis. The
+      machine-wide number that is worth having -- frames per second across all slots -- is
+      already in the top bar.
+
+- [ ] **A5 - behavioural - non-blocking** -- Where does "time remaining" come from? The
+      page already measures a 10-second rolling frame rate for the `fps` readout, and
+      `/status` carries this attempt's `progress.done` and `elapsed_s`, whose ratio is the
+      attempt's average rate. Recommendation: **the attempt average**, falling back to the
+      rolling rate before there is enough of it -- an estimate that jumps around is an
+      estimate nobody reads, and the average steadies as the job goes on.
 
 ## Decisions
 
-- **2026-10-14** — Three volunteer-facing states map onto machinery that already exists
-  rather than replacing it: Foreground/Background are the existing `screen` modes
-  `window`/`off`, retargetable on a running worker through `/status/screen`. Pause is the
-  existing `WorkerState.set_paused`, plus the new suspend described in R5.
-- **2026-10-14** — Pause means *suspend now*, not *finish the job then stop*. Isaac:
-  *"on pause the job it's running will be paused so the user can use their computer"*.
-  The reason somebody presses it is that they want the GPU back, so draining is the wrong
-  behaviour even though it is the gentler one.
-- **2026-10-14** — **Pausing and releasing the GPU are two different things, and the menu
-  offers both.** Suspending the frame loop stops the GPU computing but leaves the model
-  resident in VRAM -- which is what makes resuming free, and is also useless to a
-  volunteer who wants to play a game. So Pause suspends and keeps the weights, escalating
-  to a release after five minutes (R7), and *Give me my GPU now* releases immediately
-  (R10). Isaac, 2026-10-14: *"if the user needs their gpu right away they should have that
-  option as well"*.
+- **2026-10-15** -- Display only. Every number already flows: `report_progress` fires every
+  `_PROGRESS_EVERY_FRAMES` frames, `/status` reports each running job's `progress`, and the
+  frame packet already carries `range_start` and `range_end`. Nothing new is measured.
 
 ## Plan
 
-1. `jobs/worker_state.py` — the paused flag already exists; add the wait primitive a
-   running job blocks on, and the timestamp pause began, for R7's escalation.
-2. `engines/tracking_engine.py` — at the existing progress-and-stop checkpoint
-   (`ctx.should_stop()`, every `PROGRESS_INTERVAL` frames) also honour a pause: block
-   there while paused. That checkpoint is already the one place the frame loop yields, so
-   R5 and R6 need no new loop and no frame is reprocessed.
-3. `jobs/runner.py` — release: `request_stop()` on the paused job, which is the path a
-   coordinator cancel already takes and already unloads and hands the attempt back. Two
-   callers -- the five-minute escalation (R7) and the menu item (R10). One code path, so
-   the slow one cannot drift from the fast one.
-4. `installation/tray.py` (new) — the icon, the menu and the tooltip. Reads state from
-   the running worker's own `/status`; writes through `/status/pause` and
-   `/status/screen`, which both exist. R10 is the one that needs a new endpoint, because
-   nothing today lets a local caller release a running job -- the smallest thing that
-   works is a `release` flag on the existing `/status/pause`, not a new route.
-5. `installation/launcher.py` — start the tray alongside the worker, and swallow its
-   absence (R9).
-6. Durability (R8): the tray writes the volunteer's choice through
-   `installation/operator_control.py`, which is already the durable local choice, and the
-   launcher reads it at startup.
+1. Settle A1-A3.
+2. Carry the video's length to the window. `geometry.total_frames` is already read in
+   `tracking_engine.py`; it reaches the page through the frame packet, beside the range.
+3. Draw the timeline in `live.html`: the band, the window inside it, the attempt's start,
+   the playhead, and the frame numbers under it.
+4. Elapsed and remaining, from `/status` in `refreshFooter`, which already polls.
+5. If A3 is yes: the percentage into `tooltip_for()` in `installation/tray.py`.
+6. If A2 is yes: the job's own start on the leased spec copy, in MARP_API, on its own
+   branch and its own pull request, with the worker tolerating its absence.
 
 ## Acceptance criteria
 
-- Installing the worker on a Windows machine puts an icon in the tray with no extra step.
-- Pressing Pause while a job is running: GPU utilisation drops to idle within one progress
-  interval, and the coordinator still shows the attempt as held, not failed.
-- Leaving Pause: the same job continues, and its progress numbers carry on from where they
-  stopped rather than restarting.
-- Staying paused past five minutes: the attempt is returned to the coordinator and the
-  worker reports no fault.
-- Pressing *Give me my GPU now*: VRAM drops to idle immediately -- not just utilisation --
-  and the attempt is returned. Measured with `nvidia-smi`, because used memory is the
-  number that decides whether a game starts.
-- Foreground while a job runs: the live view appears for *that* job.
-- Killing and restarting the worker while paused: it comes back paused.
-- `pytest` green on a machine with no GPU and no tray.
+- With a job running, the window shows the job's range, the playhead inside it, and both
+  frame numbers; the bar moves as the job runs.
+- A job that resumes part-way through its window shows the earlier part as already covered
+  rather than starting its bar part-filled with no explanation.
+- Elapsed counts up and the remaining estimate falls; neither is blank once the job has
+  run long enough to have a rate.
+- A video whose container reports no frame count still draws a usable timeline.
+- Frame rate with the window open is unchanged, slot for slot, from before this change.
 
 ## Test plan
 
-Filled in at G3.
+`.marp/verification.md`, written at G3. Two things in it are worth reading before the
+rest: R3 and R5 have no automated test and say so, and the render section is the only
+tier that can see the page draw.
 
 ## Status
 
-- **Gate:** implementing
-- **Notes:** The machinery for Background and Foreground already exists and is wired
-  (`--screen`, `/status/screen`, `watch/display.py`); this task surfaces it rather than
-  building it. The genuinely new code is the tray and the mid-job suspend. A1 and A2 are
-  the two that block.
+- **Gate:** verifying
+- **Notes:** A1-A3 answered 2026-10-15. A4 stands as recommended. **A5 was implemented
+  the other way round from its recommendation**, and the reason is a fact found after it
+  was written: `progress.elapsed_s` counts from when the job *process* started, so the
+  model load, the seek and every second of a pause are inside it. Dividing by it
+  understates the rate and inflates the estimate, worst on exactly the paused job somebody
+  is looking at the window to understand. So the rolling rate leads and the average is the
+  fallback. The coordinator's half is MARP_API branch `lease-says-where-the-job-began`,
+  which has no issue of its own -- one is needed there, or this can be referenced from
+  #60.

@@ -342,6 +342,16 @@ class TrackingEngine(BaseEngine):
         end_frame = int(frame_range["end_frame"])
         expected_frames = end_frame - start_frame
 
+        # Where the whole job begins, as against where this attempt does. The
+        # coordinator sends it only on a resumed lease; absent, or nonsense,
+        # this attempt is the whole job and the two are the same frame.
+        job_start_frame = frame_range.get("job_start_frame")
+        job_start_frame = (
+            int(job_start_frame)
+            if job_start_frame is not None and 0 <= int(job_start_frame) <= start_frame
+            else start_frame
+        )
+
         # When this attempt began. Wall clock rather than CPU time: what is
         # being answered is "how long did this machine take over it", which is
         # what a volunteer's donation is measured in and what the dashboard
@@ -526,6 +536,12 @@ class TrackingEngine(BaseEngine):
                 # only thing that knows how many jobs this machine runs at once.
                 slot_index=int(params.get("slot_index") or 0),
                 slot_count=int(params.get("slot_count") or 1),
+                # The timeline's two fixed points: how long the video is, and
+                # where the job began. The container's count is taken as read
+                # -- it is what the seek is against -- and treated as unknown
+                # when it reports nothing, which some streams do (#60 R4).
+                video_frames=geometry.total_frames or None,
+                job_start_frame=job_start_frame,
             )
             if not watch.start():
                 watch = None

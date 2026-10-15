@@ -254,7 +254,16 @@ $UvArchive = Join-Path $DownloadRoot 'uv.zip'
 Get-VerifiedArchive $UvLock $UvArchive
 $UvRoot = Join-Path $DownloadRoot 'uv'
 if (Test-Path -LiteralPath $UvRoot) { Remove-Item -LiteralPath $UvRoot -Recurse -Force }
-Expand-Archive -LiteralPath $UvArchive -DestinationPath $UvRoot
+# -Force as well as the removal above, because the removal was not enough on
+# its own and we could not establish why. A reinstall over an existing install
+# died here -- "the file uv\uv.exe already exists" -- leaving a complete new
+# version that was never switched to, while Inno had already reported the
+# install a success, so nothing downstream could tell. Measured 2026-10-14.
+#
+# An extraction that overwrites is correct whatever the cause: the archive is
+# verified against its lock above, so whatever is already there is either
+# identical or stale.
+Expand-Archive -LiteralPath $UvArchive -DestinationPath $UvRoot -Force
 $Uv = Join-Path $UvRoot 'uv.exe'
 
 $env:UV_PYTHON_INSTALL_DIR = Join-Path $InstallRoot 'python'
@@ -310,7 +319,7 @@ if ($LASTEXITCODE -ne 0) { throw "Installing the $ComputeRuntime runtime failed.
 
 $SourceRoot = Join-Path $VersionRoot 'source'
 Write-Stage 6 'Installing the MARP worker and video display...'
-Expand-Archive -LiteralPath (Join-Path $PayloadRoot 'worker-source.zip') -DestinationPath $SourceRoot
+Expand-Archive -LiteralPath (Join-Path $PayloadRoot 'worker-source.zip') -DestinationPath $SourceRoot -Force
 & $Uv pip install --python $Python --no-deps --editable $SourceRoot
 if ($LASTEXITCODE -ne 0) { throw 'MARP worker installation failed.' }
 
@@ -320,7 +329,7 @@ $ChromeArchive = Join-Path $DownloadRoot 'chromium.zip'
 Get-VerifiedArchive $ChromeLock $ChromeArchive
 $ChromeExtract = Join-Path $DownloadRoot 'chromium'
 if (Test-Path -LiteralPath $ChromeExtract) { Remove-Item -LiteralPath $ChromeExtract -Recurse -Force }
-Expand-Archive -LiteralPath $ChromeArchive -DestinationPath $ChromeExtract
+Expand-Archive -LiteralPath $ChromeArchive -DestinationPath $ChromeExtract -Force
 $ChromeDestination = New-Item -ItemType Directory -Force -Path (Join-Path $VersionRoot 'chromium')
 Copy-Item -Path (Join-Path $ChromeExtract 'chrome-win\*') -Destination $ChromeDestination -Recurse -Force
 Remove-Item -LiteralPath $ChromeExtract -Recurse -Force

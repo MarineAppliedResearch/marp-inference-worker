@@ -39,39 +39,45 @@ while it runs, and ends in weights MARP has registered and the pool can run infe
   profile.
 - **R8** — Nothing on the training path imports the Jellyfin client, extending the existing
   `test_nothing_on_the_job_path_imports_jellyfin` boundary.
+- **R9** — One training job is one training run: a single `model.train()` over one dataset.
+  There are no curriculum phases. See the decision below — the legacy script's
+  crops/frames/mixed pipeline is an abandoned experiment and must not be carried forward
+  from it.
+- **R10** — A training job occupies the machine. While one runs, the worker offers no
+  further slots, whatever `_live_slot_count()` would otherwise derive from throughput.
 
 ## Open assumptions
 
-- [ ] **A1 · architectural · blocking** — How does the dataset reach the worker? The
-      proposal is the A8 shape: MARP resolves the dataset and the job spec carries a
-      locator plus a hash, exactly as `video.url` does, so the worker never learns where
-      datasets live and the coming file server is a change on MARP's side only. The
-      alternatives are the worker being given per-frame URLs and labels and assembling the
-      YOLO tree itself, or dataset building becoming its own job kind. Which?
-- [ ] **A2 · architectural · blocking** — One training job that runs all three phases, or
-      one job per phase with the coordinator chaining them and passing each phase's weights
-      to the next? Chaining falls out of the existing lease, retry and resume machinery;
-      one long job does not.
-- [ ] **A3 · scientific · blocking** — What is the phase order?
-      `runTrainingPipeline`'s own docstring says *"1. crops 2. frames 3. mixed"* and the
-      line below it runs `phases = ["crops", "mixed", "frames"]`. The two have disagreed
-      inside one function for as long as the file has existed, so neither can be taken as
-      the intended one.
-- [ ] **A4 · performance/concurrency · blocking** — A training run is hours and the lease
-      is built for minutes: heartbeat every 10s, and a quiet attempt is reclaimed. Does a
-      training attempt hold its lease for the whole run, or publish a checkpoint and resume
-      after a restart? `ctx.resume_from` exists for the second and is hard-coded to `None`
-      today.
-- [ ] **A5 · cross-repository · blocking** — Who turns finished weights into an `ml_models`
-      row with its `model_species`, and when? The worker can only publish an artifact; the
-      registration is MARP's (`MarineAppliedResearch/MARP_API#265`).
-- [ ] **A6 · performance/concurrency · non-blocking** — Does a training job take the whole machine, rather
-      than one of the slots `_live_slot_count()` derived? That function measures frames per
-      second and a training job reports epochs, so it would read a healthy run as a stalled
-      one.
-- [ ] **A7 · environment · non-blocking** — Where does the shared dataset cache live, and what evicts it?
-      Model weights cache under the install's `models/cache`; a dataset is far larger and
-      the same choice may not suit.
+- [x] **A1 · architectural · blocking** — answered 2026-10-15: MARP serves the dataset. The
+      job spec carries a locator the worker fetches and verifies, exactly as `video.url`
+      already works. marp-api serves it itself for now; later the API writes datasets to a
+      file server and serves them from there, and because the worker only ever sees a
+      locator, that change is MARP's alone. The file server does not exist yet and nothing
+      here waits for it.
+- [x] **A2 · architectural · blocking** — answered 2026-10-15: one job, one training run.
+      The question assumed phases and there are none.
+- [x] **A3 · scientific · blocking** — answered 2026-10-15: not applicable. crops/frames/
+      mixed was an attempt at curriculum learning, it did not work well, and it is not what
+      we do. The order the legacy code and its own docstring disagree about is therefore
+      moot rather than a thing to resolve.
+- [ ] **A4 · behavioural · blocking** — If a machine dies three hours into a four-hour run,
+      is that work lost? The lease itself is fine — the parent process heartbeats every ten
+      seconds for any running job regardless of what the engine is doing, so a long job
+      holds its lease as long as the worker is alive. This is only about a crash, a reboot,
+      or a volunteer closing the lid. Ultralytics already writes `last.pt` after every
+      epoch and can resume from it, and `ctx.resume_from` exists for exactly this and is
+      hard-coded to `None` today. So: publish a checkpoint periodically so a retry can pick
+      it up, or accept that an interrupted training run starts again?
+- [ ] **A5 · cross-repository · blocking** — When does the worker hand the weights over:
+      every time training finds a new best, or once at the end? Every new best costs an
+      upload per improvement but means a long run is never wholly lost and MARP can show
+      the best model so far; once at the end is one upload and nothing until it finishes.
+      Related to A4 and may be answered by the same choice.
+- [x] **A6 · performance/concurrency · non-blocking** — answered 2026-10-15: a training job
+      takes what it can, and the machine is not expected to have slots left over. R10.
+- [ ] **A7 · environment · non-blocking** — Where does the shared dataset cache live, and
+      what evicts it? Model weights cache under the install's `models/cache`; a dataset is
+      far larger and the same choice may not suit.
 
 ## Decisions
 
@@ -79,10 +85,22 @@ while it runs, and ends in weights MARP has registered and the pool can run infe
   than a second job path. `report_metrics` is already unschema'd for Ultralytics' varying
   metric names, and `resume_from` was documented for training from the start, so the
   contract was built expecting this.
+- **2026-10-15** — **No curriculum phases.** The legacy pipeline trains in three phases —
+  crops, then frames, then mixed — passing each phase's best weights to the next. That was
+  an experiment in curriculum learning, it did not work well, and training is now a single
+  ordinary run. This is written down because `model_training_live.py` still contains the
+  whole pipeline and reads like the intended design: it even disagrees with itself about
+  the order, with `runTrainingPipeline`'s docstring saying crops/frames/mixed and the line
+  below it running `["crops", "mixed", "frames"]`. Anyone porting from that file will find
+  the phases first. Promote to a decision record at G2, when edits outside `.marp/` are
+  unblocked.
+- **2026-10-15** — The dataset reaches the worker as a locator plus a hash, and the worker
+  never learns what serves it. This is the same boundary A8 drew for video, and it is what
+  lets the file server arrive later without the worker changing.
 
 ## Plan
 
-Written after A1–A5 are answered; the shape of every step depends on them.
+Written once A4 and A5 are answered; both change what the engine publishes and when.
 
 ## Acceptance criteria
 
@@ -92,6 +110,7 @@ Written after A1–A5 are answered; the shape of every step depends on them.
 - The weights land in MARP as an artifact that can be registered and then run.
 - A second attempt on the same worker reuses the cached dataset rather than fetching it
   again.
+- While a training job runs, the worker offers no further slots.
 
 ## Test plan
 
@@ -100,6 +119,7 @@ Filled in at G3, after the gate.
 ## Status
 
 - **Gate:** design
-- **Notes:** G1. Blocking assumptions A1–A5 are with Isaac; nothing is implemented until
-  they are answered. The coordinator half is `MarineAppliedResearch/MARP_API#265` and the
-  cross-repository tracking issue is `MarineAppliedResearch/MARP#36`.
+- **Notes:** G1. A1, A2, A3 and A6 answered 2026-10-15. A4 and A5 are still with Isaac and
+  are related — both are about when work is handed over. Nothing implemented. The
+  coordinator half is `MarineAppliedResearch/MARP_API#265`; the tracking issue is
+  `MarineAppliedResearch/MARP#36`.

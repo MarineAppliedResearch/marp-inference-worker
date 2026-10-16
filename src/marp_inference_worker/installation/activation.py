@@ -26,7 +26,7 @@ def activate(coordinator_url: str, activation_code: str, state_dir: Path) -> dic
         json={
             "activation_code": activation_code,
             "local_id": identity.local_id,
-            "name": f"{socket.gethostname()}-{identity.local_id[:8]}",
+            "name": socket.gethostname(),
             "platform": system,
             "architecture": architecture,
             "compute_runtime": installed_compute_runtime(),

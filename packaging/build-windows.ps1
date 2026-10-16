@@ -142,10 +142,17 @@ if (-not $Development -and -not $SigningCertificateThumbprint) {
 # matters is whether THIS coordinator will accept THIS code today, which no
 # amount of string validation can answer. `local_id` is obviously synthetic so
 # the row this creates is identifiable as a build probe.
+#
+# **The probe id is per build machine, not per build.** It was a fresh GUID,
+# and because activation upserts on `local_id` that meant one permanent worker
+# row for every build ever run: seventeen of them against one development
+# database, none ever seen again, drowning the four real computers in the pool
+# view. Keyed on the machine instead, a build host owns one probe row however
+# often it builds.
 function Assert-EnrollmentCodeAccepted([string]$Url, [string]$Code) {
     $Probe = @{
         activation_code = $Code
-        local_id = "buildcheck-$([guid]::NewGuid())"
+        local_id = "buildcheck-$env:COMPUTERNAME"
         name = "buildcheck-$env:COMPUTERNAME"
         platform = 'windows'
         architecture = 'x86_64'

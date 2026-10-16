@@ -119,6 +119,9 @@ Filled in at G3, after the gate.
 ## Status
 
 - **Gate:** design
+- **Also on this branch:** the worker-identity fix, specified in
+  `.marp/task-worker-identity.md` and already implemented. One branch carries the
+  work stream rather than one branch per task.
 - **Notes:** G1. A1, A2, A3 and A6 answered 2026-10-15. A4 and A5 are still with Isaac and
   are related — both are about when work is handed over. Nothing implemented. The
   coordinator half is `MarineAppliedResearch/MARP_API#265`; the tracking issue is

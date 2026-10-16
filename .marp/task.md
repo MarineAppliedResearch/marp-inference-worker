@@ -43,6 +43,9 @@ while it runs, and ends in weights MARP has registered and the pool can run infe
   There are no curriculum phases. See the decision below — the legacy script's
   crops/frames/mixed pipeline is an abandoned experiment and must not be carried forward
   from it.
+- **R11** — The worker publishes its best weights while the run is in progress: on every
+  new best, never more than once every ten minutes, and unconditionally once at the end.
+  A run that dies loses only the epochs since the last publish.
 - **R10** — A training job occupies the machine. While one runs, the worker offers no
   further slots, whatever `_live_slot_count()` would otherwise derive from throughput.
 
@@ -60,19 +63,15 @@ while it runs, and ends in weights MARP has registered and the pool can run infe
       mixed was an attempt at curriculum learning, it did not work well, and it is not what
       we do. The order the legacy code and its own docstring disagree about is therefore
       moot rather than a thing to resolve.
-- [ ] **A4 · behavioural · blocking** — If a machine dies three hours into a four-hour run,
-      is that work lost? The lease itself is fine — the parent process heartbeats every ten
-      seconds for any running job regardless of what the engine is doing, so a long job
-      holds its lease as long as the worker is alive. This is only about a crash, a reboot,
-      or a volunteer closing the lid. Ultralytics already writes `last.pt` after every
-      epoch and can resume from it, and `ctx.resume_from` exists for exactly this and is
-      hard-coded to `None` today. So: publish a checkpoint periodically so a retry can pick
-      it up, or accept that an interrupted training run starts again?
-- [ ] **A5 · cross-repository · blocking** — When does the worker hand the weights over:
-      every time training finds a new best, or once at the end? Every new best costs an
-      upload per improvement but means a long run is never wholly lost and MARP can show
-      the best model so far; once at the end is one upload and nothing until it finishes.
-      Related to A4 and may be answered by the same choice.
+- [x] **A4 · behavioural · blocking** — answered 2026-10-15: the worker publishes its
+      best weights as it goes, so an interrupted run is never wholly lost. Recovery is
+      "start again from the last published best" rather than a true optimizer-state
+      resume; see the decision below for why that is enough for now. `ctx.resume_from`
+      stays unused.
+- [x] **A5 · cross-repository · blocking** — answered 2026-10-15: on every new best,
+      rate-limited, plus an unconditional publish at the end. Checkpoints go up under the
+      artifact role `checkpoint`; the final one goes up as `weights` and is what MARP
+      registers as a model.
 - [x] **A6 · performance/concurrency · non-blocking** — answered 2026-10-15: a training job
       takes what it can, and the machine is not expected to have slots left over. R10.
 - [ ] **A7 · environment · non-blocking** — Where does the shared dataset cache live, and
@@ -80,6 +79,28 @@ while it runs, and ends in weights MARP has registered and the pool can run infe
       far larger and the same choice may not suit.
 
 ## Decisions
+
+- **2026-10-15** — **Publish on every new best, not every epoch, and never faster than
+  once every ten minutes.** Isaac asked which is better; this is the reasoning. The two
+  reasons to send anything are *don't lose the run* and *let MARP see the model*, and only
+  a new best serves the second — an epoch that did not improve produces weights nobody
+  would ever register or run. Every epoch is also expensive in a way that matters here:
+  the weights are around 130 MB, a run is often a couple of hundred epochs, and that is
+  tens of gigabytes up a volunteer's home connection for files superseded minutes later.
+  A new best fires often early and rarely later, which is the right shape — it is exactly
+  when there is something new worth having. The rate limit exists because early epochs can
+  improve on consecutive passes, and the end-of-run publish is unconditional so the final
+  best is never the one the limiter skipped.
+- **2026-10-15** — **Recovery is restarting from the last published best, not a true
+  resume.** Ultralytics resumes from `last.pt`, which carries optimizer and scheduler
+  state that `best.pt` does not, so a real resume means publishing a second and larger
+  file on a timer for a case that has not happened yet. Restarting from the last best
+  keeps everything the run has learned and loses only the epochs since — acceptable, and
+  far less machinery. Revisit when somebody actually loses a long run.
+- **2026-10-15** — **A checkpoint and the finished model are different artifact roles.**
+  `publish_artifact(path, "checkpoint")` while running, `publish_artifact(path, "weights")`
+  at the end. MARP registers the second as an `ml_models` row; the first is attached to the
+  training run and is not a model anybody is asked to use.
 
 - **2026-10-15** — The spec is written against the existing `BaseEngine` contract rather
   than a second job path. `report_metrics` is already unschema'd for Ultralytics' varying

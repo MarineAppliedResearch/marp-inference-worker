@@ -138,6 +138,34 @@ class FrameRange(BaseModel):
         return self.end_frame - self.start_frame
 
 
+# DatasetRef
+# Names the training dataset a job runs over, and the hash it must have.
+# The coordinator resolves the dataset and hands over something the worker can
+# fetch, exactly as it already does for video (A8): the worker does not know what
+# is serving the locator, holds no credential for it, and cannot tell a file
+# server from the API answering directly. That is what lets the file server in
+# `MarineAppliedResearch/MARP_API#120` arrive without the worker changing.
+class DatasetRef(BaseModel):
+
+    # The only thing the worker uses to fetch it. Refused empty for the same
+    # reason `VideoRef.url` is: a spec that cannot name its source must fail at
+    # the boundary rather than inside a child process launched for it.
+    url: str = Field(min_length=1)
+
+    # Expected sha256 of the archive, lower-case hex. Verified before anything
+    # is unpacked, so a truncated download cannot become a training run that
+    # looks finished and learned from half a dataset.
+    sha256: str
+
+    # What MARP calls this dataset, recorded with the run. The class names are
+    # deliberately not here: they come from the dataset's own YAML, which is the
+    # thing the training actually reads, and a second copy could disagree with it.
+    name: str | None = None
+
+    # MARP's `datasets.id`, when the job came from a registered dataset.
+    dataset_id: int | None = None
+
+
 # ReductionRef
 # Names the keyframe reduction rule this job must use, and its version.
 # Recorded with every observation the job produces, because the reduction is
@@ -217,18 +245,58 @@ class JobSpec(BaseModel):
     # engine takes a model, and mock takes a mock one.
     model: ModelRef
 
-    # Video the frames come from.
-    video: VideoRef
+    # Video the frames come from. Absent on a training job, which has no video.
+    video: VideoRef | None = None
 
-    # Frame span this job owns.
-    range: FrameRange
+    # Frame span this job owns. Absent on a training job for the same reason.
+    range: FrameRange | None = None
+
+    # The dataset a training job learns from. Absent on an inference job.
+    dataset: DatasetRef | None = None
 
     # Free-form engine parameters. Deliberately unschema'd: confidence
     # thresholds, tracker settings and Ultralytics arguments differ per engine.
     params: dict[str, Any] = Field(default_factory=dict)
 
-    # Keyframe reduction rule to apply to finished tracks.
-    reduction: ReductionRef
+    # Keyframe reduction rule to apply to finished tracks. A training job
+    # produces no tracks, so it carries none.
+    reduction: ReductionRef | None = None
+
+
+    # _check_shape()
+    # Refuses a spec that is neither a whole inference job nor a whole training one.
+    # Inputs: the validated model.
+    # Output: the model, or a ValueError naming what is missing.
+    #
+    # **Optional here does not mean optional.** `video`, `range` and `reduction`
+    # stopped being required fields so a training job could exist at all, and
+    # without this check that would quietly loosen every inference job too --
+    # a lease missing its range would validate and fail much later, inside a
+    # child process, as something that reads like an engine bug.
+    #
+    # The two shapes are told apart by `dataset`, not by the engine name: the
+    # engine is a free string the coordinator chooses, and a typo in it must not
+    # decide which fields are checked.
+    @model_validator(mode="after")
+    def _check_shape(self) -> "JobSpec":
+
+        if self.dataset is not None:
+            # A training job. Carrying a frame range as well means the
+            # coordinator built something incoherent; say so rather than
+            # picking one.
+            if self.video is not None or self.range is not None:
+                raise ValueError("a training job carries a dataset, not a video and a range")
+            return self
+
+        # An inference job, held to exactly what it was held to before.
+        missing = [name for name in ("video", "range", "reduction")
+                   if getattr(self, name) is None]
+        if missing:
+            raise ValueError(
+                "a job without a dataset is an inference job and needs "
+                + ", ".join(missing)
+            )
+        return self
 
     # Where the observations will be filed, for the watch window to show.
     #

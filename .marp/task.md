@@ -46,6 +46,10 @@ while it runs, and ends in weights MARP has registered and the pool can run infe
 - **R11** — The worker publishes its best weights while the run is in progress: on every
   new best, never more than once every ten minutes, and unconditionally once at the end.
   A run that dies loses only the epochs since the last publish.
+- **R12** — After unpacking, the worker rewrites the dataset YAML's `train` and `val`
+  paths to point at where it actually put the files. A dataset built by the legacy scripts
+  records absolute paths on the machine that built it, so shipped as-is it names
+  directories the worker does not have.
 - **R10** — A training job occupies the machine. While one runs, the worker offers no
   further slots, whatever `_live_slot_count()` would otherwise derive from throughput.
 
@@ -75,8 +79,10 @@ while it runs, and ends in weights MARP has registered and the pool can run infe
 - [x] **A6 · performance/concurrency · non-blocking** — answered 2026-10-15: a training job
       takes what it can, and the machine is not expected to have slots left over. R10.
 - [ ] **A7 · environment · non-blocking** — Where does the shared dataset cache live, and
-      what evicts it? Model weights cache under the install's `models/cache`; a dataset is
-      far larger and the same choice may not suit.
+      what evicts it? Sharper now that the first real dataset is measured: rockfish5 is
+      4.7 GB unpacked and Star4 is 10.7 GB, so two or three datasets on one volunteer
+      machine is tens of gigabytes that nothing currently removes. Same shape as #65,
+      and R7 only says the cache is shared, not what bounds it.
 
 ## Decisions
 
@@ -118,6 +124,24 @@ while it runs, and ends in weights MARP has registered and the pool can run infe
 - **2026-10-15** — The dataset reaches the worker as a locator plus a hash, and the worker
   never learns what serves it. This is the same boundary A8 drew for video, and it is what
   lets the file server arrive later without the worker changing.
+
+## Decisions (continued)
+
+- **2026-10-19** — **The first end-to-end test runs on `rockfish5`.** Its training portion
+  is 4.7 GB: 9,879 train images, 1,966 eval, 11 rockfish and groundfish classes. `Star4` is
+  the same shape at 10.7 GB and is the obvious second. Two directories are excluded from
+  the archive: `for_human_review/`, which is not training data, and `crops/`, which exists
+  only for the curriculum phases we are not doing.
+- **2026-10-19** — **`frames-classnames.yaml` is the one to use.** rockfish5 carries three
+  — `crops-`, `frames-` and `mixed-` — because it was built for the three-phase pipeline.
+  `frames-` is train plus eval and nothing else, which is exactly one ordinary training
+  run; `mixed-` adds the crops tree. Picking `frames-` is what makes R9 true of a dataset
+  that was built before R9 was decided.
+- **2026-10-19** — **The archive lives in `MARP_API/storage/` for now**, beside
+  `gpu-artifacts/`, and that is explicitly temporary. The worker only ever sees a locator
+  and a hash, so when the file server in `MarineAppliedResearch/MARP_API#120` takes over,
+  nothing in the worker changes and nothing in this spec needs revisiting. That is the
+  whole reason the dataset is addressed by locator rather than by path.
 
 ## Plan
 

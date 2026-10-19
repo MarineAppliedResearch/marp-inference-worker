@@ -50,3 +50,7 @@ Thumbs.db
 # Hosts, accounts and key paths for one developer. Repository files may say that a
 # credential exists and where it lives, never its value.
 .marp/local/
+
+# Per-workspace metadata written by `marp agent start`: a port and a path for
+# this machine only, never part of the branch.
+.marp-agent.json

@@ -121,6 +121,29 @@ keeping the final validation's metrics as the run's result. Covered now by
 `test_the_final_validation_is_not_counted_as_an_epoch`, which replays the exact sequence
 the run produced, plus a repeat-index variant and a positive control.
 
-### Confirmation run
+### Confirmation run, after the fix
 
-A second run after the fix, same data and weights, 1 epoch.
+Same data and weights, 1 epoch, 624 s. **PASS.**
+
+```
+==> CUDA devices: 1
+    already cached in 0.0s at .../datasets/1904bf2396...
+    progress: 0/1 epochs (loading_model)
+    progress: 0/1 epochs (training)
+    progress: 1/1 epochs (training)
+    epoch 1: precision 0.76877  recall 0.88513  box_loss 0.75845  cls_loss 0.62161  dfl_loss 1.01172
+    progress: 1/1 epochs (publishing)
+
+    epochs_completed: 1    metric events: 1    artifacts: ['checkpoint', 'weights']
+    mAP50 0.825   mAP50-95 0.659   weights 136,708,090 bytes
+```
+
+One epoch requested, one counted, one metric event. The phantom is gone.
+
+**And R7 is proven on real data by the first line of it**: `already cached in 0.0s`. The
+second run reused the first run's 4.9 GB unpack instead of fetching and unpacking again,
+which is the behaviour #65 exists to insist on.
+
+A one-epoch run scores lower than the two-epoch one (mAP50 0.825 against 0.925), which is
+what a shorter run should do and is worth noting only because it says the numbers are real
+rather than copied forward from the starting weights.

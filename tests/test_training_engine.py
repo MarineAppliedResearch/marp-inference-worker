@@ -183,3 +183,116 @@ def test_a_setting_of_the_wrong_type_is_reported_not_guessed(tmp_path) -> None:
 
     assert ignored["epochs"] == "lots"
     assert settings["epochs"] == 100
+
+
+# FakeTrainer
+# The handful of attributes the epoch callback reads off Ultralytics' trainer.
+# A fake rather than the real thing because the callback's job is bookkeeping,
+# and what it has to get right is the sequence of calls -- which a real trainer
+# would take twenty minutes and a GPU to produce once.
+class FakeTrainer:
+
+    def __init__(self, epoch: int, metrics: dict, fitness=None, best_fitness=None) -> None:
+
+        # Zero-based, as Ultralytics counts.
+        self.epoch = epoch
+        self.metrics = metrics
+        self.fitness = fitness
+        self.best_fitness = best_fitness
+
+
+# RecordingContext
+# Enough of a JobContext for the callback, keeping what it was told.
+class RecordingContext:
+
+    def __init__(self) -> None:
+
+        self.progress: list[tuple] = []
+        self.metrics: list[tuple] = []
+        self.logs: list[str] = []
+
+    def report_progress(self, done, total, unit, phase=None, tracks=None) -> None:
+        self.progress.append((done, total, unit, phase))
+
+    def report_metrics(self, step, phase, metrics) -> None:
+        self.metrics.append((step, phase, dict(metrics)))
+
+    def log(self, message, level="info") -> None:
+        self.logs.append(message)
+
+    def should_stop(self) -> bool:
+        return False
+
+    def wait_while_paused(self, while_waiting=None) -> bool:
+        return False
+
+
+# test_the_final_validation_is_not_counted_as_an_epoch()
+# Verifies a two-epoch run reports two epochs.
+# Inputs: tmp_path.
+# Output: pytest pass/fail result.
+#
+# **This is a defect the first real run found.** Ultralytics calls
+# `on_fit_epoch_end` once per epoch and then once more, after it validates the
+# best weights, with `trainer.epoch` already advanced. The engine counted that
+# as another epoch, so a two-epoch run reported "3/2 epochs", and the coordinator
+# would have written an `epochs` row for an epoch that never ran and a
+# `total_epochs` of 3.
+#
+# The sequence below is exactly what the run produced: epoch indices 0 and 1 for
+# the two real epochs, then a third call at index 2 carrying the final
+# validation's metrics.
+def test_the_final_validation_is_not_counted_as_an_epoch(tmp_path) -> None:
+
+    ctx = RecordingContext()
+    state = training_module._RunState(ctx=ctx, total_epochs=2, run_root=tmp_path)
+
+    state.on_epoch_end(FakeTrainer(0, {"metrics/precision(B)": 0.80}))
+    state.on_epoch_end(FakeTrainer(1, {"metrics/precision(B)": 0.88}))
+
+    # The extra call, after training has finished.
+    state.on_epoch_end(FakeTrainer(2, {"metrics/precision(B)": 0.91, "metrics/mAP50(B)": 0.92}))
+
+    assert state.epochs_done == 2
+    assert [step for step, _, _ in ctx.metrics] == [1, 2]
+
+    # The final figures are still the run's result, just not another epoch.
+    assert state.last_metrics["metrics/mAP50(B)"] == 0.92
+
+
+# test_a_repeated_epoch_is_not_counted_twice()
+# Verifies the same epoch arriving again does not advance the count.
+# Inputs: tmp_path.
+# Output: pytest pass/fail result.
+#
+# Some Ultralytics versions fire the final validation with the *last* index
+# rather than one past it, which is the same defect wearing a different number.
+def test_a_repeated_epoch_is_not_counted_twice(tmp_path) -> None:
+
+    ctx = RecordingContext()
+    state = training_module._RunState(ctx=ctx, total_epochs=5, run_root=tmp_path)
+
+    state.on_epoch_end(FakeTrainer(0, {"metrics/precision(B)": 0.80}))
+    state.on_epoch_end(FakeTrainer(0, {"metrics/precision(B)": 0.81}))
+
+    assert state.epochs_done == 1
+    assert len(ctx.metrics) == 1
+
+
+# test_every_epoch_of_a_full_run_is_reported()
+# The positive control.
+# Inputs: tmp_path.
+# Output: pytest pass/fail result.
+#
+# Without it the two tests above would keep passing if the callback stopped
+# counting anything at all, which is also what a broken callback looks like.
+def test_every_epoch_of_a_full_run_is_reported(tmp_path) -> None:
+
+    ctx = RecordingContext()
+    state = training_module._RunState(ctx=ctx, total_epochs=4, run_root=tmp_path)
+
+    for index in range(4):
+        state.on_epoch_end(FakeTrainer(index, {"metrics/precision(B)": 0.5 + index / 10}))
+
+    assert state.epochs_done == 4
+    assert [step for step, _, _ in ctx.metrics] == [1, 2, 3, 4]

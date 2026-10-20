@@ -343,7 +343,26 @@ class _RunState:
     # would report a best that is one epoch stale.
     def on_epoch_end(self, trainer: Any) -> None:
 
-        self.epochs_done = int(getattr(trainer, "epoch", self.epochs_done) or 0) + 1
+        # Ultralytics' epoch index is zero-based, so the first finished epoch is 1.
+        reported = int(getattr(trainer, "epoch", self.epochs_done) or 0) + 1
+
+        # **The hook fires once more than there are epochs.** After the last one
+        # Ultralytics validates the best weights again and calls this with the
+        # index already advanced, so a two-epoch run arrives here three times. The
+        # first real run of this engine reported "3/2 epochs" and would have
+        # written an epoch 3 that never happened -- a row in `epochs` and a
+        # `total_epochs` that both disagree with the run.
+        #
+        # Those final metrics are the run's result and worth keeping; they are
+        # simply not another epoch. Held as the latest metrics, which is what the
+        # summary reports, and not counted.
+        if reported > self._total or reported <= self.epochs_done:
+            raw = dict(getattr(trainer, "metrics", {}) or {})
+            if raw:
+                self.last_metrics = {str(k): v for k, v in raw.items()}
+            return
+
+        self.epochs_done = reported
 
         # Ultralytics' metric names vary by task and version, which is exactly
         # why report_metrics takes a free-form mapping.

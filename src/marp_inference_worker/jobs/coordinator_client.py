@@ -178,6 +178,23 @@ class CoordinatorClient:
         # Idempotent in httpx, so shutdown paths may call it twice.
         self._client.close()
 
+    def fetch_token_for(self, locator: str) -> str | None:
+        """The credential a child needs to fetch this locator, or None.
+
+        Returned only for the coordinator's own origin, by exactly the test
+        `resolve_artifact_url` uses, so a job spec naming somewhere else cannot
+        talk the worker into handing its token to that host.
+
+        The caller puts this in the child's environment and nowhere else. It
+        must not reach `envelope.json`: a job workspace is never deleted (#65),
+        so a credential written there would outlive the job on a volunteer's
+        machine, in plaintext, beside every other job it ever ran.
+        """
+        _, headers = self.resolve_artifact_url(locator)
+        if not headers:
+            return None
+        return self._service_token
+
     def resolve_artifact_url(self, locator: str) -> tuple[str, dict[str, str] | None]:
         """Resolve coordinator-relative model URLs and authorize only that origin."""
         parsed = urlparse(locator)

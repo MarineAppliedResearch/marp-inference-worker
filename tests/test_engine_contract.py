@@ -42,8 +42,9 @@ def test_every_job_engine_implements_the_contract() -> None:
 
     names = engine_registry.job_engine_names()
 
-    # Both job engines are registered.
-    assert set(names) == {"mock", "marp_tracking"}
+    # Every job engine is registered. Pinned as a set rather than a count, so
+    # adding one is a deliberate edit here and removing one cannot pass quietly.
+    assert set(names) == {"mock", "marp_tracking", "marp_training"}
 
     for name in names:
         engine = engine_registry.get_job_engine(name)

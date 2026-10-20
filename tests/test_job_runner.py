@@ -2021,3 +2021,58 @@ def test_a_succeeded_attempt_reports_what_it_covered(tmp_path: Path) -> None:
     # This is the number MARP resumes from, so an off-by-one here silently
     # skips or repeats a frame on every hand-over.
     assert result["completed_through_frame"] == 1005
+
+
+# test_the_fetch_credential_never_reaches_the_envelope()
+# Verifies the child's credential is passed in memory, not written to disk.
+# Inputs: pytest temporary directory.
+# Output: pytest pass/fail result.
+#
+# The child needs the worker's token to fetch a multi-gigabyte dataset, and the
+# obvious way to give it one is the envelope -- it is already a file the parent
+# writes and the child reads. That is the thing this test exists to stop. A job
+# workspace is never deleted (#65), so a token written into one would sit in
+# plaintext on a volunteer's machine beside every job it ever ran, indefinitely.
+#
+# It goes in the child's environment instead, which dies with the process and is
+# not visible in a process listing. The envelope stays exactly what it was.
+def test_the_fetch_credential_never_reaches_the_envelope(tmp_path) -> None:
+
+    from marp_inference_worker.jobs.job_process import JobProcess
+
+    secret = "tok_this-must-never-be-written-down"
+
+    job = JobProcess(
+        envelope={
+            "attempt_id": "228",
+            "worker_id": "65",
+            "lease_epoch": 1,
+            "spec": {
+                "engine": "mock",
+                "model": {"name": "m.pt", "sha256": "a" * 64},
+                "dataset": {"url": "/api/v2/gpu/datasets/294/archive", "sha256": "b" * 64},
+                "params": {"dataset_url": "http://marp.invalid/d", "dataset_sha256": "b" * 64},
+            },
+        },
+        slot_index=0,
+        workspace_root=tmp_path,
+        fetch_token=secret,
+    )
+
+    try:
+        job.start()
+
+        # Written before the child is launched, so it is on disk by now whatever
+        # the child goes on to do.
+        envelope_text = (job.workspace / "envelope.json").read_text(encoding="utf-8")
+
+        assert secret not in envelope_text
+        assert "Authorization" not in envelope_text
+        assert "MARP_FETCH_TOKEN" not in envelope_text
+
+        # And nowhere else in the workspace either.
+        for path in job.workspace.rglob("*"):
+            if path.is_file():
+                assert secret not in path.read_text(encoding="utf-8", errors="ignore"), path
+    finally:
+        job.kill(grace_s=2.0)

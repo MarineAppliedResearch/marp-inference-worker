@@ -14,6 +14,10 @@
 # json parses the child's event lines and writes its envelope.
 import json
 
+# os copies this process's environment for the child, plus the one secret
+# the child is given.
+import os
+
 # subprocess launches and supervises the child.
 import subprocess
 
@@ -50,6 +54,7 @@ class JobProcess:
         envelope: dict[str, Any],
         slot_index: int,
         workspace_root: Path,
+        fetch_token: str | None = None,
     ) -> None:
 
         # The lease this job runs under. Every coordinator call carries all three.
@@ -75,6 +80,12 @@ class JobProcess:
         # STOP and for the same reasons; the difference is that it is removable,
         # so the job carries on from where it paused rather than unwinding.
         self.pause_file = self.workspace / "PAUSE"
+
+        # The credential the child needs to fetch what the job names, held in
+        # memory and passed through the environment at launch. Never written
+        # to the envelope: a workspace is never deleted (#65), so a token in
+        # one would outlive the job on a volunteer's machine.
+        self._fetch_token = fetch_token
 
         # Filled in by start().
         self._process: subprocess.Popen[str] | None = None
@@ -156,6 +167,13 @@ class JobProcess:
 
         # Launch the child. stdout is the event channel; stderr is captured
         # separately so a library writing a warning cannot corrupt an event line.
+        # The environment carries the fetch credential, and only that. Not the
+        # command line, which is visible to anything that can list processes, and
+        # not the envelope, which stays on disk after the job is over.
+        child_environment = os.environ.copy()
+        if self._fetch_token:
+            child_environment["MARP_FETCH_TOKEN"] = self._fetch_token
+
         self._process = subprocess.Popen(
             [sys.executable, "-m", "marp_inference_worker.jobs.child_main", str(envelope_path)],
             stdout=subprocess.PIPE,
@@ -163,6 +181,7 @@ class JobProcess:
             text=True,
             encoding="utf-8",
             bufsize=1,
+            env=child_environment,
         )
         self.started_at = time.time()
 

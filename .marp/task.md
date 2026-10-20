@@ -46,6 +46,10 @@ while it runs, and ends in weights MARP has registered and the pool can run infe
 - **R11** — The worker publishes its best weights while the run is in progress: on every
   new best, never more than once every ten minutes, and unconditionally once at the end.
   A run that dies loses only the epochs since the last publish.
+- **R13** — The dataset is fetched by the child, inside the job's own process, so the
+  runner keeps heartbeating every job on the machine throughout. A multi-gigabyte fetch
+  must not make a working machine look like one that has stopped answering, and it must be
+  cancellable and visible while it runs.
 - **R12** — After unpacking, the worker rewrites the dataset YAML's `train` and `val`
   paths to point at where it actually put the files. A dataset built by the legacy scripts
   records absolute paths on the machine that built it, so shipped as-is it names
@@ -83,22 +87,19 @@ while it runs, and ends in weights MARP has registered and the pool can run infe
       4.7 GB unpacked and Star4 is 10.7 GB, so two or three datasets on one volunteer
       machine is tens of gigabytes that nothing currently removes. Same shape as #65,
       and R7 only says the cache is shared, not what bounds it.
-- [ ] **A8 · security/permissions · blocking** — Where does the 4.9 GB dataset fetch
-      actually happen, and how is it authorized? Found in G2, wiring the engine up. The
-      parent runner fetches the model today (`runner.py` `_prepare_params`) and hands the
-      child a local path, which keeps the service token out of the child entirely. A
-      dataset cannot simply follow it: the fetch is minutes rather than milliseconds, and
-      `_prepare_params` runs on the runner's own loop, so a long fetch stops the
-      heartbeats for every running job on the machine and can lose this attempt's own
-      lease before it starts. Three ways out, and they trade the same thing differently:
-      (a) the child fetches, with the parent passing the resolved URL and bearer header in
-      `envelope.json` — simple, cancellable, and it can report progress, but the worker's
-      service token lands in a job workspace, and #65 established that workspaces are
-      never deleted; (b) as (a), but `child_main` overwrites the envelope as soon as it
-      has read it, bounding the exposure to seconds; (c) the parent fetches on a
-      background thread and launches only when it completes — the token never leaves the
-      parent, at the cost of a "preparing" state the runner does not have today.
-      Recommendation: (b).
+- [x] **A8 · security/permissions · blocking** — answered 2026-10-20 by Isaac: the child
+      fetches, and it is given the credential. My first answer was the parent fetching on a
+      thread, to keep the token out of the child; he pushed back, and he was right. The
+      refinement that makes it safe is **the environment, not a file**: the parent passes
+      the token to the child process's environment, so it never touches disk, never appears
+      in a process listing, and dies with the process. `envelope.json` was the version worth
+      rejecting — #65 established that job workspaces are never deleted, so a credential
+      written there would persist on a volunteer's machine indefinitely, in plaintext,
+      beside every job it ever ran.
+
+      The engine contract is untouched by this. `child_main` fetches before it builds the
+      context, so `run()` still receives a local path exactly as it does for model weights,
+      and the engine still cannot name or reach the coordinator.
 
 
 ## Decisions

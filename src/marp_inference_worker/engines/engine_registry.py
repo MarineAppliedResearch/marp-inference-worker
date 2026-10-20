@@ -22,6 +22,8 @@ from marp_inference_worker.engines.mock_engine import MockEngine
 from marp_inference_worker.engines.tracking_engine import TrackingEngine
 
 # UltralyticsEngine serves the single-frame routes.
+from marp_inference_worker.engines.training_engine import TrainingEngine
+
 from marp_inference_worker.engines.ultralytics_engine import UltralyticsEngine
 
 
@@ -32,6 +34,7 @@ _ENGINES_BY_NAME: dict[str, object] = {
     "mock": MockEngine(),
     "ultralytics": UltralyticsEngine(),
     "marp_tracking": TrackingEngine(),
+    "marp_training": TrainingEngine(),
 }
 
 

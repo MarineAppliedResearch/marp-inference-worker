@@ -28,7 +28,7 @@ import time
 from pathlib import Path
 
 # Any types the fake coordinator's payloads.
-from typing import Any
+from typing import Any, get_args
 
 from marp_inference_worker.jobs.coordinator_client import CoordinatorError, coordinator_event
 from marp_inference_worker.jobs.runner import JobRunner
@@ -1032,6 +1032,27 @@ def test_slots_limit_how_many_jobs_run_at_once(tmp_path: Path) -> None:
     assert _wait_until(runner, lambda: len(coordinator.results) == 2)
 
 
+# _spec_model()
+# Returns the model behind one of JobSpec's fields, seeing through `X | None`.
+# Inputs: the field name on JobSpec.
+# Output: the nested pydantic model class.
+# Use this rather than reading `.annotation` directly: a job is either an
+# inference job or a training one, so the fields belonging to each shape are
+# optional and their annotation is a union rather than the model itself.
+def _spec_model(field_name: str):
+
+    # Imported here, as the test below imports it, so the contract test keeps
+    # owning when the spec module is first loaded.
+    from marp_inference_worker.jobs.job_spec import JobSpec
+
+    annotation = JobSpec.model_fields[field_name].annotation
+
+    # `VideoRef | None` is a union; pick the half that is not NoneType.
+    args = [arg for arg in get_args(annotation) if arg is not type(None)]
+    return args[0] if args else annotation
+
+
+
 # test_worker_never_receives_a_push_address(tmp_path)
 # Verifies that push is unrepresentable.
 # Inputs: pytest temporary directory.
@@ -1063,10 +1084,11 @@ def test_worker_never_receives_a_push_address(tmp_path: Path) -> None:
     for model in (JobSpec, AttemptEnvelope):
         assert not (set(model.model_fields) & forbidden), model.__name__
 
-    # Nor in the nested models the spec is built from.
-    for nested in ("model", "video", "range", "reduction"):
-        annotation = JobSpec.model_fields[nested].annotation
-        assert not (set(annotation.model_fields) & forbidden), nested
+    # Nor in the nested models the spec is built from. Unwrapped, because a
+    # training job carries no video, range or reduction and an inference job
+    # carries no dataset, so all four are `X | None` now.
+    for nested in ("model", "video", "range", "reduction", "dataset"):
+        assert not (set(_spec_model(nested).model_fields) & forbidden), nested
 
     # There are exactly two urls in the whole contract and both are outbound
     # fetches: where the worker GOES to get a model artifact, and where it GOES
@@ -1075,11 +1097,20 @@ def test_worker_never_receives_a_push_address(tmp_path: Path) -> None:
     # a callback address could. This allowance was widened from one url to two
     # when A8 moved video resolution to the coordinator; it must not be widened
     # again without the same argument about direction.
-    model_ref = JobSpec.model_fields["model"].annotation
+    model_ref = _spec_model("model")
     assert "url" in model_ref.model_fields
 
-    video_ref = JobSpec.model_fields["video"].annotation
+    video_ref = _spec_model("video")
     assert "url" in video_ref.model_fields
+
+    # Three now, and the argument is the one this test demands rather than a
+    # bumped number: a dataset locator is somewhere the worker GOES to fetch
+    # from, exactly like the model artifact and the video. It is resolved by
+    # the coordinator, the worker holds no credential for it and cannot tell
+    # what is serving it, and nothing about it can be used to reach the worker.
+    # Same direction, same reasoning as A8's widening from one url to two.
+    dataset_ref = _spec_model("dataset")
+    assert "url" in dataset_ref.model_fields
 
     urls_elsewhere = [
         (name, field)
@@ -1089,14 +1120,15 @@ def test_worker_never_receives_a_push_address(tmp_path: Path) -> None:
     ]
     assert urls_elsewhere == [], urls_elsewhere
 
-    # And nowhere else at all: those two are the only ones.
+    # And nowhere else at all: those three are the only ones.
     for nested in ("range", "reduction"):
-        annotation = JobSpec.model_fields[nested].annotation
-        assert not [name for name in annotation.model_fields if "url" in name.lower()], nested
+        assert not [name for name in _spec_model(nested).model_fields
+                    if "url" in name.lower()], nested
 
-    # The video's url is the only one it may carry -- a second url field there
-    # would be somewhere to hide a callback address.
+    # One url each, and no more -- a second url field on either would be
+    # somewhere to hide a callback address.
     assert [name for name in video_ref.model_fields if "url" in name.lower()] == ["url"]
+    assert [name for name in dataset_ref.model_fields if "url" in name.lower()] == ["url"]
 
 
 # test_two_piece_split_covers_every_frame_exactly_once(tmp_path)
@@ -1989,3 +2021,58 @@ def test_a_succeeded_attempt_reports_what_it_covered(tmp_path: Path) -> None:
     # This is the number MARP resumes from, so an off-by-one here silently
     # skips or repeats a frame on every hand-over.
     assert result["completed_through_frame"] == 1005
+
+
+# test_the_fetch_credential_never_reaches_the_envelope()
+# Verifies the child's credential is passed in memory, not written to disk.
+# Inputs: pytest temporary directory.
+# Output: pytest pass/fail result.
+#
+# The child needs the worker's token to fetch a multi-gigabyte dataset, and the
+# obvious way to give it one is the envelope -- it is already a file the parent
+# writes and the child reads. That is the thing this test exists to stop. A job
+# workspace is never deleted (#65), so a token written into one would sit in
+# plaintext on a volunteer's machine beside every job it ever ran, indefinitely.
+#
+# It goes in the child's environment instead, which dies with the process and is
+# not visible in a process listing. The envelope stays exactly what it was.
+def test_the_fetch_credential_never_reaches_the_envelope(tmp_path) -> None:
+
+    from marp_inference_worker.jobs.job_process import JobProcess
+
+    secret = "tok_this-must-never-be-written-down"
+
+    job = JobProcess(
+        envelope={
+            "attempt_id": "228",
+            "worker_id": "65",
+            "lease_epoch": 1,
+            "spec": {
+                "engine": "mock",
+                "model": {"name": "m.pt", "sha256": "a" * 64},
+                "dataset": {"url": "/api/v2/gpu/datasets/294/archive", "sha256": "b" * 64},
+                "params": {"dataset_url": "http://marp.invalid/d", "dataset_sha256": "b" * 64},
+            },
+        },
+        slot_index=0,
+        workspace_root=tmp_path,
+        fetch_token=secret,
+    )
+
+    try:
+        job.start()
+
+        # Written before the child is launched, so it is on disk by now whatever
+        # the child goes on to do.
+        envelope_text = (job.workspace / "envelope.json").read_text(encoding="utf-8")
+
+        assert secret not in envelope_text
+        assert "Authorization" not in envelope_text
+        assert "MARP_FETCH_TOKEN" not in envelope_text
+
+        # And nowhere else in the workspace either.
+        for path in job.workspace.rglob("*"):
+            if path.is_file():
+                assert secret not in path.read_text(encoding="utf-8", errors="ignore"), path
+    finally:
+        job.kill(grace_s=2.0)

@@ -897,6 +897,13 @@ class JobRunner:
             },
             slot_index=slot_index,
             workspace_root=self._workspace_root,
+            # Only for a job that has something to fetch, and only for the
+            # coordinator's own origin -- `fetch_token_for` applies the same
+            # same-origin test the model fetch uses.
+            fetch_token=(
+                self._client.fetch_token_for(envelope.spec.dataset.url)
+                if envelope.spec.dataset is not None else None
+            ),
         )
         self._jobs_by_slot[slot_index] = job
 
@@ -967,6 +974,21 @@ class JobRunner:
         # What MARP says this model was trained on. The engine checks it
         # against the weights it actually loads and refuses a mismatch.
         params["model_class_names"] = model.class_names
+
+        # A training job names a dataset instead of a video. Only the locator is
+        # resolved here; the bytes are fetched by the child, because a dataset is
+        # gigabytes and this method runs on the loop that heartbeats every job on
+        # the machine (#67 A8, R13).
+        dataset = envelope.spec.dataset
+        if dataset is not None:
+            dataset_url, _ = self._client.resolve_artifact_url(dataset.url)
+            params["dataset_url"] = dataset_url
+            params["dataset_sha256"] = dataset.sha256
+
+            # One cache for the machine, beside the rest of the worker's state.
+            # Per attempt it would be tens of gigabytes of identical bytes, which
+            # is the mistake #65 already records against the job workspace.
+            params["dataset_cache"] = str(self._state_dir / "datasets")
 
         return params
 

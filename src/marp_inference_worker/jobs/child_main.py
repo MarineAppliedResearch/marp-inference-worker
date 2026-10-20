@@ -93,6 +93,11 @@ def main(argv: list[str]) -> int:
     ctx.report_progress(0, max(0, end_frame - start_frame), "frames", phase="starting")
 
     try:
+        # A training job's dataset is fetched here, in the job's own process, so
+        # the runner keeps heartbeating everything on the machine while it runs
+        # and the transfer is cancellable like any other part of the job (A8).
+        _fetch_dataset_if_named(ctx, spec)
+
         # Resolve the engine by name. A frame-only engine is refused here.
         engine = engine_registry.get_job_engine(str(spec["engine"]))
 
@@ -132,6 +137,54 @@ def main(argv: list[str]) -> int:
             },
         )
         return 1
+
+
+# _fetch_dataset_if_named()
+# Puts the job's dataset on local disk and tells the engine where it is.
+# Inputs: the job context and the spec mapping, which is modified in place.
+# Output: none.
+# Use this before preflight, so an engine always receives a local path and never
+# a locator -- the same contract model weights already have.
+#
+# **The credential comes from the environment and is taken out of it.** The
+# parent puts it there rather than in `envelope.json`, because a job workspace is
+# never deleted (#65) and a token written into one would outlive the job on a
+# volunteer's machine. Popping it means it is not inherited by anything this
+# process goes on to start, which for a training job is Ultralytics.
+def _fetch_dataset_if_named(ctx: Any, spec: dict[str, Any]) -> None:
+
+    params = spec.setdefault("params", {})
+    url = params.get("dataset_url")
+    if not url:
+        return
+
+    # Imported here so a worker that never trains never pays for it.
+    from marp_inference_worker.training import ensure_dataset
+
+    token = os.environ.pop("MARP_FETCH_TOKEN", None)
+    headers = {"Authorization": f"Bearer {token}"} if token else None
+
+    # Reported in bytes: a four gigabyte fetch is a real part of the job's
+    # duration, and a volunteer watching a worker that says nothing for twenty
+    # minutes has no way to tell it apart from one that has hung.
+    def on_progress(received: int, total: int | None) -> None:
+        ctx.report_progress(received, total, "bytes", phase="fetching_dataset")
+
+    ctx.report_progress(0, None, "bytes", phase="fetching_dataset")
+    result = ensure_dataset(
+        url=str(url),
+        sha256=str(params["dataset_sha256"]),
+        cache_root=Path(str(params["dataset_cache"])),
+        headers=headers,
+        on_progress=on_progress,
+    )
+
+    params["data_yaml"] = str(result["data_yaml"])
+    params["dataset_path"] = str(result["path"])
+    ctx.log(
+        f"dataset ready at {result['path']}"
+        + ("" if result["fetched"] else " (already on this machine)")
+    )
 
 
 # _apply_ultralytics_environment()

@@ -83,6 +83,23 @@ while it runs, and ends in weights MARP has registered and the pool can run infe
       4.7 GB unpacked and Star4 is 10.7 GB, so two or three datasets on one volunteer
       machine is tens of gigabytes that nothing currently removes. Same shape as #65,
       and R7 only says the cache is shared, not what bounds it.
+- [ ] **A8 · security/permissions · blocking** — Where does the 4.9 GB dataset fetch
+      actually happen, and how is it authorized? Found in G2, wiring the engine up. The
+      parent runner fetches the model today (`runner.py` `_prepare_params`) and hands the
+      child a local path, which keeps the service token out of the child entirely. A
+      dataset cannot simply follow it: the fetch is minutes rather than milliseconds, and
+      `_prepare_params` runs on the runner's own loop, so a long fetch stops the
+      heartbeats for every running job on the machine and can lose this attempt's own
+      lease before it starts. Three ways out, and they trade the same thing differently:
+      (a) the child fetches, with the parent passing the resolved URL and bearer header in
+      `envelope.json` — simple, cancellable, and it can report progress, but the worker's
+      service token lands in a job workspace, and #65 established that workspaces are
+      never deleted; (b) as (a), but `child_main` overwrites the envelope as soon as it
+      has read it, bounding the exposure to seconds; (c) the parent fetches on a
+      background thread and launches only when it completes — the token never leaves the
+      parent, at the cost of a "preparing" state the runner does not have today.
+      Recommendation: (b).
+
 
 ## Decisions
 

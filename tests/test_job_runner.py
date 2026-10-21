@@ -192,6 +192,11 @@ class FakeCoordinator:
             "attempt_id": attempt_id,
             "path": str(path),
             "bytes": path.stat().st_size,
+            # Kept, because the real coordinator keeps them and because the
+            # worker deletes its own copy once the result is accepted (#65).
+            # A test asserting on the worker's leftover was asserting on
+            # something MARP never sees.
+            "content": path.read_bytes(),
         })
 
     # report_result()
@@ -1171,6 +1176,11 @@ def test_two_piece_split_covers_every_frame_exactly_once(tmp_path: Path) -> None
 
     coordinator = FakeCoordinator(offers=list(pieces))
 
+    # Make the hand-off actually transfer. The fake claims to hold every
+    # artifact already, which is right for most tests and wrong here: this one
+    # reads the observations back, and they only cross if MARP asks for them.
+    coordinator.already_have_artifact = False
+
     # Two slots, so both pieces run as they would on two workers.
     runner, _ = _runner(coordinator, tmp_path, slots=2)
     runner.ensure_enrolled()
@@ -1192,17 +1202,26 @@ def test_two_piece_split_covers_every_frame_exactly_once(tmp_path: Path) -> None
 
     assert set(frames_by_attempt) == {"attempt-piece-one", "attempt-piece-two"}
 
-    # Now read the frame indices the engine actually wrote, per piece. The
-    # summary counts could both be 300 while overlapping or skipping, so the
-    # counts alone do not settle it -- the indices do.
+    # Now read the frame indices each piece actually produced. The summary
+    # counts could both be 300 while overlapping or skipping, so the counts
+    # alone do not settle it -- the indices do.
+    #
+    # Read from what the coordinator received rather than from the worker's
+    # own disk. The workspace is removed once MARP accepts the result (#65),
+    # and the uploaded copy is the better evidence anyway: it is the one MARP
+    # will build observations from.
     indices_by_attempt: dict[str, list[int]] = {}
     for attempt_id in frames_by_attempt:
-        results_path = tmp_path / "state" / "jobs" / attempt_id / "work" / "observations.jsonl"
-        assert results_path.is_file(), f"no results file for {attempt_id}"
+        uploaded = [
+            upload for upload in coordinator.uploads
+            if upload["attempt_id"] == attempt_id
+            and upload["path"].endswith("observations.jsonl")
+        ]
+        assert len(uploaded) == 1, f"no observations reached MARP for {attempt_id}"
 
         indices_by_attempt[attempt_id] = [
             json.loads(line)["frame"]
-            for line in results_path.read_text(encoding="utf-8").splitlines()
+            for line in uploaded[0]["content"].decode("utf-8").splitlines()
             if line.strip()
         ]
 
@@ -2030,9 +2049,10 @@ def test_a_succeeded_attempt_reports_what_it_covered(tmp_path: Path) -> None:
 #
 # The child needs the worker's token to fetch a multi-gigabyte dataset, and the
 # obvious way to give it one is the envelope -- it is already a file the parent
-# writes and the child reads. That is the thing this test exists to stop. A job
-# workspace is never deleted (#65), so a token written into one would sit in
-# plaintext on a volunteer's machine beside every job it ever ran, indefinitely.
+# writes and the child reads. That is the thing this test exists to stop. A
+# workspace lives as long as the job and, when MARP refuses the result, until
+# some later start -- so a token written into one would sit in plaintext on a
+# volunteer's machine for as long as that takes (#65).
 #
 # It goes in the child's environment instead, which dies with the process and is
 # not visible in a process listing. The envelope stays exactly what it was.
@@ -2076,3 +2096,122 @@ def test_the_fetch_credential_never_reaches_the_envelope(tmp_path) -> None:
                 assert secret not in path.read_text(encoding="utf-8", errors="ignore"), path
     finally:
         job.kill(grace_s=2.0)
+
+
+# test_an_accepted_result_takes_its_workspace_with_it(tmp_path)
+# Verifies a finished attempt leaves nothing on disk (#65 R5).
+# Inputs: pytest temporary directory.
+# Output: pytest pass/fail result.
+#
+# This is what filled a volunteer's disk. Every attempt got a directory under
+# `<state>/jobs` and nothing ever removed one: 31 were found on a single
+# machine, 86 to 101 attempts a day were being made, and the directories held
+# a browser profile each. Once MARP has the events, the failure reason and the
+# artifacts, what is left is a duplicate of things MARP already holds.
+def test_an_accepted_result_takes_its_workspace_with_it(tmp_path: Path) -> None:
+
+    coordinator = FakeCoordinator(offers=[_job_for(tmp_path, "attempt-tidied", frames=5)])
+    runner, _state = _runner(coordinator, tmp_path)
+    runner.ensure_enrolled()
+
+    assert runner._poll_once() is True
+    workspace = Path(runner._jobs_by_slot[0].workspace)
+    assert workspace.is_dir(), "the job never got a workspace"
+
+    assert _wait_until(runner, lambda: len(coordinator.results) == 1), "job never reported"
+
+    assert coordinator.results[0]["outcome"] == "succeeded"
+    assert not workspace.exists(), f"{workspace} survived an accepted result"
+
+
+# test_a_refused_result_keeps_the_workspace_it_still_needs(tmp_path)
+# Verifies tidying never destroys work MARP has not taken (#65 R5).
+# Inputs: pytest temporary directory.
+# Output: pytest pass/fail result.
+#
+# The other half of the rule, and the one worth having a test for. A refused
+# result is held and re-offered at the next start, and that retry names its
+# artifacts by hash -- so deleting the workspace on the way out would turn a
+# coordinator that was briefly unhappy into work that cannot be re-sent.
+def test_a_refused_result_keeps_the_workspace_it_still_needs(tmp_path: Path) -> None:
+
+    class RefusingCoordinator(FakeCoordinator):
+        def report_result(self, *args, **kwargs):
+            raise CoordinatorError("400: outcome is not one this coordinator accepts")
+
+    coordinator = RefusingCoordinator(offers=[_job_for(tmp_path, "attempt-owed", frames=5)])
+    runner, _state = _runner(coordinator, tmp_path)
+    runner.ensure_enrolled()
+
+    assert runner._poll_once() is True
+    job = runner._jobs_by_slot[0]
+    workspace = Path(job.workspace)
+
+    assert _wait_until(runner, lambda: not job.is_running())
+    runner._service_running_jobs()
+
+    # Refused, so the slot is free but the evidence is not.
+    assert coordinator.results == []
+    assert runner._jobs_by_slot == {}
+    assert workspace.is_dir(), "a workspace was removed while its result was still owed"
+
+
+# test_leftover_workspaces_are_pruned_at_start(tmp_path)
+# Verifies a worker cleans up what previous runs left (#65 R6).
+# Inputs: pytest temporary directory.
+# Output: pytest pass/fail result.
+#
+# Removing a workspace as each job finishes cannot reach what is already there,
+# and that is most of the problem on a machine that has been running for
+# months. A worker killed mid-job also leaves one behind that no completion
+# path will ever see.
+def test_leftover_workspaces_are_pruned_at_start(tmp_path: Path) -> None:
+
+    state_dir = tmp_path / "state"
+    workspaces = state_dir / "jobs"
+
+    # Three attempts from runs that are long over, with a profile each.
+    for attempt in ("attempt-old-1", "attempt-old-2", "attempt-old-3"):
+        profile = workspaces / attempt / "chromium-profile" / "Default"
+        profile.mkdir(parents=True)
+        (profile / "Cookies").write_bytes(b"x" * 64)
+
+    coordinator = FakeCoordinator()
+    runner, state = _runner(coordinator, tmp_path)
+
+    # Through the real start sequence, so this proves the wiring and not just
+    # the method: the sweep has to happen after `report_lost_job()` has said
+    # what it still owes, and asserting on a direct call could not see that.
+    # The loop is told to exit at once, and the update check is stubbed because
+    # the fake coordinator has no check-in route.
+    runner._check_for_update = lambda force=False: None
+    runner._should_exit = True
+    runner.run_forever()
+
+    assert list(workspaces.iterdir()) == []
+    assert "3 leftover job workspace" in (state.describe()["last_notice"] or "")
+
+
+# test_tidying_never_reaches_outside_the_workspace_root(tmp_path)
+# Verifies the guard on a destructive operation (#65 R7).
+# Inputs: pytest temporary directory.
+# Output: pytest pass/fail result.
+#
+# `_discard_workspace()` runs `rmtree`. A job whose workspace is not under the
+# worker's own root is a bug somewhere above it, and deleting whatever the path
+# points at is not the way to find out.
+def test_tidying_never_reaches_outside_the_workspace_root(tmp_path: Path) -> None:
+
+    from types import SimpleNamespace
+
+    elsewhere = tmp_path / "not-ours"
+    elsewhere.mkdir()
+    (elsewhere / "keep-me").write_text("important", encoding="utf-8")
+
+    coordinator = FakeCoordinator()
+    runner, state = _runner(coordinator, tmp_path)
+
+    runner._discard_workspace(SimpleNamespace(workspace=elsewhere, attempt_id="attempt-odd"))
+
+    assert (elsewhere / "keep-me").is_file()
+    assert "refusing to remove" in (state.describe()["last_error"] or "")

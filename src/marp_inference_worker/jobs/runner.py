@@ -22,6 +22,9 @@ import socket
 # time paces the loop and the heartbeat interval.
 import time
 
+# shutil removes a finished attempt's workspace.
+import shutil
+
 from .worker_state import worker_version
 
 # Path types the state and workspace directories.
@@ -274,6 +277,9 @@ class JobRunner:
         # Where identity, workspaces and the in-flight record live.
         self._state_dir = state_dir
         self._workspace_root = state_dir / "jobs"
+        # The watch window's browser profiles, one per slot, kept for the life
+        # of the worker rather than built and thrown away per attempt (#65 R1).
+        self._profile_root = state_dir / "chromium-profiles"
         self._inflight_path = state_dir / "in-flight.json"
 
         # Results the coordinator would not take. Held here, written into the
@@ -656,7 +662,13 @@ class JobRunner:
         try:
             from marp_inference_worker.watch.display import close_orphaned_windows
 
-            orphans = close_orphaned_windows(self._workspace_root)
+            # Both roots. The profile root is where they live now; the
+            # workspace root is where a worker from before this change put
+            # them, and its ghosts are still on the machine after an upgrade.
+            orphans = sum(
+                close_orphaned_windows(root)
+                for root in (self._profile_root, self._workspace_root)
+            )
 
             if orphans:
                 self._state.note(f"closed {orphans} watch window(s) left by a previous run")
@@ -669,6 +681,15 @@ class JobRunner:
         # Report a job that did not survive the last restart, before taking new
         # work, so MARP can re-queue it promptly.
         self.report_lost_job()
+
+        # Now that every attempt the last run left behind has been reported or
+        # deliberately dropped, nothing in `jobs/` is owed to anyone, so the
+        # leftovers go (#65 R6). Deliberately after `report_lost_job()` and not
+        # before it: a workspace still named by the in-flight record is
+        # evidence, and this used to be where a machine's disk went -- 31
+        # directories found on one, the oldest months old.
+        self._prune_workspaces()
+
         self._check_for_update(force=True)
 
         # The loop. Each pass services what is running and then, if there is
@@ -945,6 +966,12 @@ class JobRunner:
         # and video -- wrong data, confidently displayed, with nothing to
         # suggest it was wrong.
         params["_attempt_id"] = envelope.attempt_id
+
+        # And where this slot's browser profile lives. Outside the workspace, so
+        # the next job in this slot reuses it instead of making Chromium fetch
+        # its whole component set again -- 70 to 120 MB a job, which is what
+        # filled a volunteer's disk (#65 R1).
+        params["watch_profile_root"] = str(self._profile_root)
 
         # Fetch the model and verify it. A job spec's model always carries a
         # sha256, so this always verifies -- unlike the frame routes, where the
@@ -1304,7 +1331,9 @@ class JobRunner:
                 failure_reason=_failure_reason(outcome, payload),
                 completed_through_frame=completed_through_frame,
             )
+            reported = True
         except CoordinatorError as error:
+            reported = False
             self._state.note_error(f"could not report result for {job.attempt_id}: {error}")
 
             # Keep everything needed to say the same thing again. The outcome
@@ -1331,6 +1360,86 @@ class JobRunner:
         self._jobs_by_slot.pop(slot_index, None)
         self._write_inflight()
         self._state.set_jobs(self._describe_jobs())
+
+        # And throw the workspace away, now that everything in it has reached
+        # MARP (#65). Only when the result was actually accepted: a refused one
+        # is held in `_unreported` and retried at the next start, and that retry
+        # re-offers the artifact by hash -- which it cannot do if the file it
+        # names has been deleted.
+        if reported:
+            self._discard_workspace(job)
+
+
+    # _discard_workspace()
+    # Removes a finished attempt's workspace.
+    # Inputs: the job whose result MARP has accepted.
+    # Output: none.
+    #
+    # The events, the failure reason and the artifacts have all reached the
+    # coordinator by the time this runs, so what is left on disk is a duplicate
+    # of things MARP already holds plus a Chromium profile. On a machine running
+    # a hundred attempts in twelve hours that was 70 to 120 MB each, kept
+    # forever, and it filled a volunteer's disk (#65).
+    #
+    # Never fatal. A workspace that cannot be removed -- a file still open, a
+    # browser that has not quite exited -- is worth a note and nothing more: the
+    # job is done and failing it now would turn a tidying problem into lost work.
+    def _discard_workspace(self, job: JobProcess) -> None:
+
+        workspace = Path(job.workspace)
+
+        # Only ever inside our own root, and only a directory named for an
+        # attempt. A path that is neither is a bug somewhere above, and deleting
+        # whatever it points at is not the way to find out.
+        try:
+            inside = workspace.resolve().parent == self._workspace_root.resolve()
+        except OSError:
+            inside = False
+
+        if not inside:
+            self._state.note_error(f"refusing to remove {workspace}: not a job workspace")
+            return
+
+        try:
+            shutil.rmtree(workspace, ignore_errors=False)
+        except OSError as error:
+            self._state.note(f"could not remove the workspace for {job.attempt_id}: {error}")
+
+    # _prune_workspaces()
+    # Removes job workspaces left by previous runs.
+    # Inputs: none.
+    # Output: none.
+    # Use this once at start, after `report_lost_job()` has said what it owes.
+    #
+    # `_discard_workspace()` keeps this from accumulating from now on, but it
+    # cannot reach what is already there: a worker upgrading into this change
+    # has every workspace it ever made, and a worker killed mid-job leaves one
+    # behind that no completion path will ever see.
+    #
+    # Never fatal, and a single failure does not stop the sweep -- one directory
+    # held open by something must not keep the other thirty.
+    def _prune_workspaces(self) -> None:
+
+        if not self._workspace_root.is_dir():
+            return
+
+        removed = 0
+        failed = 0
+
+        for workspace in self._workspace_root.iterdir():
+            if not workspace.is_dir():
+                continue
+            try:
+                shutil.rmtree(workspace, ignore_errors=False)
+                removed += 1
+            except OSError:
+                failed += 1
+
+        if removed:
+            self._state.note(f"removed {removed} leftover job workspace(s)")
+
+        if failed:
+            self._state.note_error(f"could not remove {failed} leftover job workspace(s)")
 
     # _hand_over_artifact()
     # Offers one artifact by hash and uploads it only if asked.

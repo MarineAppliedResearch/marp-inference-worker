@@ -13,6 +13,7 @@ import pytest
 
 from marp_inference_worker.watch.display import (
     WatchDisplay,
+    _DISK_CACHE_BYTES,
     _FrameChannel,
     _chromium_args,
 )
@@ -36,7 +37,12 @@ def test_chromium_keeps_occluded_watch_windows_rendering_without_the_cuda_gpu() 
     assert "--disable-background-timer-throttling" in args
     assert "--disable-backgrounding-occluded-windows" in args
     assert "--disable-renderer-backgrounding" in args
-    assert "--disable-features=CalculateNativeWinOcclusion" in args
+    # One combined flag now, because Chromium keeps only the last
+    # `--disable-features` it is given. Asserted by membership rather than by
+    # the whole string so adding another feature does not fail this test about
+    # occlusion.
+    disabled = next(a for a in args if a.startswith("--disable-features="))
+    assert "CalculateNativeWinOcclusion" in disabled.split("=", 1)[1].split(",")
     assert "--no-proxy-server" in args
     assert "--proxy-bypass-list=<-loopback>" in args
     assert "--new-window" not in args
@@ -1020,3 +1026,102 @@ def test_every_element_the_page_reaches_for_exists_on_it() -> None:
 
     assert wanted, "no element lookups found; this test has stopped testing anything"
     assert wanted <= declared, f"the page reaches for ids it does not have: {sorted(wanted - declared)}"
+
+
+# test_the_window_fetches_nothing_it_cannot_use()
+# Verifies the display surface does no background networking (#65 R4).
+# Inputs: none.
+# Output: pytest pass/fail result.
+#
+# This window loads one local page on 127.0.0.1 and runs the video player in
+# it. There is no address bar, no browsing and no user, so every background
+# service Chromium starts for a new profile is serving a feature it cannot use
+# -- and it fetched the lot per job: 35.8 MB of optimization-guide models,
+# 15.8 MB of Safe Browsing lists, 7.6 MB of omnibox suggest model. Measured at
+# 86 to 101 attempts in twelve hours on one machine, which is how a volunteer's
+# disk filled.
+def test_the_window_fetches_nothing_it_cannot_use() -> None:
+    args = _chromium_args(
+        Path("chrome.exe"),
+        "http://127.0.0.1:1234/",
+        Path("C:/worker/chromium-profiles/slot-0"),
+        "window",
+    )
+
+    assert "--disable-background-networking" in args
+    # Named separately rather than left to the umbrella flag, because this is
+    # the 36 MB one.
+    assert "--disable-component-update" in args
+    assert "--no-default-browser-check" in args
+
+    # The cache is the one part of a profile that can still grow now that the
+    # profile outlives the job, so it is bounded rather than left to Chromium.
+    assert f"--disk-cache-size={_DISK_CACHE_BYTES}" in args
+
+    # A window is ended by killing it and the profile survives that, so every
+    # launch after the first opens a profile Chromium thinks crashed.
+    assert "--hide-crash-restore-bubble" in args
+
+    # The model store is the one the two flags above do not stop. Measured on
+    # 2026-10-21 against a real Chrome: with background networking and the
+    # component updater both off, a fresh profile still reached 47 MB of
+    # `optimization_guide_model_store`. Naming the features is what stops it --
+    # 17 MB against 102 MB for today's flags.
+    disabled = next(a for a in args if a.startswith("--disable-features=")).split("=", 1)[1]
+    assert "OptimizationGuideModelDownloading" in disabled.split(",")
+    assert "OptimizationHints" in disabled.split(",")
+
+
+# test_a_slots_profile_is_reused_by_every_job_that_runs_in_it()
+# Verifies the browser profile is per slot and not per attempt (#65 R1).
+# Inputs: pytest temporary directory.
+# Output: pytest pass/fail result.
+#
+# The whole of #65. A profile was `<workspace>/chromium-profile`, so a new one
+# was built for every attempt and nothing ever removed it: 69 MB median and
+# 123 MB at worst, of which 81 MB of two profiles made days apart were
+# byte-identical. Per slot, outside the workspace, it is built once and reused.
+def test_a_slots_profile_is_reused_by_every_job_that_runs_in_it(tmp_path: Path) -> None:
+    profile_root = tmp_path / "state" / "chromium-profiles"
+
+    first = WatchDisplay(
+        "window", tmp_path / "state" / "jobs" / "attempt-1", lambda _m: None,
+        slot_index=0, slot_count=2, profile_root=profile_root,
+    )
+    second = WatchDisplay(
+        "window", tmp_path / "state" / "jobs" / "attempt-2", lambda _m: None,
+        slot_index=0, slot_count=2, profile_root=profile_root,
+    )
+
+    # Two attempts, one slot, one profile. This is the assertion the old code
+    # could not have passed.
+    assert first._profile_path() == second._profile_path()
+
+    # And outside the workspace, so removing a finished job's workspace cannot
+    # take it with it.
+    assert first._profile_path().parent == profile_root.resolve()
+    assert first._workspace not in first._profile_path().parents
+
+
+# test_two_slots_never_share_one_profile(tmp_path)
+# Verifies concurrent windows keep their own `--user-data-dir` (#65 R2).
+# Inputs: pytest temporary directory.
+# Output: pytest pass/fail result.
+#
+# This is the reason the profile is per slot rather than one for the worker.
+# Chromium will not start a second process against a `--user-data-dir` another
+# one holds -- it signals the holder instead -- and the worker finds and kills
+# its own window by matching the profile path on the process command line, so
+# two windows in one process could not be told apart.
+def test_two_slots_never_share_one_profile(tmp_path: Path) -> None:
+    profile_root = tmp_path / "chromium-profiles"
+
+    paths = {
+        WatchDisplay(
+            "window", tmp_path / "jobs" / f"attempt-{slot}", lambda _m: None,
+            slot_index=slot, slot_count=4, profile_root=profile_root,
+        )._profile_path()
+        for slot in range(4)
+    }
+
+    assert len(paths) == 4

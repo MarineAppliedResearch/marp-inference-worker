@@ -23,11 +23,41 @@ import cv2
 _FRAME_ACK_TIMEOUT_S = 60.0
 
 
-# How often to ask whether anything still holds this attempt's Chromium profile,
+# How often to ask whether anything still holds this slot's Chromium profile,
 # once the process we launched has exited. A second is far below what a person
 # would notice in a window going away, and the check costs a process spawn on
 # Windows, so polling faster would be paying real money for nothing.
 _PROFILE_POLL_SECONDS = 1.0
+
+
+# A bound on Chromium's page cache, in bytes.
+#
+# The profile is reused by every job in its slot now rather than thrown away
+# after one, so the cache is the one part of it that can still grow without a
+# limit. 32 MB is generous for a single local page: the frames are pushed over
+# the display channel and never go near it.
+_DISK_CACHE_BYTES = 32 * 1024 * 1024
+
+
+# Chromium features the watch window turns off.
+#
+# `CalculateNativeWinOcclusion` is the old one and is about drawing: Windows
+# decides a covered window need not render, which is right for a browser and
+# wrong for a window whose whole job is to be rendering.
+#
+# The optimization-guide three are about disk, and they are the ones that
+# matter. `--disable-background-networking` and `--disable-component-update`
+# together do *not* stop the model store: measured on 2026-10-21 against a real
+# Chrome, a profile with both still reached 47 MB of
+# `optimization_guide_model_store`, which was most of what was left. Naming the
+# features is what stops it -- the same measurement with these added settled at
+# 17 MB against 102 MB for today's flags.
+_DISABLED_FEATURES = (
+    "CalculateNativeWinOcclusion",
+    "OptimizationHints",
+    "OptimizationGuideModelDownloading",
+    "OptimizationGuideOnDeviceModel",
+)
 
 
 # _window_position()
@@ -302,6 +332,30 @@ def _chromium_args(
         f"--user-data-dir={profile}",
         "--no-first-run",
         "--disable-sync",
+        "--no-default-browser-check",
+        # A window is ended by killing it, and the profile outlives that now,
+        # so every launch after the first opens one Chromium considers to have
+        # crashed. Without this the volunteer gets "Restore pages?" over the
+        # video.
+        "--hide-crash-restore-bubble",
+        # This window is a display surface for marp-video-player and nothing
+        # else: one local page on 127.0.0.1, no address bar, no browsing, no
+        # user. So every background service Chromium starts for a new profile
+        # is serving a feature it cannot use -- and a fresh profile per job
+        # fetched the lot, every job: 35.8 MB of optimization-guide models,
+        # 15.8 MB of Safe Browsing lists, 7.6 MB of omnibox suggest model and
+        # 7.6 MB of component CRX cache. 81 MB of two 122 MB profiles made days
+        # apart were byte-identical, which is what "the same bytes, re-fetched"
+        # looks like when you measure it (#65).
+        #
+        # `--disable-background-networking` is the umbrella: no Safe Browsing
+        # updates, no field trials, no upgrade detector. It does not stop the
+        # optimization-guide model store, and neither does naming the component
+        # updater -- that one is turned off by feature, below, which is where
+        # the 36 MB actually goes.
+        "--disable-background-networking",
+        "--disable-component-update",
+        f"--disk-cache-size={_DISK_CACHE_BYTES}",
         # The display server is loopback-only. Corporate/system proxy settings can
         # otherwise leave the app window stuck on its raw 127.0.0.1 URL.
         "--no-proxy-server",
@@ -317,7 +371,10 @@ def _chromium_args(
         "--disable-background-timer-throttling",
         "--disable-backgrounding-occluded-windows",
         "--disable-renderer-backgrounding",
-        "--disable-features=CalculateNativeWinOcclusion",
+        # One flag, not several. Chromium takes the last `--disable-features`
+        # and discards the rest, so a second one here would silently undo the
+        # occlusion fix above it rather than add to it.
+        f"--disable-features={','.join(_DISABLED_FEATURES)}",
         # Keep Chromium off the inference GPU. This laptop class renders the
         # canvas through Chromium's CPU paint path when GPU compositing is off.
         "--disable-gpu",
@@ -602,9 +659,15 @@ def _bring_to_front(process_id: int, attempts: int = 40) -> None:
 
 # close_orphaned_windows()
 # Ends watch windows left behind by a previous run of this worker.
-# Inputs: the directory job workspaces live under.
+# Inputs: a directory watch profiles live under -- the profile root, and the
+#   job workspace root for ghosts left by a worker from before #65 moved them.
 # Output: how many processes were asked to stop.
 # Use this once at start, before taking work.
+#
+# More load-bearing since the profile became per slot and is reused: a ghost
+# holding `slot-0` is not merely untidy, it captures the next launch, because
+# Chromium routes a second start against a held `--user-data-dir` into the
+# process already holding it rather than starting its own.
 #
 # `WatchDisplay.close()` only runs in the process that owns the display, so a
 # worker that was killed -- by a crash, a reaper, or somebody closing the
@@ -618,12 +681,12 @@ def _bring_to_front(process_id: int, attempts: int = 40) -> None:
 # screen sees a label that is wrong for the work being done, with no way to tell
 # it is a ghost.
 #
-# Matched on the workspace root, so it can only ever reach this worker's own
-# windows: the volunteer's browser and any other worker's windows use different
-# profile paths.
-def close_orphaned_windows(workspace_root: Path) -> int:
+# Matched on the root, so it can only ever reach this worker's own windows: the
+# volunteer's browser and any other worker's windows use different profile
+# paths.
+def close_orphaned_windows(profile_root: Path) -> int:
 
-    root = str(Path(workspace_root).resolve())
+    root = str(Path(profile_root).resolve())
 
     if sys.platform != "win32":
         # Matched on the profile path, not the process name. That is what keeps
@@ -934,6 +997,7 @@ class WatchDisplay:
         slot_count: int = 1,
         video_frames: int | None = None,
         job_start_frame: int | None = None,
+        profile_root: Path | None = None,
     ) -> None:
         self._mode = screen_mode
         # Which of the worker's windows this is, and how many there are. Only
@@ -945,6 +1009,11 @@ class WatchDisplay:
         # Chromium must receive an absolute profile path or a relative worker
         # state directory is applied twice and the viewer never connects.
         self._workspace = workspace.resolve()
+        # Where this slot's browser profile lives. Outside the workspace, so it
+        # survives the job and is reused by the next one in this slot (#65 R1).
+        # The workspace is the fallback for a caller that does not supply one --
+        # callers outside the job path, which have no worker state directory.
+        self._profile_root = (profile_root or workspace).resolve()
         self._warn = warn
         self._job_id = job_id
         self._attempt_id = attempt_id
@@ -972,6 +1041,21 @@ class WatchDisplay:
         # one. Not a fault: it is the measure of how much work the display has
         # stopped doing.
         self._skipped = 0
+
+    # _profile_path()
+    # Where this slot's browser profile lives.
+    # Inputs: none; reads the profile root and the slot index.
+    # Output: the directory to give Chromium as `--user-data-dir`.
+    #
+    # One per slot, not per attempt. A slot runs one job at a time so nothing
+    # contends for it, and Chromium will not start a second process against a
+    # `--user-data-dir` another one holds -- which is why this is per slot
+    # rather than a single profile for the whole worker (#65 A1).
+    #
+    # Its own method so the rule can be asserted without launching a browser.
+    def _profile_path(self) -> Path:
+
+        return self._profile_root / f"slot-{self._slot_index}"
 
     @staticmethod
     def _install_root() -> Path:
@@ -1086,7 +1170,8 @@ class WatchDisplay:
             self._server.requests_seen = []
             threading.Thread(target=self._server.serve_forever, daemon=True).start()
             port = self._server.server_address[1]
-            profile = self._workspace / "chromium-profile"
+            profile = self._profile_path()
+            profile.mkdir(parents=True, exist_ok=True)
             # Remembered so close() can find the browser by the profile
             # it holds, which survives Chromium changing process.
             self._profile_dir = profile

@@ -542,6 +542,15 @@ class TrackingEngine(BaseEngine):
                 # when it reports nothing, which some streams do (#60 R4).
                 video_frames=geometry.total_frames or None,
                 job_start_frame=job_start_frame,
+                # One browser profile per slot, kept beside the worker's other
+                # state rather than inside this attempt's workspace, so the
+                # next job in this slot reuses it (#65 R1). Absent only for a
+                # caller outside the job path, which has no state directory;
+                # WatchDisplay then falls back to the workspace.
+                profile_root=(
+                    Path(str(params["watch_profile_root"]))
+                    if params.get("watch_profile_root") else None
+                ),
             )
             if not watch.start():
                 watch = None

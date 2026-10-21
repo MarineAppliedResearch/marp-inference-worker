@@ -233,6 +233,96 @@ def _workspace_lifecycle(scratch: Path) -> None:
     print("   last notice   " + str(state.describe()["last_notice"]))
 
 
+# How long two concurrent windows are left up. Shorter than the settle above:
+# this part is about whether both exist and stay independent, and the size
+# question is already answered by parts 0 to 2.
+_CONCURRENT_S = 30.0
+
+
+# _two_slots_at_once()
+# Opens two watch windows at the same time and checks they stay separate.
+# Inputs: the profile root to put both profiles under.
+# Output: none; prints what it saw, and raises if the rule is broken.
+#
+# This is the case the per-slot decision exists for, and the one a single-slot
+# run cannot see. Chromium will not start a second process against a
+# `--user-data-dir` another one holds -- it signals the holder and exits -- so
+# two windows sharing a profile would be one process owning both, and
+# `_kill_by_profile()` would take down a running job's window when the other
+# job ended. Two profiles is what stops that, and this is where it is checked.
+def _two_slots_at_once(profile_root: Path, workspace_root: Path) -> dict:
+
+    displays = []
+    for slot in (0, 1):
+        workspace = workspace_root / ("attempt-slot-" + str(slot))
+        workspace.mkdir(parents=True, exist_ok=True)
+        display = WatchDisplay(
+            screen_mode="window",
+            workspace=workspace,
+            warn=lambda message: print("   [warn] " + message),
+            job_id="slot-" + str(slot),
+            attempt_id="attempt-slot-" + str(slot),
+            model_name="rockfish5",
+            species_names=["Lingcod", "Vermilion Rockfish"],
+            slot_index=slot,
+            slot_count=2,
+            profile_root=profile_root,
+        )
+        if not display.start():
+            raise SystemExit("the watch window would not start for slot " + str(slot))
+        displays.append(display)
+
+    first, second = displays
+
+    # Two profiles, and two processes. A single process owning both windows is
+    # exactly the failure this is looking for.
+    print("   slot 0 profile  " + first._profile_dir.name)
+    print("   slot 1 profile  " + second._profile_dir.name)
+    print("   different       " + str(first._profile_dir != second._profile_dir))
+    print("   two processes   " + str(first._process.pid != second._process.pid)
+          + "  (" + str(first._process.pid) + ", " + str(second._process.pid) + ")")
+
+    # Both drawing, side by side, for long enough to look at.
+    frames = [
+        SimpleNamespace(image=np.full((360, 640, 3), shade, dtype=np.uint8))
+        for shade in (40, 90)
+    ]
+    print("   both drawing for " + str(int(_CONCURRENT_S)) + "s -- two windows should be on screen")
+    deadline = time.monotonic() + _CONCURRENT_S
+    while time.monotonic() < deadline:
+        for display, frame in zip(displays, frames):
+            display.present(frame, int(time.monotonic()), [], range_start=0, range_end=100)
+        time.sleep(1.0)
+
+    print("   slot 0 window alive " + str(first._profile_in_use()))
+    print("   slot 1 window alive " + str(second._profile_in_use()))
+
+    # The part that matters: one job ending must not close the other's window.
+    # Under one shared profile it would, because the kill matches on the
+    # profile path and both windows would be behind the same one.
+    print("   closing slot 0 only...")
+    first.close()
+    time.sleep(5.0)
+
+    still_up = second._profile_in_use()
+    print("   slot 0 window alive " + str(first._profile_in_use()))
+    print("   slot 1 window alive " + str(still_up))
+    print("   slot 1 still draws  " + str(
+        second.present(frames[1], 999, [], range_start=0, range_end=100)))
+
+    second.close()
+    time.sleep(3.0)
+
+    if not still_up:
+        raise SystemExit("closing slot 0 took slot 1's window with it")
+
+    return {
+        "two_profiles": first._profile_dir != second._profile_dir,
+        "two_processes": first._process.pid != second._process.pid,
+        "closing_one_left_the_other_up": still_up,
+    }
+
+
 def main() -> int:
 
     scratch = Path(tempfile.mkdtemp(prefix="marp-65-"))
@@ -273,12 +363,20 @@ def main() -> int:
         print("\n4. The workspace lifecycle, through the real runner")
         _workspace_lifecycle(scratch)
 
+        print("")
+        print("5. Two slots at once -- the case per-slot profiles exist for")
+        concurrent = _two_slots_at_once(profile_root, scratch / "state" / "jobs")
+        print("   profiles now    " + str(sorted(p.name for p in profile_root.iterdir())))
+        for entry in sorted(profile_root.iterdir()):
+            print("      " + str(_size_mb(entry)).rjust(7) + " MB  " + entry.name)
+
         print("\n" + json.dumps({
             "profile_with_the_old_flags_mb": baseline_mb,
             "profile_after_first_job_mb": first_mb,
             "profile_after_second_job_mb": second_mb,
             "profile_is_per_slot": first == second,
             "profile_outside_workspace": profile_root in first.parents,
+            **concurrent,
         }, indent=2))
     finally:
         shutil.rmtree(scratch, ignore_errors=True)

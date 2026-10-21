@@ -34,8 +34,13 @@ removing the `_prune_workspaces()` call failed *leftover workspaces are pruned a
   real frame and are closed the way a job closes one, but the frames come from the script
   rather than from a model over real video. What that leaves unproven is the window under
   load, not the window.
-- **One slot only.** Nothing has opened two windows at once, which is the case the
-  per-slot decision exists for.
+- **Whether a long-lived profile creeps.** `slot-0` above was used three times and read
+  11.2, 11.2 then 15.2 MB, so it is not perfectly flat. Six headless launches of one
+  profile, each force-killed, stayed at 12 MB -- but headless produces no `BrowserMetrics`
+  and windowed mode does, so that run does not settle the windowed case. It is bounded in
+  the sense that matters here (`--disk-cache-size` caps the cache, and 15 MB is a quarter
+  of one old profile against one per job), but a profile that now lives for the life of
+  the worker should be measured over more launches than three.
 - Nothing measures a worker's disk over a day, which is the number the issue is about.
 
 ## Results
@@ -91,7 +96,32 @@ back out, so the comparison is made by the script rather than quoted from elsewh
    last notice   removed 5 leftover job workspace(s)
 ```
 
-Four things that are settled by this and were not settled by the suite:
+And two slots at once, which a single-slot run cannot see:
+
+```
+5. Two slots at once -- the case per-slot profiles exist for
+   slot 0 profile  slot-0
+   slot 1 profile  slot-1
+   different       True
+   two processes   True  (30244, 8168)
+   both drawing for 30s -- two windows should be on screen
+   slot 0 window alive True
+   slot 1 window alive True
+   closing slot 0 only...
+   slot 0 window alive False
+   slot 1 window alive True
+   slot 1 still draws  True
+   profiles now    ['slot-0', 'slot-1']
+         15.2 MB  slot-0
+         11.2 MB  slot-1
+```
+
+**Closing one job's window left the other's running and still drawing.** That is the whole
+case for per slot rather than one profile for the worker: two `--user-data-dir`s means two
+processes, so `_kill_by_profile()` reaches exactly one window. Behind a single shared
+profile both windows would be one process and ending either job would take both down.
+
+Five things that are settled by this and were not settled by the suite:
 
 - **The window still draws.** `drew a frame True` on all three, so nothing in the new
   flags stops the page rendering -- which was the plausible way this change could break

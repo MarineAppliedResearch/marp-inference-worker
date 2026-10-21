@@ -1532,7 +1532,8 @@ class WatchDisplay:
         # old code read that as "already closed" and killed nothing, so the
         # window outlived its job -- showing a frozen frame and an error from a
         # server that had shut down underneath it. The profile directory is
-        # unique to this job, so anything holding it is ours.
+        # this slot's and no other worker's, and a slot runs one job at a time,
+        # so anything holding it is this job's window.
         self._kill_by_profile()
 
         # Off Windows, only signal the pid if it is still *our* browser.

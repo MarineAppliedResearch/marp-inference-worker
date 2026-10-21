@@ -30,11 +30,12 @@ removing the `_prune_workspaces()` call failed *leftover workspaces are pruned a
 
 ## Known gaps
 
-- **Nothing has run a real watch window with these flags.** The measurement below used the
-  same Chrome and the same flags, headless, against `about:blank`. It settles what gets
-  fetched; it does not settle that the window still draws. That needs a GPU job.
-- **The profile is now reused after a force-kill**, which no run here has exercised twice.
-  `--hide-crash-restore-bubble` is there for it, untested.
+- **No real inference job has run with these flags.** The windows below are real, draw a
+  real frame and are closed the way a job closes one, but the frames come from the script
+  rather than from a model over real video. What that leaves unproven is the window under
+  load, not the window.
+- **One slot only.** Nothing has opened two windows at once, which is the case the
+  per-slot decision exists for.
 - Nothing measures a worker's disk over a day, which is the number the issue is about.
 
 ## Results
@@ -50,7 +51,64 @@ That failure is **not from this change**: it fails identically on `develop` at `
 the commit this branch starts from. `/status` answers `engines` in a shape the test does
 not expect (`KeyError: 'engine'`). Named and left alone.
 
-### What a profile actually costs, measured
+### A real window, a real profile, 2026-10-21
+
+`scripts/verify_watch_storage.py` on this machine, against the Chrome at
+`C:\Program Files\Google\Chrome\Application\chrome.exe`. Three real watch windows in
+sequence, each drawing a frame and left up for 75 seconds, then a real job through the
+real runner. The baseline window is driven by the same code with the new flags stripped
+back out, so the comparison is made by the script rather than quoted from elsewhere.
+
+```
+0. BASELINE -- the flags as they were before #65
+   drew a frame True
+   profile is   61.3 MB
+         46.0 MB  optimization_guide_model_store
+          8.9 MB  Default
+
+1. First job in slot 0 -- a profile that has never existed
+   drew a frame True
+   profile is   11.2 MB
+          4.9 MB  Default
+          4.0 MB  BrowserMetrics
+
+2. Second job in slot 0 -- the same profile, reused
+   drew a frame True
+   profile is   11.2 MB
+   same directory as the first: True
+
+3. Where it all lives
+      11.2 MB  state/chromium-profiles
+       0.0 MB  state/jobs
+
+4. The workspace lifecycle, through the real runner
+   before start  ['attempt-a', 'attempt-b', 'attempt-old-1', 'attempt-old-2', 'attempt-old-3']
+   after prune   []
+   job running   ['attempt-demo']
+   reported      succeeded
+   after result  []
+   workspace survived: False
+   last notice   removed 5 leftover job workspace(s)
+```
+
+Four things that are settled by this and were not settled by the suite:
+
+- **The window still draws.** `drew a frame True` on all three, so nothing in the new
+  flags stops the page rendering -- which was the plausible way this change could break
+  the feature rather than merely shrink it.
+- **11.2 MB against 61.3 MB** for the same window with the old flags, and the whole of the
+  difference is `optimization_guide_model_store`.
+- **A second job in the same slot costs nothing.** Identical directory, identical size.
+  Under the old behaviour that second job was another 61 MB.
+- **`state/jobs` is 0.0 MB** at the end, with its five leftovers -- including the two the
+  watch windows above had just made -- pruned at start, and the demo job's own workspace
+  gone once MARP took the result.
+
+The baseline number is if anything flattering to the old behaviour: it is the size at 75
+seconds, and the headless comparison below shows a baseline profile still climbing at that
+point, reaching 102 MB by three minutes, while a flagged one is flat from 90 seconds.
+
+### What a profile actually costs, measured headless
 
 Real Chrome (`C:\Program Files\Google\Chrome\Application\chrome.exe`), headless, three
 fresh profiles against `about:blank`, sampled every 15s for three minutes.

@@ -30,18 +30,21 @@ removing the `_prune_workspaces()` call failed *leftover workspaces are pruned a
 
 ## Known gaps
 
-- **No real inference job has run with these flags.** The windows below are real, draw a
-  real frame and are closed the way a job closes one, but the frames come from the script
-  rather than from a model over real video. What that leaves unproven is the window under
-  load, not the window.
-- **Whether a long-lived profile creeps.** `slot-0` above was used three times and read
-  11.2, 11.2 then 15.2 MB, so it is not perfectly flat. Six headless launches of one
-  profile, each force-killed, stayed at 12 MB -- but headless produces no `BrowserMetrics`
-  and windowed mode does, so that run does not settle the windowed case. It is bounded in
-  the sense that matters here (`--disk-cache-size` caps the cache, and 15 MB is a quarter
-  of one old profile against one per job), but a profile that now lives for the life of
-  the worker should be measured over more launches than three.
-- Nothing measures a worker's disk over a day, which is the number the issue is about.
+Both of the gaps this file first recorded -- no real inference job, and whether a
+long-lived profile creeps -- were closed by the installed run below. What is left:
+
+- **One slot only.** Two windows at once are covered by the script, but no real job has
+  run concurrently with another on this machine.
+- Nothing measures a worker's disk over a *day*, which is the number the issue quotes.
+  What is measured is one real job and the state a hundred of them left behind.
+- **The install still grows by version.** `installation/updater.py` keeps every installed
+  version side by side, and after upgrading to 0.1.5 the machine held
+  `versions/0.1.4-cu128` at 5,808 MB beside `versions/0.1.5-cu128` at 5,808 MB -- a
+  complete second copy of the Python runtime with torch (4,992 MB) and of Chromium
+  (807 MB). Confirmed as two real directories rather than the junction double-count
+  `AGENTS.md` warns about: different inodes, neither a reparse point. That is named in #65
+  as secondary and separate, and on these numbers it is four times the problem the
+  workspaces were.
 
 ## Results
 
@@ -56,7 +59,71 @@ That failure is **not from this change**: it fails identically on `develop` at `
 the commit this branch starts from. `/status` answers `engines` in a shape the test does
 not expect (`KeyError: 'engine'`). Named and left alone.
 
+### The installed worker, on real jobs, 2026-10-21
+
+**This is the measurement that counts, and it is twelve times better than the synthetic
+ones below, because those under-measured the problem.**
+
+ABYSS had been running the pilot build, 0.1.4-cu128, which predates this change. It held
+three leftover job workspaces:
+
+```
+1429 MB  state/jobs
+ 482 MB    state/jobs/12753
+ 482 MB    state/jobs/12754
+ 466 MB    state/jobs/12755
+```
+
+A real workspace is **482 MB**, not the 70-120 MB #65 recorded off a checkout's spare
+copies, and the profile is all of it -- `work`, `ultralytics`, `envelope.json` and the
+render proof together are under 2 MB, exactly as the issue said. What fills it:
+
+| | 0.1.4, per job | 0.1.5, one per slot |
+| --- | --- | --- |
+| `component_crx_cache` | 237 MB | 1 MB |
+| `SODALanguagePacks` | 194 MB | absent |
+| `SODA` | 35 MB | absent |
+| `OnDeviceHeadSuggestModel` | 8 MB | absent |
+| `optimization_guide_model_store` | -- | absent |
+| everything else | ~12 MB | 7 MB |
+| **total** | **482 MB** | **8 MB** |
+
+**SODA is Chrome's on-device speech recognition** -- live-caption models, a
+speaker-diarization encoder, a 48 MB rank-candidates model. Fetched per job, on a
+volunteer's machine, by a window that shows a silent video feed and has no microphone and
+no captions. It is the single largest thing in a real profile and **it never appeared in
+any synthetic measurement**, because a window that is up for 75 seconds and idle does not
+trigger it. That is why the numbers below are too kind to the old behaviour.
+
+After installing 0.1.5 built from `develop` at `9ae9da1`:
+
+```
+BEFORE   active 0.1.4-cu128   jobs: 3 dirs, 1429 MB
+AFTER    active 0.1.5-cu128   jobs: 0 dirs,    0 MB
+```
+
+The start-up prune reclaimed **1.4 GB on a real machine, first run**. Then one real job
+through the installed worker -- job 21746, 6,000 frames of Jellyfin video, attempt 19200,
+succeeded and ingested at 12:11:16:
+
+```
+12:08:36  starting    0/6000   profile=-    jobs=1MB  soda=0
+12:09:37  inferring 2130/6000   profile=5MB  jobs=1MB  soda=0
+12:10:38  inferring 4470/6000   profile=9MB  jobs=1MB  soda=0
+12:11:09  inferring 5790/6000   profile=9MB  jobs=1MB  soda=0
+          succeeded  6000/6000  through=8000
+          profile: slot-0, 8 MB.  SODA present: 0.  jobs left: 0 dirs, 0 MB
+```
+
+So on a real workload: **8 MB against 482 MB, once per slot rather than once per job**,
+and nothing left behind afterwards.
+
 ### A real window, a real profile, 2026-10-21
+
+**Synthetic, and it understates the fix by about twelve times.** Kept because it is
+repeatable on any machine with no worker installed and no GPU, and because it is what
+proves the window still draws. Do not quote its numbers as the size of the problem -- the
+installed run above is the one to quote.
 
 `scripts/verify_watch_storage.py` on this machine, against the Chrome at
 `C:\Program Files\Google\Chrome\Application\chrome.exe`. Three real watch windows in
@@ -139,6 +206,9 @@ seconds, and the headless comparison below shows a baseline profile still climbi
 point, reaching 102 MB by three minutes, while a flagged one is flat from 90 seconds.
 
 ### What a profile actually costs, measured headless
+
+**Synthetic, and the oldest of the three.** Its value is the A/B that found which flag
+mattered, not its absolute numbers.
 
 Real Chrome (`C:\Program Files\Google\Chrome\Application\chrome.exe`), headless, three
 fresh profiles against `about:blank`, sampled every 15s for three minutes.

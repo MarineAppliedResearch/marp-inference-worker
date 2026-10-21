@@ -50,8 +50,14 @@ _DISK_CACHE_BYTES = 32 * 1024 * 1024
 # together do *not* stop the model store: measured on 2026-10-21 against a real
 # Chrome, a profile with both still reached 47 MB of
 # `optimization_guide_model_store`, which was most of what was left. Naming the
-# features is what stops it -- the same measurement with these added settled at
-# 17 MB against 102 MB for today's flags.
+# features is what stops it.
+#
+# On a real job the whole set is worth far more than that A/B suggested: an
+# installed worker's profile went from 482 MB per job to 8 MB per slot. The
+# biggest single item on a real machine is `SODALanguagePacks` at 194 MB --
+# Chrome's on-device speech models, in a window with no microphone -- and it
+# never appears in a short idle test, which is why the synthetic numbers are
+# too kind to the old behaviour. See `.marp/verification.md`.
 _DISABLED_FEATURES = (
     "CalculateNativeWinOcclusion",
     "OptimizationHints",

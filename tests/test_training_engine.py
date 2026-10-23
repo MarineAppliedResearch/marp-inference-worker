@@ -368,10 +368,12 @@ def test_the_hazardous_arguments_are_still_refused(tmp_path) -> None:
         assert hazard in ignored
         assert hazard not in settings
 
-    # `device` is in the engine's own key list rather than the allow-list: the
-    # worker resolves it, so a job naming one is neither honoured nor worth
-    # reporting back as a setting nobody recognised.
+    # `device` is in the engine's own key list rather than the allow-list, so it
+    # is neither a setting nor an ignored one. run() reads it separately, hands
+    # it to resolve_device() and passes the answer to train() itself -- leaving
+    # it here would pass `device` twice and let the request through unresolved.
     assert "device" not in settings
+    assert "device" not in ignored
 
 
 # test_the_settings_report_says_which_device_and_which_build()

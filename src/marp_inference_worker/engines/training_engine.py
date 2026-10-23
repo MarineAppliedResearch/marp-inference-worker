@@ -128,17 +128,17 @@ _TRAINING_DEFAULTS: dict[str, Any] = {
 # artifact hashes and nothing else, and the engine's own summary reaches the
 # coordinator only inside a log line, where nothing can read a column out of it.
 #
-# `source` is "worker", and it is the load-bearing part. Both of these are
-# deliberately *not* the submitter's to set -- `device` is excluded from the
-# allow-list on purpose, because a job that asked for cuda:1 must not get it
-# ahead of the slot it was pinned to -- so the record has to say that the worker
-# decided them, or a reader cannot tell a resolved device from a requested one.
+# `source` is "worker", and it is the load-bearing part. Neither value is
+# something the submitter set. A job may *request* a device, but what it gets is
+# whatever resolve_device() makes of that against this machine -- "auto" becomes
+# this slot's card or the CPU, and a card this worker does not have is a refusal
+# -- so the only device that is a fact is the resolved one. Saying "worker" is
+# what lets a reader tell it apart from a request.
 def _run_provenance(device: str) -> dict[str, dict[str, Any]]:
 
     return {
         # Named for MARP's `training_runs.compute_device`. The resolved device,
-        # which is the only one that is a fact: what the job asked for is in
-        # `ignored` if it asked at all.
+        # which may or may not be the one the job named.
         "compute_device": {
             "value": device,
             "type": "str",

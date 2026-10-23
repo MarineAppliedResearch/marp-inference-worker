@@ -14,8 +14,8 @@ ignored.
 
 Separately, three of `training_runs`' columns in MARP_API are never filled. Two of them
 can only be filled by this worker, because it is the only thing that knows the answer:
-`compute_device`, which the worker resolves for itself rather than taking from the
-submitter, and `train_script_commit`, which is which build of this worker ran.
+`compute_device`, which is whatever the worker resolved rather than whatever the job
+asked for, and `train_script_commit`, which is which build of this worker ran.
 
 When this is done a training job can set the loss weights and have them honoured, and
 every training attempt tells MARP which GPU it used and which build of the worker
@@ -57,8 +57,9 @@ writes it to `gpu_attempt_settings` and `gpu_attempt_ignored_params`
   Ultralytics rather than being reported ignored.
 - **R2** A training job may set `mask_ratio`, cast to int.
 - **R3** Widening the allow-list does not admit `project`, `name`, `resume` or `device`.
-- **R4** Every training attempt reports `compute_device` -- the device it resolved, not
-  the one it was asked for -- in its settings report, with `source: "worker"`.
+- **R4** Every training attempt reports `compute_device` -- the device `resolve_device()`
+  settled on, which a job's request is only one input to -- in its settings report, with
+  `source: "worker"`.
 - **R5** Every training attempt reports `train_script_commit` the same way, and always has
   an answer: a commit sha from a checkout, the package version from an installed wheel.
 - **R6** A run started from a checkout with uncommitted changes says so, so a provenance
@@ -89,7 +90,7 @@ Three things the API side needs to know:
 
 - **`source: "worker"` is the discriminator.** Everything else in `settings` is
   `"job"`. A reader must not treat `compute_device` as something the submitter chose; it
-  is specifically what the worker resolved instead.
+  is what the worker resolved, which a job's request is only one input to.
 - **`train_script_commit` has two forms and they are distinguishable.** Forty hex
   characters is a git commit, optionally suffixed `+dirty`. Anything else is the worker's
   package version, which is the honest answer from a volunteer's wheel.

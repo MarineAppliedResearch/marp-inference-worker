@@ -15,6 +15,11 @@
 # pytest provides raises and monkeypatch.
 import pytest
 
+# sys and types build the stand-in `ultralytics` module one test installs, so a
+# whole run() can be exercised without a GPU or real weights.
+import sys
+import types
+
 # Path builds the fixture dataset and weights.
 from pathlib import Path
 
@@ -296,3 +301,198 @@ def test_every_epoch_of_a_full_run_is_reported(tmp_path) -> None:
 
     assert state.epochs_done == 4
     assert [step for step, _, _ in ctx.metrics] == [1, 2, 3, 4]
+
+
+# test_the_loss_weights_reach_ultralytics()
+# Verifies box, cls and dfl are honoured rather than reported ignored.
+# Inputs: tmp_path.
+# Output: pytest pass/fail result.
+#
+# These are the knobs for the trade MARP actually cares about -- recall against
+# false positives, because a biologist rejecting a bad tile in a review mosaic
+# is cheap and a missed animal costs re-reviewing video. The dashboard has
+# offered them on its detection form since the training page was wired; the
+# worker did not accept them, so a run that set them trained at the defaults and
+# said nothing a reader of the record would notice.
+def test_the_loss_weights_reach_ultralytics(tmp_path) -> None:
+
+    spec = a_runnable_spec(tmp_path, box=9.0, cls=1.25, dfl=2.0)
+
+    settings, ignored = TrainingEngine()._training_settings(spec["params"])
+
+    assert settings["box"] == pytest.approx(9.0)
+    assert settings["cls"] == pytest.approx(1.25)
+    assert settings["dfl"] == pytest.approx(2.0)
+
+    for weight in ("box", "cls", "dfl"):
+        assert weight not in ignored
+
+
+# test_mask_ratio_is_an_integer_divisor()
+# Verifies mask_ratio is cast as the int Ultralytics lists it as.
+# Inputs: tmp_path.
+# Output: pytest pass/fail result.
+#
+# It is a downsample divisor, used as `h // mask_ratio`. A float would reach
+# Ultralytics and fail somewhere inside the segmentation dataloader rather than
+# here, so the cast is what turns a wrong value into a settings report.
+def test_mask_ratio_is_an_integer_divisor(tmp_path) -> None:
+
+    settings, ignored = TrainingEngine()._training_settings(
+        a_runnable_spec(tmp_path, mask_ratio="8")["params"]
+    )
+
+    assert settings["mask_ratio"] == 8
+    assert isinstance(settings["mask_ratio"], int)
+    assert "mask_ratio" not in ignored
+
+
+# test_the_hazardous_arguments_are_still_refused()
+# Verifies widening the allow-list did not widen it past its reason for being.
+# Inputs: tmp_path.
+# Output: pytest pass/fail result.
+#
+# The allow-list exists because a handful of `model.train()` arguments change
+# what the result means rather than how well it trains. Adding four loss weights
+# is a different kind of change and must not drag those in behind it; this is
+# the test that says so out loud, where the one above only says the four arrived.
+def test_the_hazardous_arguments_are_still_refused(tmp_path) -> None:
+
+    spec = a_runnable_spec(
+        tmp_path, project="/tmp/elsewhere", name="theirs", resume=True, device="cuda:3"
+    )
+
+    settings, ignored = TrainingEngine()._training_settings(spec["params"])
+
+    for hazard in ("project", "name", "resume"):
+        assert hazard in ignored
+        assert hazard not in settings
+
+    # `device` is in the engine's own key list rather than the allow-list: the
+    # worker resolves it, so a job naming one is neither honoured nor worth
+    # reporting back as a setting nobody recognised.
+    assert "device" not in settings
+
+
+# test_the_settings_report_says_which_device_and_which_build()
+# Verifies the two facts only the worker can state reach MARP's record.
+# Inputs: none.
+# Output: pytest pass/fail result.
+#
+# `training_runs.compute_device` and `training_runs.train_script_commit` are
+# columns nothing filled. Only the worker knows either: it resolves the device
+# itself, deliberately not from the submitter's request, and it is the thing
+# that knows which build it is. Both are reported as `source: "worker"`, which
+# is what lets a reader tell a resolved device from a requested one.
+def test_the_settings_report_says_which_device_and_which_build() -> None:
+
+    provenance = training_module._run_provenance("cuda:1")
+
+    assert provenance["compute_device"]["value"] == "cuda:1"
+    assert provenance["compute_device"]["source"] == "worker"
+
+    commit = provenance["train_script_commit"]
+    assert commit["source"] == "worker"
+    assert isinstance(commit["value"], str) and commit["value"]
+
+
+# StubTrainedModel
+# A YOLO stand-in that records the arguments train() was called with.
+# Real Ultralytics is not used here: it would want a CUDA device, real weights
+# and twenty minutes to answer a question about argument plumbing.
+class StubTrainedModel:
+
+    def __init__(self, weights_path) -> None:
+
+        self.weights_path = weights_path
+        self.train_kwargs: dict = {}
+        self.callbacks: dict = {}
+
+    def add_callback(self, event, handler) -> None:
+        self.callbacks[event] = handler
+
+    def train(self, **kwargs) -> None:
+        self.train_kwargs = kwargs
+
+
+# RunContext
+# Enough of a JobContext for a whole run(), keeping every report it was given.
+class RunContext(RecordingContext):
+
+    def __init__(self, checkpoint_dir) -> None:
+
+        super().__init__()
+        self.checkpoint_dir = checkpoint_dir
+        self.settings_reports: list[tuple] = []
+
+    def report_settings(self, engine, settings, ignored) -> None:
+        self.settings_reports.append((engine, dict(settings), dict(ignored)))
+
+    def publish_artifact(self, path, kind) -> str:
+        return "0" * 64
+
+
+# a_stubbed_ultralytics()
+# Installs a fake `ultralytics` module and returns the model it will hand out.
+# Inputs: pytest's monkeypatch.
+# Output: the StubTrainedModel run() will train.
+#
+# run() imports ultralytics inside the function, so replacing the entry in
+# sys.modules is enough and nothing has to be injected through the engine.
+def a_stubbed_ultralytics(monkeypatch) -> StubTrainedModel:
+
+    model = StubTrainedModel(None)
+
+    module = types.ModuleType("ultralytics")
+
+    # YOLO(path) in run() -- records which weights it was pointed at.
+    def _yolo(weights):
+        model.weights_path = weights
+        return model
+
+    module.YOLO = _yolo
+    monkeypatch.setitem(sys.modules, "ultralytics", module)
+    return model
+
+
+# test_a_run_reports_its_provenance_and_passes_its_loss_weights()
+# Verifies the wiring, not just the two helpers either side of it.
+# Inputs: tmp_path and monkeypatch.
+# Output: pytest pass/fail result.
+#
+# The two tests above can both pass while run() never calls either function.
+# This one goes through run() itself with a stubbed Ultralytics, so it can see
+# the settings report MARP will actually receive and the arguments the trainer
+# will actually get. It is the tier the change has to be observed at; the
+# helpers' own tests only say what the helpers would produce if asked.
+def test_a_run_reports_its_provenance_and_passes_its_loss_weights(tmp_path, monkeypatch) -> None:
+
+    model = a_stubbed_ultralytics(monkeypatch)
+    spec = a_runnable_spec(tmp_path, epochs=1, box=9.0, cls=1.25, dfl=2.0, mask_ratio=8)
+
+    ctx = RunContext(tmp_path / "attempt")
+    ctx.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+    summary = TrainingEngine().run(ctx, spec)
+
+    # What MARP is told about how the run ran.
+    assert len(ctx.settings_reports) == 1
+    _engine, reported, _ignored = ctx.settings_reports[0]
+
+    assert reported["compute_device"]["source"] == "worker"
+    assert reported["compute_device"]["value"] == summary["device"]
+    assert reported["train_script_commit"]["source"] == "worker"
+    assert reported["train_script_commit"]["value"] == summary["train_script_commit"]
+
+    # The loss weights are the submitter's, and are reported as such.
+    assert reported["box"] == {"value": 9.0, "type": "float", "source": "job"}
+
+    # And they reached the trainer rather than only the record.
+    assert model.train_kwargs["box"] == pytest.approx(9.0)
+    assert model.train_kwargs["cls"] == pytest.approx(1.25)
+    assert model.train_kwargs["dfl"] == pytest.approx(2.0)
+    assert model.train_kwargs["mask_ratio"] == 8
+
+    # The worker's decisions are still the worker's: a device argument is
+    # passed by run() itself, never merged in from the job's settings.
+    assert model.train_kwargs["device"] == summary["device"]

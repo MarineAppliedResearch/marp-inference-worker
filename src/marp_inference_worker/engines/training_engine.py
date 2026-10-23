@@ -37,6 +37,9 @@ from marp_inference_worker.engines.base_engine import (
 # Device selection is the worker's decision, not the engine's.
 from marp_inference_worker.system.device import cuda_device_count, resolve_device
 
+# Which build of this worker produced the run, for the attempt's record.
+from marp_inference_worker.system.provenance import worker_revision
+
 
 # How long to wait between publishing improved weights, in seconds.
 #
@@ -74,6 +77,33 @@ _ALLOWED_TRAINING_PARAMS = {
     "freeze": int,
     "single_cls": bool,
     "rect": bool,
+
+    # The loss weights. These are the gains on the three terms YOLO's detection
+    # loss is summed from, and they are what you reach for when a detector finds
+    # the wrong things rather than when it trains badly: raising `box` buys
+    # tighter boxes, raising `cls` buys confidence on small or rare classes at
+    # the cost of false positives. That trade is the one MARP deliberately wants
+    # pushed toward recall, because a biologist rejecting a false positive in a
+    # review mosaic is cheap and a missed animal costs re-reviewing video.
+    #
+    # Safe to accept where `project`, `name`, `resume` and `device` are not:
+    # they change how well the run trains, never where its weights land or what
+    # the result is taken to mean.
+    "box": float,
+    "cls": float,
+    "dfl": float,
+
+    # Segmentation only, and inert rather than harmful on a detection run.
+    # Ultralytics hands `mask_ratio` to its `Format` transform for every task but
+    # reads it only under `return_mask`, which is set from the dataset's
+    # `use_segments`. So a detect job that sets it trains exactly as if it had
+    # not -- it is accepted here because the dashboard offers it on the
+    # segmentation form and a job that sets it should have it recorded, not
+    # because this engine can currently act on it.
+    #
+    # An int, not a float: it is a downsample divisor, and Ultralytics lists it
+    # among its integer keys.
+    "mask_ratio": int,
 }
 
 
@@ -85,6 +115,44 @@ _TRAINING_DEFAULTS: dict[str, Any] = {
     "imgsz": 640,
     "patience": 50,
 }
+
+
+# _run_provenance()
+# The facts about a run that only the worker can state, as settings entries.
+# Inputs: the device this run resolved to.
+# Output: a mapping in report_settings' `{name: {value, type, source}}` shape.
+#
+# These ride in the settings report rather than in a channel of their own
+# because that is the one structured thing an attempt already tells MARP about
+# how it ran: the terminal result route records an outcome, a failure reason and
+# artifact hashes and nothing else, and the engine's own summary reaches the
+# coordinator only inside a log line, where nothing can read a column out of it.
+#
+# `source` is "worker", and it is the load-bearing part. Both of these are
+# deliberately *not* the submitter's to set -- `device` is excluded from the
+# allow-list on purpose, because a job that asked for cuda:1 must not get it
+# ahead of the slot it was pinned to -- so the record has to say that the worker
+# decided them, or a reader cannot tell a resolved device from a requested one.
+def _run_provenance(device: str) -> dict[str, dict[str, Any]]:
+
+    return {
+        # Named for MARP's `training_runs.compute_device`. The resolved device,
+        # which is the only one that is a fact: what the job asked for is in
+        # `ignored` if it asked at all.
+        "compute_device": {
+            "value": device,
+            "type": "str",
+            "source": "worker",
+        },
+        # Named for MARP's `training_runs.train_script_commit`. A sha when the
+        # worker runs from a checkout, the package version when it runs from an
+        # installed wheel; see worker_revision() for why both are answers.
+        "train_script_commit": {
+            "value": worker_revision(),
+            "type": "str",
+            "source": "worker",
+        },
+    }
 
 
 # TrainingEngine
@@ -168,8 +236,11 @@ class TrainingEngine(BaseEngine):
         try:
             ctx.report_settings(
                 self.engine_name,
-                {name: {"value": value, "type": type(value).__name__, "source": "job"}
-                 for name, value in settings.items()},
+                {
+                    **{name: {"value": value, "type": type(value).__name__, "source": "job"}
+                       for name, value in settings.items()},
+                    **_run_provenance(device),
+                },
                 ignored,
             )
         except Exception as error:
@@ -231,6 +302,11 @@ class TrainingEngine(BaseEngine):
         return {
             "engine": self.engine_name,
             "device": device,
+            # The same value the settings report carries, under the same name.
+            # The settings report is what MARP reads; this is here so the
+            # terminal log line a failure is diagnosed from says which build
+            # produced it, without having to go and find the settings report.
+            "train_script_commit": worker_revision(),
             "dataset": str(data_yaml.parent),
             "epochs_requested": total_epochs,
             "epochs_completed": state.epochs_done,

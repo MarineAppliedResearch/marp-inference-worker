@@ -64,6 +64,11 @@ writes it to `gpu_attempt_settings` and `gpu_attempt_ignored_params`
   an answer: a commit sha from a checkout, the package version from an installed wheel.
 - **R6** A run started from a checkout with uncommitted changes says so, so a provenance
   record never claims a reproducibility it does not have.
+- **R7** Every training attempt reports the `optimizer`, `lr0` and `momentum` Ultralytics
+  actually resolved, with `source: "resolved"`, in a second settings report sent before
+  the first epoch.
+- **R8** A value that cannot be read off the live optimizer is omitted, never filled in
+  from a default or from what was requested.
 
 ## The contract this changes
 
@@ -86,6 +91,23 @@ shape it already accepts:
 }
 ```
 
+A **second** settings report follows, from `on_train_start`, before epoch 1:
+
+```json
+{
+  "kind": "settings",
+  "payload": {
+    "engine": "marp_training",
+    "settings": {
+      "optimizer": {"value": "AdamW", "type": "str",   "source": "resolved"},
+      "lr0":       {"value": 0.002,   "type": "float", "source": "resolved"},
+      "momentum":  {"value": 0.9,     "type": "float", "source": "resolved"}
+    },
+    "ignored": {}
+  }
+}
+```
+
 Three things the API side needs to know:
 
 - **`source: "worker"` is the discriminator.** Everything else in `settings` is
@@ -94,6 +116,17 @@ Three things the API side needs to know:
 - **`train_script_commit` has two forms and they are distinguishable.** Forty hex
   characters is a git commit, optionally suffixed `+dirty`. Anything else is the worker's
   package version, which is the honest answer from a volunteer's wheel.
+- **`source: "resolved"` means Ultralytics decided it, and it overrides the `"job"` entry
+  of the same name.** `optimizer` and `lr0` appear in both reports when the job set them.
+  The resolved one is what ran. They differ whenever the job left `optimizer` at `auto` --
+  and `auto` also discards an `lr0` the job *did* send, which Ultralytics says in its own
+  log line, so the two disagreeing is normal rather than a fault.
+- **The second report is a second event, and MARP_API treats the first settings report as
+  the record.** Taking these values therefore needs a deliberate change on the API side:
+  either merge later reports when `source` is `"resolved"`, or read the resolved values
+  off the event. This is the one part that does not work by itself.
+- **An absent key means "could not be read", never "the default".** Nothing in the
+  resolved report is reconstructed.
 - **Nothing else changes.** No new event kind, no new route, no change to the result
   payload. The names were chosen to match the `training_runs` columns they are for.
 
@@ -107,6 +140,16 @@ Three things the API side needs to know:
   because the dashboard offers it on its segmentation form and a job that sets it should
   have the value recorded rather than filed as unrecognised. It is documented as
   segmentation-only at the allow-list.
+- [x] **A4 - API contract - non-blocking** - the resolved values go in a *second* settings
+  report rather than being folded into the first. The first is sent before the model is
+  loaded, so none of them exist yet, and moving it would lose the property that an attempt
+  dying during setup still carries its record (MARP_API#232). The cost is that MARP_API's
+  "first report is the record" rule has to learn about `source: "resolved"`.
+- [x] **A5 - scientific/data-meaning - non-blocking** - `momentum` is reported although no
+  `training_runs` column asks for it. `optimizer='auto'` overrides momentum exactly as it
+  overrides lr0, so recording two of the three would leave the record quietly wrong about
+  the third. The settings catalogue registers names it does not know, so an unused entry
+  costs nothing and a missing one cannot be recovered later.
 - [x] **A3 - environment - non-blocking** - `train_script_commit` falls back to the
   package version rather than being left empty when there is no git. A volunteer's
   installed worker is the common case, and an empty column for every volunteer run is the

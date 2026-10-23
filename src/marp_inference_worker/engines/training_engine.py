@@ -155,6 +155,73 @@ def _run_provenance(device: str) -> dict[str, dict[str, Any]]:
     }
 
 
+# _resolved_training_settings()
+# What Ultralytics decided for itself, read off the built optimizer.
+# Inputs: the Ultralytics trainer, once _setup_train() has finished.
+# Output: a mapping in report_settings' `{name: {value, type, source}}` shape,
+#   carrying only what could actually be read.
+#
+# **This exists because the requested values are not updated in place.**
+# `build_optimizer` resolves `optimizer='auto'` into a name, a learning rate and
+# a momentum, and keeps all three in local variables: `trainer.args.optimizer`
+# still reads "auto" and `trainer.args.lr0` still reads whatever was configured.
+# Reading `args` back would therefore record what was asked for while claiming it
+# was what ran, which is the one thing a scientific record must not do.
+#
+# Worse, `auto` ignores a learning rate the submitter *did* send -- Ultralytics
+# says so in its own log line -- so the gap is not only about the Auto default.
+#
+# Nothing here is reconstructed. Every value is read off the live optimizer, and
+# anything that cannot be read is left out rather than filled in from a default
+# (#268): an absent column is a known unknown, a guessed one is a wrong fact.
+def _resolved_training_settings(trainer: Any) -> dict[str, dict[str, Any]]:
+
+    resolved: dict[str, dict[str, Any]] = {}
+
+    optimizer = getattr(trainer, "optimizer", None)
+    if optimizer is None:
+        return resolved
+
+    # The optimizer's class is the only honest statement of which one was
+    # chosen; `args.optimizer` is still the request.
+    resolved["optimizer"] = {
+        "value": type(optimizer).__name__,
+        "type": "str",
+        "source": "resolved",
+    }
+
+    groups = getattr(optimizer, "param_groups", None) or []
+    if not groups:
+        return resolved
+
+    # `initial_lr`, not `lr`. The scheduler stamps `initial_lr` on every group
+    # when it is constructed, and then warmup starts moving `lr` per batch, so
+    # by the time anything can read it `lr` is no longer the run's lr0.
+    first = groups[0]
+    if "initial_lr" in first:
+        resolved["lr0"] = {
+            "value": float(first["initial_lr"]),
+            "type": "float",
+            "source": "resolved",
+        }
+
+    # Momentum lives in two places depending on which optimizer was chosen:
+    # SGD-family optimizers have `momentum`, Adam-family ones keep it as the
+    # first of `betas`. Read both, report neither if it is neither.
+    momentum = first.get("momentum")
+    if momentum is None:
+        betas = first.get("betas") or ()
+        momentum = betas[0] if betas else None
+    if momentum is not None:
+        resolved["momentum"] = {
+            "value": float(momentum),
+            "type": "float",
+            "source": "resolved",
+        }
+
+    return resolved
+
+
 # TrainingEngine
 # Runs one YOLO training job and publishes the weights it produces.
 # Constructed once by the registry; every run happens in its own child process,
@@ -261,7 +328,12 @@ class TrainingEngine(BaseEngine):
         run_root = Path(ctx.checkpoint_dir) / "train"
         run_root.mkdir(parents=True, exist_ok=True)
 
-        state = _RunState(ctx=ctx, total_epochs=total_epochs, run_root=run_root)
+        state = _RunState(
+            ctx=ctx,
+            total_epochs=total_epochs,
+            run_root=run_root,
+            engine_name=self.engine_name,
+        )
         self._attach_callbacks(model, state)
 
         ctx.report_progress(0, total_epochs, "epochs", phase="training")
@@ -359,6 +431,11 @@ class TrainingEngine(BaseEngine):
     # run yields, so it is where progress, metrics, stop and pause all live.
     def _attach_callbacks(self, model: Any, state: "_RunState") -> None:
 
+        # `on_train_start` rather than any earlier hook: it is the first point
+        # at which Ultralytics has finished _setup_train() and the optimizer
+        # exists, and it is still before epoch 1. `on_pretrain_routine_start`
+        # fires from the trainer's constructor, where nothing is resolved yet.
+        model.add_callback("on_train_start", state.on_train_start)
         model.add_callback("on_fit_epoch_end", state.on_epoch_end)
 
 
@@ -378,13 +455,21 @@ class _RunState:
 
     # __init__()
     # Builds the state for one run.
-    # Inputs: the job context, the epoch total, and where the run writes.
+    # Inputs: the job context, the epoch total, where the run writes, and the
+    #   engine name the settings reports are filed under.
     # Output: initialized _RunState.
-    def __init__(self, ctx: JobContext, total_epochs: int, run_root: Path) -> None:
+    def __init__(
+        self,
+        ctx: JobContext,
+        total_epochs: int,
+        run_root: Path,
+        engine_name: str = "marp_training",
+    ) -> None:
 
         self._ctx = ctx
         self._total = total_epochs
         self._run_root = run_root
+        self._engine_name = engine_name
 
         self.epochs_done = 0
         self.publishes = 0
@@ -395,6 +480,33 @@ class _RunState:
         # When weights were last sent up, so the rate limit is measured from a
         # real publish rather than from the start of the run.
         self._last_publish_at = 0.0
+
+    # on_train_start()
+    # Reports what Ultralytics resolved, once, before the first epoch.
+    # Inputs: the Ultralytics trainer.
+    # Output: none.
+    #
+    # A second settings report rather than more fields on the first one, because
+    # the first is sent before the model is even loaded and none of this exists
+    # yet. Keeping the first where it is matters: an attempt that dies during
+    # setup -- a broken dataset, an OOM building the model -- still carries the
+    # record of what it was trying to run, which is why MARP_API#232 put it
+    # there. This one says what the run settled on and is only reachable once
+    # setup succeeded.
+    def on_train_start(self, trainer: Any) -> None:
+
+        # Bookkeeping must never cost a volunteer's GPU run. Same rule as the
+        # first report: a fault building the record is a warning, not a failure.
+        try:
+            resolved = _resolved_training_settings(trainer)
+            if resolved:
+                self._ctx.report_settings(self._engine_name, resolved, {})
+        except Exception as error:
+            self._ctx.log(
+                f"could not report what this run resolved: {type(error).__name__}: {error}",
+                level="warning",
+            )
+
 
     # best_weights_path()
     # Where Ultralytics keeps the best weights for this run.

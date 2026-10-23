@@ -498,3 +498,196 @@ def test_a_run_reports_its_provenance_and_passes_its_loss_weights(tmp_path, monk
     # The worker's decisions are still the worker's: a device argument is
     # passed by run() itself, never merged in from the job's settings.
     assert model.train_kwargs["device"] == summary["device"]
+
+
+# FakeParamGroup/FakeOptimizer
+# The two attributes the resolved-settings reader touches on a torch optimizer.
+# Named after the optimizer class, because the class name IS the reported value.
+class FakeAdamW:
+
+    def __init__(self, groups) -> None:
+
+        self.param_groups = groups
+
+
+class FakeSGD:
+
+    def __init__(self, groups) -> None:
+
+        self.param_groups = groups
+
+
+# test_what_the_run_resolved_is_read_off_the_optimizer()
+# Verifies the reported optimizer and lr0 come from the built optimizer.
+# Inputs: none.
+# Output: pytest pass/fail result.
+#
+# `build_optimizer` resolves `optimizer='auto'` into a name, a learning rate and
+# a momentum and keeps all three in LOCAL variables -- `trainer.args.optimizer`
+# still reads "auto" afterwards and `trainer.args.lr0` still reads whatever was
+# configured. Reading `args` back would record the request while claiming it was
+# the run. This asserts the reader goes to the optimizer instead.
+def test_what_the_run_resolved_is_read_off_the_optimizer() -> None:
+
+    trainer = FakeTrainer(0, {})
+    trainer.args = types.SimpleNamespace(optimizer="auto", lr0=0.01, momentum=0.937)
+    trainer.optimizer = FakeAdamW([{"initial_lr": 0.002, "betas": (0.9, 0.999)}])
+
+    resolved = training_module._resolved_training_settings(trainer)
+
+    # The request said "auto" and 0.01; neither is what ran.
+    assert resolved["optimizer"]["value"] == "FakeAdamW"
+    assert resolved["lr0"]["value"] == pytest.approx(0.002)
+    assert resolved["momentum"]["value"] == pytest.approx(0.9)
+
+    for entry in resolved.values():
+        assert entry["source"] == "resolved"
+
+
+# test_momentum_is_found_wherever_the_optimizer_keeps_it()
+# Verifies the SGD spelling of momentum is read as well as the Adam one.
+# Inputs: none.
+# Output: pytest pass/fail result.
+#
+# SGD-family optimizers have a `momentum` key; Adam-family ones keep it as the
+# first of `betas`. A reader that knew only one of the two would silently drop
+# the value for half of the optimizers Ultralytics can pick.
+def test_momentum_is_found_wherever_the_optimizer_keeps_it() -> None:
+
+    trainer = FakeTrainer(0, {})
+    trainer.optimizer = FakeSGD([{"initial_lr": 0.01, "momentum": 0.937}])
+
+    resolved = training_module._resolved_training_settings(trainer)
+
+    assert resolved["momentum"]["value"] == pytest.approx(0.937)
+    assert resolved["optimizer"]["value"] == "FakeSGD"
+
+
+# test_nothing_is_invented_when_it_cannot_be_read()
+# Verifies an unreadable value is left out rather than filled from a default.
+# Inputs: none.
+# Output: pytest pass/fail result.
+#
+# This is the point of the whole exercise. The dashboard deliberately does not
+# send Auto, because a guess written into a scientific record is worse than a
+# null. A reader that fell back to a default would reintroduce exactly that, and
+# would do it invisibly.
+def test_nothing_is_invented_when_it_cannot_be_read() -> None:
+
+    trainer = FakeTrainer(0, {})
+    trainer.args = types.SimpleNamespace(optimizer="auto", lr0=0.01, momentum=0.937)
+
+    # No optimizer at all: nothing is knowable, so nothing is said.
+    trainer.optimizer = None
+    assert training_module._resolved_training_settings(trainer) == {}
+
+    # An optimizer whose groups carry no initial_lr: the name is knowable and
+    # is reported; the learning rate is not and is omitted, NOT taken from
+    # trainer.args.lr0, which is sitting right there reading 0.01.
+    trainer.optimizer = FakeSGD([{}])
+    resolved = training_module._resolved_training_settings(trainer)
+
+    assert resolved["optimizer"]["value"] == "FakeSGD"
+    assert "lr0" not in resolved
+    assert "momentum" not in resolved
+
+
+# test_the_resolved_report_goes_out_before_the_first_epoch()
+# Verifies the second settings report fires from on_train_start.
+# Inputs: tmp_path.
+# Output: pytest pass/fail result.
+#
+# Timing is the requirement, not just content: a run that dies at epoch 3 still
+# has to answer "what was it trying?". Reporting at the end would lose exactly
+# the runs somebody needs to diagnose.
+def test_the_resolved_report_goes_out_before_the_first_epoch(tmp_path) -> None:
+
+    ctx = RunContext(tmp_path)
+    state = training_module._RunState(
+        ctx=ctx, total_epochs=4, run_root=tmp_path, engine_name="marp_training"
+    )
+
+    trainer = FakeTrainer(0, {})
+    trainer.optimizer = FakeSGD([{"initial_lr": 0.01, "momentum": 0.937}])
+
+    state.on_train_start(trainer)
+
+    assert state.epochs_done == 0
+    assert len(ctx.settings_reports) == 1
+
+    engine, reported, ignored = ctx.settings_reports[0]
+    assert engine == "marp_training"
+    assert reported["lr0"]["value"] == pytest.approx(0.01)
+
+    # The resolved report carries no ignored params; the first report owns those.
+    assert ignored == {}
+
+
+# test_a_broken_resolved_report_does_not_kill_the_run()
+# Verifies bookkeeping never costs a volunteer's GPU run.
+# Inputs: tmp_path.
+# Output: pytest pass/fail result.
+def test_a_broken_resolved_report_does_not_kill_the_run(tmp_path) -> None:
+
+    class Exploding(RunContext):
+        def report_settings(self, engine, settings, ignored) -> None:
+            raise RuntimeError("coordinator went away")
+
+    ctx = Exploding(tmp_path)
+    state = training_module._RunState(ctx=ctx, total_epochs=1, run_root=tmp_path)
+
+    trainer = FakeTrainer(0, {})
+    trainer.optimizer = FakeSGD([{"initial_lr": 0.01}])
+
+    # Must not raise.
+    state.on_train_start(trainer)
+
+    assert any("could not report" in line for line in ctx.logs)
+
+
+# test_the_reader_works_against_a_real_ultralytics_optimizer()
+# The control: everything above uses a fake optimizer shaped the way this file
+# believes torch shapes them. This one builds a real one.
+# Inputs: none.
+# Output: pytest pass/fail result.
+#
+# Without it, every test above would keep passing if Ultralytics changed where
+# it keeps the resolved learning rate -- the fakes would still match the old
+# shape and the engine would silently report nothing. It uses Ultralytics' own
+# build_optimizer on a toy torch model: no dataset, no GPU, no training.
+def test_the_reader_works_against_a_real_ultralytics_optimizer() -> None:
+
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("ultralytics")
+
+    from torch import nn, optim
+    from ultralytics.cfg import get_cfg
+    from ultralytics.engine.trainer import BaseTrainer
+
+    model = nn.Sequential(nn.Conv2d(3, 8, 3), nn.BatchNorm2d(8))
+
+    # optimizer='auto' is the dashboard's default, and the case that matters.
+    args = get_cfg(overrides={})
+    owner = types.SimpleNamespace(args=args, data={"nc": 1})
+    optimizer = BaseTrainer.build_optimizer(
+        owner, model=model, name=args.optimizer, lr=args.lr0,
+        momentum=args.momentum, decay=0.0005, iterations=500,
+    )
+    # The scheduler is what stamps initial_lr onto the param groups, so the
+    # engine only ever sees an optimizer that has been through this.
+    optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda _x: 1.0)
+
+    trainer = FakeTrainer(0, {})
+    trainer.args = args
+    trainer.optimizer = optimizer
+
+    resolved = training_module._resolved_training_settings(trainer)
+
+    # Ultralytics left the request untouched: this is the lie we must not tell.
+    assert args.optimizer == "auto"
+
+    # And the reader found the real thing anyway.
+    assert resolved["optimizer"]["value"] != "auto"
+    assert resolved["optimizer"]["value"] == type(optimizer).__name__
+    assert resolved["lr0"]["value"] > 0
+    assert resolved["lr0"]["value"] != pytest.approx(args.lr0)

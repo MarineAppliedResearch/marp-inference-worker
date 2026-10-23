@@ -222,6 +222,58 @@ def _resolved_training_settings(trainer: Any) -> dict[str, dict[str, Any]]:
     return resolved
 
 
+# _epoch_metrics()
+# Everything one finished epoch can honestly say about itself.
+# Inputs: the Ultralytics trainer, at `on_fit_epoch_end`.
+# Output: a free-form metric mapping, carrying only what was readable.
+#
+# Three sources, because Ultralytics keeps them in three places and only ever
+# brings them together to write its own CSV (`save_metrics`, trainer.py:635):
+#
+#   trainer.metrics     the validator's output -- precision, recall, mAP50,
+#                       mAP50-95, fitness. Already reported before this existed.
+#   trainer.tloss       the epoch's running mean loss, reset at every epoch
+#                       start, labelled through the trainer's own
+#                       `label_loss_items` so the names are the task's own
+#                       (`train/box_loss`, and `train/seg_loss` on segmentation).
+#   trainer.epoch_time  set immediately before this callback fires.
+#
+# Nothing is derived. The losses are labelled by Ultralytics' own method rather
+# than by a list of names kept here, which would be a second copy that goes
+# stale the first time a task has a different loss. A source that is missing --
+# `tloss` is None through a NaN-recovery epoch -- contributes nothing rather
+# than a zero (#268).
+def _epoch_metrics(trainer: Any) -> dict[str, Any]:
+
+    metrics: dict[str, Any] = {
+        str(name): value
+        for name, value in (getattr(trainer, "metrics", {}) or {}).items()
+    }
+
+    # The per-epoch losses, which never reach trainer.metrics.
+    tloss = getattr(trainer, "tloss", None)
+    labeller = getattr(trainer, "label_loss_items", None)
+    if tloss is not None and callable(labeller):
+        try:
+            metrics.update({str(name): value for name, value in labeller(tloss).items()})
+        except Exception:
+            # A trainer that labels its losses differently is not a failed
+            # epoch. Report what was readable and leave the rest out.
+            pass
+
+    # The one key the worker names itself, because Ultralytics keeps the epoch
+    # duration as an attribute and never puts it in a mapping. Named for MARP's
+    # `epochs.duration_seconds` so the API side is a lookup, not a mapping.
+    epoch_time = getattr(trainer, "epoch_time", None)
+    if epoch_time is not None:
+        try:
+            metrics["duration_seconds"] = round(float(epoch_time), 3)
+        except (TypeError, ValueError):
+            pass
+
+    return metrics
+
+
 # TrainingEngine
 # Runs one YOLO training job and publishes the weights it produces.
 # Constructed once by the registry; every run happens in its own child process,
@@ -545,17 +597,16 @@ class _RunState:
         # simply not another epoch. Held as the latest metrics, which is what the
         # summary reports, and not counted.
         if reported > self._total or reported <= self.epochs_done:
-            raw = dict(getattr(trainer, "metrics", {}) or {})
+            raw = _epoch_metrics(trainer)
             if raw:
-                self.last_metrics = {str(k): v for k, v in raw.items()}
+                self.last_metrics = raw
             return
 
         self.epochs_done = reported
 
         # Ultralytics' metric names vary by task and version, which is exactly
         # why report_metrics takes a free-form mapping.
-        raw = dict(getattr(trainer, "metrics", {}) or {})
-        self.last_metrics = {str(k): v for k, v in raw.items()}
+        self.last_metrics = _epoch_metrics(trainer)
 
         fitness = getattr(trainer, "fitness", None)
         if fitness is not None:

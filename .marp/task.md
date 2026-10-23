@@ -69,6 +69,10 @@ writes it to `gpu_attempt_settings` and `gpu_attempt_ignored_params`
   the first epoch.
 - **R8** A value that cannot be read off the live optimizer is omitted, never filled in
   from a default or from what was requested.
+- **R9** Every finished epoch reports its mean losses and its duration alongside the
+  validator's metrics, at the epoch boundary rather than at the end of the run.
+- **R10** A metric source that is absent contributes nothing, never a zero; a genuine
+  measurement of zero is still reported.
 
 ## The contract this changes
 

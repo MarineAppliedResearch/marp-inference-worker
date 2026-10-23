@@ -691,3 +691,172 @@ def test_the_reader_works_against_a_real_ultralytics_optimizer() -> None:
     assert resolved["optimizer"]["value"] == type(optimizer).__name__
     assert resolved["lr0"]["value"] > 0
     assert resolved["lr0"]["value"] != pytest.approx(args.lr0)
+
+
+# a_trainer_at_epoch_end()
+# A FakeTrainer carrying the three places Ultralytics keeps epoch numbers.
+# Inputs: validator metrics, the epoch's mean losses, the epoch duration.
+# Output: the fake trainer.
+#
+# `label_loss_items` is the trainer's own method in Ultralytics and is what
+# names the losses, so the fake has to provide it rather than a flat dict --
+# otherwise the test would assert against names this file invented.
+def a_trainer_at_epoch_end(epoch=0, metrics=None, losses=None, epoch_time=None):
+
+    trainer = FakeTrainer(epoch, dict(metrics or {}))
+    trainer.tloss = dict(losses) if losses is not None else None
+    trainer.epoch_time = epoch_time
+    trainer.label_loss_items = lambda items, prefix="train": {
+        f"{prefix}/{name}": round(float(value), 5) for name, value in items.items()
+    }
+    return trainer
+
+
+# test_an_epoch_reports_its_losses_and_duration()
+# Verifies the numbers that were reaching the database as NULL now arrive.
+# Inputs: none.
+# Output: pytest pass/fail result.
+#
+# The first real run from the dashboard wrote precision and recall and left
+# box_loss, cls_loss, dfl_loss and duration_seconds empty. The losses never
+# reach `trainer.metrics` at all -- Ultralytics keeps them in `tloss` and only
+# brings the two together when it writes its own CSV -- and the duration is a
+# plain attribute.
+def test_an_epoch_reports_its_losses_and_duration() -> None:
+
+    trainer = a_trainer_at_epoch_end(
+        metrics={"metrics/precision(B)": 0.19, "metrics/mAP50(B)": 0.42},
+        losses={"box_loss": 1.25, "cls_loss": 0.8, "dfl_loss": 0.95},
+        epoch_time=27.1234,
+    )
+
+    reported = training_module._epoch_metrics(trainer)
+
+    assert reported["train/box_loss"] == pytest.approx(1.25)
+    assert reported["train/cls_loss"] == pytest.approx(0.8)
+    assert reported["train/dfl_loss"] == pytest.approx(0.95)
+    assert reported["duration_seconds"] == pytest.approx(27.123)
+
+    # And the validator's numbers are still carried, unchanged.
+    assert reported["metrics/precision(B)"] == pytest.approx(0.19)
+    assert reported["metrics/mAP50(B)"] == pytest.approx(0.42)
+
+
+# test_a_missing_source_contributes_nothing_not_zero()
+# Verifies an absent number is absent rather than reported as 0.
+# Inputs: none.
+# Output: pytest pass/fail result.
+#
+# `tloss` is None through a NaN-recovery epoch, and `epoch_time` is unset
+# before the first one finishes. Reporting 0.0 for either would put a wrong
+# number in a scientific record and look exactly like a real measurement.
+def test_a_missing_source_contributes_nothing_not_zero() -> None:
+
+    trainer = a_trainer_at_epoch_end(metrics={"metrics/recall(B)": 0.4})
+
+    reported = training_module._epoch_metrics(trainer)
+
+    assert reported == {"metrics/recall(B)": 0.4}
+    assert "duration_seconds" not in reported
+    assert not any(name.endswith("_loss") for name in reported)
+
+
+# test_a_real_loss_of_zero_is_still_reported()
+# The control for the test above.
+# Inputs: none.
+# Output: pytest pass/fail result.
+#
+# Without it, dropping every falsy value would pass -- and that would silently
+# discard a genuine zero, which is a measurement and not an absence.
+def test_a_real_loss_of_zero_is_still_reported() -> None:
+
+    trainer = a_trainer_at_epoch_end(losses={"cls_loss": 0.0}, epoch_time=0.0)
+
+    reported = training_module._epoch_metrics(trainer)
+
+    assert reported["train/cls_loss"] == 0.0
+    assert reported["duration_seconds"] == 0.0
+
+
+# test_the_whole_epoch_record_reaches_the_context()
+# Verifies the callback reports the assembled mapping, not just the validator's.
+# Inputs: tmp_path.
+# Output: pytest pass/fail result.
+#
+# `_epoch_metrics` could be perfect while `on_epoch_end` still forwarded
+# `trainer.metrics`, which is exactly the bug being fixed. This watches what
+# actually leaves the engine.
+def test_the_whole_epoch_record_reaches_the_context(tmp_path) -> None:
+
+    ctx = RecordingContext()
+    state = training_module._RunState(ctx=ctx, total_epochs=2, run_root=tmp_path)
+
+    state.on_epoch_end(
+        a_trainer_at_epoch_end(
+            epoch=0,
+            metrics={"metrics/mAP50-95(B)": 0.31},
+            losses={"box_loss": 1.1},
+            epoch_time=27.0,
+        )
+    )
+
+    assert len(ctx.metrics) == 1
+    step, phase, reported = ctx.metrics[0]
+
+    assert (step, phase) == (1, "training")
+    assert reported["metrics/mAP50-95(B)"] == pytest.approx(0.31)
+    assert reported["train/box_loss"] == pytest.approx(1.1)
+    assert reported["duration_seconds"] == pytest.approx(27.0)
+
+
+# test_the_loss_names_are_ultralytics_own()
+# The control: every test above uses a fake label_loss_items shaped the way
+# this file believes Ultralytics shapes it. This one uses the real method.
+# Inputs: none.
+# Output: pytest pass/fail result.
+#
+# The loss names are task-derived -- Ultralytics reads them off the criterion on
+# the first batch, so segmentation has a `seg_loss` that detection does not.
+# Keeping a list of names here would be a second copy that goes stale; this
+# asserts we are using theirs, and would fail if the `train/` prefix or the
+# labelling moved.
+def test_the_loss_names_are_ultralytics_own() -> None:
+
+    pytest.importorskip("ultralytics")
+    from ultralytics.engine.trainer import BaseTrainer
+
+    trainer = FakeTrainer(0, {})
+    trainer.tloss = {"box_loss": 1.5, "cls_loss": 0.6, "dfl_loss": 0.9}
+    trainer.epoch_time = 12.0
+    trainer.loss_names = tuple(trainer.tloss)
+
+    # The real method, bound to the fake -- it reads only loss_names and the
+    # items it is handed.
+    trainer.label_loss_items = types.MethodType(BaseTrainer.label_loss_items, trainer)
+
+    reported = training_module._epoch_metrics(trainer)
+
+    assert reported["train/box_loss"] == pytest.approx(1.5)
+    assert reported["train/dfl_loss"] == pytest.approx(0.9)
+
+
+# test_a_trainer_that_cannot_label_its_losses_still_reports_the_rest()
+# Verifies one unreadable source does not cost the whole epoch's record.
+# Inputs: none.
+# Output: pytest pass/fail result.
+def test_a_trainer_that_cannot_label_its_losses_still_reports_the_rest() -> None:
+
+    trainer = FakeTrainer(0, {"metrics/precision(B)": 0.5})
+    trainer.tloss = {"box_loss": 1.0}
+    trainer.epoch_time = 9.0
+
+    def exploding(_items, prefix="train"):
+        raise RuntimeError("loss names moved")
+
+    trainer.label_loss_items = exploding
+
+    reported = training_module._epoch_metrics(trainer)
+
+    assert reported["metrics/precision(B)"] == pytest.approx(0.5)
+    assert reported["duration_seconds"] == pytest.approx(9.0)
+    assert not any(name.endswith("_loss") for name in reported)

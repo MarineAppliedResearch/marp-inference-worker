@@ -264,6 +264,21 @@ def _epoch_metrics(trainer: Any) -> dict[str, Any]:
     # The one key the worker names itself, because Ultralytics keeps the epoch
     # duration as an attribute and never puts it in a mapping. Named for MARP's
     # `epochs.duration_seconds` so the API side is a lookup, not a mapping.
+    #
+    # **What this duration covers, because both answers surprise somebody:**
+    #
+    # It INCLUDES that epoch's validation. Ultralytics takes its timestamp after
+    # `validate()` has returned (trainer.py:645), so an epoch's duration is
+    # training plus the validation that followed it. Anyone comparing these
+    # against the training loop alone will find them consistently longer, and
+    # that is correct rather than drift.
+    #
+    # And the FIRST epoch's clock starts at `_do_train` entry, not at the job's.
+    # `epoch_time_start` is initialised there (trainer.py:457), which is after
+    # `_setup_train` has built the dataloaders, loaded the model and built the
+    # optimizer. Those are not the epoch and should not be in it -- but on a
+    # large dataset the gap is minutes, so epoch 1's duration is not the time
+    # from the job starting, and reading it that way understates a run badly.
     epoch_time = getattr(trainer, "epoch_time", None)
     if epoch_time is not None:
         try:

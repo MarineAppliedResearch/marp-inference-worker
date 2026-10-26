@@ -286,6 +286,48 @@ def _epoch_metrics(trainer: Any) -> dict[str, Any]:
         except (TypeError, ValueError):
             pass
 
+    # Where this epoch sat inside its run, as seconds since training began.
+    #
+    # Offsets rather than wall-clock instants, which is Isaac's decision (#268):
+    # a volunteer's clock can be wrong by any amount, so an absolute timestamp
+    # from this machine would claim an agreement with MARP's other timestamps
+    # that nothing checks. An offset makes no such claim and still places an
+    # epoch within its run.
+    #
+    # The end is read off `epoch_time_start`, which by the time this callback
+    # runs holds the moment the epoch ENDED -- Ultralytics reuses the one
+    # attribute as the next epoch's start (trainer.py:646-647). The start is the
+    # end minus the duration, and that subtraction is exact rather than an
+    # estimate: `epoch_time` was itself computed as this timestamp minus the
+    # previous one, so subtracting it back reproduces the overwritten instant.
+    #
+    # Deliberately not a clock reading of our own taken in `on_train_epoch_start`
+    # -- that would be this process's clock a few milliseconds from the
+    # trainer's, and `end - start` would then disagree with `duration_seconds`
+    # for no benefit. The identity is worth more than a directly sampled start.
+    #
+    # **The origin is the start of TRAINING, not of the job.** `train_time_start`
+    # is set at `_do_train` entry (trainer.py:458), after `_setup_train` has
+    # built the dataloaders, loaded the model and built the optimizer. So epoch
+    # 1 starts at roughly 0.0 and the setup that preceded it is not inside these
+    # numbers at all. Setup cost is still recoverable -- it is the gap between
+    # the attempt's first event and the settings report sent from
+    # `on_train_start` -- but it is not here, and a reader expecting epoch 1 to
+    # begin at the setup time will be wrong.
+    origin = getattr(trainer, "train_time_start", None)
+    epoch_end = getattr(trainer, "epoch_time_start", None)
+    if origin is not None and epoch_end is not None and "duration_seconds" in metrics:
+        try:
+            # Rounded before the subtraction so the identity
+            # `end_offset_s - start_offset_s == duration_seconds` survives it.
+            end_offset = round(float(epoch_end) - float(origin), 3)
+            metrics["end_offset_s"] = end_offset
+            metrics["start_offset_s"] = round(end_offset - metrics["duration_seconds"], 3)
+        except (TypeError, ValueError):
+            # Half an interval is not a measurement: if either end cannot be
+            # read, neither is reported.
+            metrics.pop("end_offset_s", None)
+
     return metrics
 
 

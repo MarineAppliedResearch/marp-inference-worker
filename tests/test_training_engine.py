@@ -860,3 +860,111 @@ def test_a_trainer_that_cannot_label_its_losses_still_reports_the_rest() -> None
     assert reported["metrics/precision(B)"] == pytest.approx(0.5)
     assert reported["duration_seconds"] == pytest.approx(9.0)
     assert not any(name.endswith("_loss") for name in reported)
+
+
+# test_an_epoch_says_where_it_sat_in_its_run()
+# Verifies the two offsets, measured from the start of training.
+# Inputs: none.
+# Output: pytest pass/fail result.
+#
+# Offsets rather than wall-clock instants is Isaac's decision: a volunteer's
+# clock can be wrong by any amount, so an absolute timestamp from the worker
+# would claim an agreement with MARP's other timestamps that nothing checks.
+def test_an_epoch_says_where_it_sat_in_its_run() -> None:
+
+    trainer = a_trainer_at_epoch_end(losses={"box_loss": 1.0}, epoch_time=27.5)
+    trainer.train_time_start = 1_800_000_000.0
+    trainer.epoch_time_start = 1_800_000_100.0
+
+    reported = training_module._epoch_metrics(trainer)
+
+    assert reported["end_offset_s"] == pytest.approx(100.0)
+    assert reported["start_offset_s"] == pytest.approx(72.5)
+
+
+# test_the_offsets_agree_with_the_duration_exactly()
+# Verifies end - start is the duration, to the rounding.
+# Inputs: none.
+# Output: pytest pass/fail result.
+#
+# **This identity is the whole reason the start is derived rather than sampled.**
+# Reading our own clock in `on_train_epoch_start` would give a start a few
+# milliseconds from the trainer's, and these three numbers would then disagree
+# with each other in the record for no benefit.
+def test_the_offsets_agree_with_the_duration_exactly() -> None:
+
+    for duration in (13.75, 0.001, 27.123, 600.5):
+        trainer = a_trainer_at_epoch_end(epoch_time=duration)
+        trainer.train_time_start = 1_800_000_000.0
+        trainer.epoch_time_start = 1_800_000_000.0 + 3 * duration
+
+        reported = training_module._epoch_metrics(trainer)
+
+        assert reported["end_offset_s"] - reported["start_offset_s"] == pytest.approx(
+            reported["duration_seconds"]
+        ), f"identity broke at duration={duration}"
+
+
+# test_the_first_epoch_starts_at_the_beginning_of_training_not_the_job()
+# Verifies, and pins, that setup time is NOT inside these offsets.
+# Inputs: none.
+# Output: pytest pass/fail result.
+#
+# `train_time_start` and `epoch_time_start` are both set at `_do_train` entry,
+# microseconds apart and AFTER `_setup_train` has built the dataloaders, loaded
+# the model and built the optimizer. So epoch 1 begins at roughly zero however
+# long setup took.
+#
+# This is worth a test rather than only a comment because the opposite was
+# expected during design -- that a first epoch starting at 180s would show a
+# three-minute setup. It does not, and anyone who later makes it do so should
+# have to delete this test deliberately.
+def test_the_first_epoch_starts_at_the_beginning_of_training_not_the_job() -> None:
+
+    # A run whose setup took three minutes: the trainer's clocks still start
+    # together, because Ultralytics sets them after setup has finished.
+    started = 1_800_000_180.0
+    trainer = a_trainer_at_epoch_end(epoch_time=20.0)
+    trainer.train_time_start = started
+    trainer.epoch_time_start = started + 20.0
+
+    reported = training_module._epoch_metrics(trainer)
+
+    assert reported["start_offset_s"] == pytest.approx(0.0)
+    assert reported["end_offset_s"] == pytest.approx(20.0)
+
+
+# test_neither_offset_is_reported_without_a_duration()
+# Verifies half an interval is withheld rather than shipped alone.
+# Inputs: none.
+# Output: pytest pass/fail result.
+def test_neither_offset_is_reported_without_a_duration() -> None:
+
+    trainer = a_trainer_at_epoch_end()
+    trainer.train_time_start = 1_800_000_000.0
+    trainer.epoch_time_start = 1_800_000_100.0
+
+    reported = training_module._epoch_metrics(trainer)
+
+    assert "start_offset_s" not in reported
+    assert "end_offset_s" not in reported
+
+
+# test_no_offsets_without_an_origin()
+# Verifies an offset is never measured from an origin that was not there.
+# Inputs: none.
+# Output: pytest pass/fail result.
+#
+# Without `train_time_start` the only thing left to measure from would be zero,
+# which would silently turn every epoch's offset into a wall-clock instant --
+# exactly what Isaac chose against.
+def test_no_offsets_without_an_origin() -> None:
+
+    trainer = a_trainer_at_epoch_end(epoch_time=20.0)
+    trainer.epoch_time_start = 1_800_000_100.0
+
+    reported = training_module._epoch_metrics(trainer)
+
+    assert reported["duration_seconds"] == pytest.approx(20.0)
+    assert "start_offset_s" not in reported
+    assert "end_offset_s" not in reported

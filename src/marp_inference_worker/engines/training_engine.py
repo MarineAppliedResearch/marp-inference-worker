@@ -289,10 +289,18 @@ def _epoch_metrics(trainer: Any) -> dict[str, Any]:
     # Where this epoch sat inside its run, as seconds since training began.
     #
     # Offsets rather than wall-clock instants, which is Isaac's decision (#268):
-    # a volunteer's clock can be wrong by any amount, so an absolute timestamp
-    # from this machine would claim an agreement with MARP's other timestamps
-    # that nothing checks. An offset makes no such claim and still places an
-    # epoch within its run.
+    # "ordering and duration only -- valid within a run, never compared across
+    # machines". A volunteer's clock can be wrong by any amount, so an absolute
+    # timestamp from this machine would claim an agreement with MARP's other
+    # timestamps that nothing checks.
+    #
+    # What these ARE: durations measured by the trainer. A machine an hour out
+    # of sync still measures 42 seconds as 42 seconds, so an offset does not
+    # depend on this computer's clock being right -- only on it ticking evenly.
+    #
+    # What these are NOT: a position on any MARP-wide timeline. If MARP ever
+    # places them on one by adding its own stamp for the run, that is MARP's
+    # doing and the accuracy of it is MARP's to state. Nothing here asserts it.
     #
     # The end is read off `epoch_time_start`, which by the time this callback
     # runs holds the moment the epoch ENDED -- Ultralytics reuses the one

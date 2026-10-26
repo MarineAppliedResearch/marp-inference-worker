@@ -487,7 +487,7 @@ def test_a_run_reports_its_provenance_and_passes_its_loss_weights(tmp_path, monk
     assert reported["train_script_commit"]["value"] == summary["train_script_commit"]
 
     # The loss weights are the submitter's, and are reported as such.
-    assert reported["box"] == {"value": 9.0, "type": "float", "source": "job"}
+    assert reported["box"] == {"value": 9.0, "type": "real", "source": "job"}
 
     # And they reached the trainer rather than only the record.
     assert model.train_kwargs["box"] == pytest.approx(9.0)
@@ -968,3 +968,125 @@ def test_no_offsets_without_an_origin() -> None:
     assert reported["duration_seconds"] == pytest.approx(20.0)
     assert "start_offset_s" not in reported
     assert "end_offset_s" not in reported
+
+
+# The only type names MARP's settings route accepts.
+# Written out here rather than imported from the engine on purpose: a test that
+# imported the engine's own mapping would agree with whatever the engine says,
+# which is exactly the failure this pins. These four are MARP's contract, copied
+# from its 400: "must be one of: real, int, bool, text".
+CONTRACT_TYPE_NAMES = {"real", "int", "bool", "text"}
+
+
+# test_every_reported_setting_type_is_one_the_coordinator_accepts()
+# Verifies the whole report speaks MARP's vocabulary, not Python's.
+# Inputs: tmp_path and monkeypatch.
+# Output: pytest pass/fail result.
+#
+# **This is the test the defect needed and did not have.** Run 205 resolved
+# optimizer=AdamW, lr0=0.002 and momentum=0.9 perfectly and MARP stored none of
+# them: one entry typed "float" makes the route refuse the WHOLE report with a
+# 400, so the attempt recorded no settings at all. Every piece worked and two
+# words did not match.
+#
+# No test of our own behaviour could see that, because the engine agreed with
+# itself. So this one asserts against the contract's vocabulary, named here.
+def test_every_reported_setting_type_is_one_the_coordinator_accepts(tmp_path, monkeypatch) -> None:
+
+    a_stubbed_ultralytics(monkeypatch)
+
+    # One of each shape the allow-list can produce: float, int, bool and str.
+    spec = a_runnable_spec(
+        tmp_path, epochs=1, lr0=0.002, imgsz=512, cos_lr=True, optimizer="AdamW"
+    )
+
+    ctx = RunContext(tmp_path / "attempt")
+    ctx.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+    TrainingEngine().run(ctx, spec)
+
+    _engine, reported, _ignored = ctx.settings_reports[0]
+
+    # Every entry, including the worker's own provenance ones.
+    for name, entry in reported.items():
+        assert entry["type"] in CONTRACT_TYPE_NAMES, (
+            f"{name} was reported as {entry['type']!r}, which MARP refuses"
+        )
+
+    # And the four shapes landed where they should rather than all on text.
+    assert reported["lr0"]["type"] == "real"
+    assert reported["imgsz"]["type"] == "int"
+    assert reported["cos_lr"]["type"] == "bool"
+    assert reported["optimizer"]["type"] == "text"
+
+
+# test_pythons_type_names_never_reach_the_report()
+# The named negative: the two words that actually broke run 205.
+# Inputs: tmp_path and monkeypatch.
+# Output: pytest pass/fail result.
+#
+# The test above would pass if a future entry were typed, say, "numeric" and the
+# set were widened to match. This one names "float" and "str" specifically,
+# because those are what Python hands you and what a new report will reach for.
+def test_pythons_type_names_never_reach_the_report(tmp_path, monkeypatch) -> None:
+
+    a_stubbed_ultralytics(monkeypatch)
+    spec = a_runnable_spec(tmp_path, epochs=1, lr0=0.002, optimizer="AdamW")
+
+    ctx = RunContext(tmp_path / "attempt")
+    ctx.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+    TrainingEngine().run(ctx, spec)
+
+    _engine, reported, _ignored = ctx.settings_reports[0]
+    emitted = {entry["type"] for entry in reported.values()}
+
+    assert "float" not in emitted
+    assert "str" not in emitted
+
+
+# test_the_resolved_report_speaks_the_contracts_vocabulary_too()
+# Verifies the second report, which is the one run 205 actually died on.
+# Inputs: none.
+# Output: pytest pass/fail result.
+def test_the_resolved_report_speaks_the_contracts_vocabulary_too() -> None:
+
+    trainer = FakeTrainer(0, {})
+    trainer.optimizer = FakeSGD([{"initial_lr": 0.002, "momentum": 0.9}])
+
+    resolved = training_module._resolved_training_settings(trainer)
+
+    assert resolved["optimizer"]["type"] == "text"
+    assert resolved["lr0"]["type"] == "real"
+    assert resolved["momentum"]["type"] == "real"
+
+    for entry in resolved.values():
+        assert entry["type"] in CONTRACT_TYPE_NAMES
+
+
+# test_an_unmappable_value_travels_as_text_rather_than_costing_the_report()
+# Verifies one odd value cannot take every setting down with it.
+# Inputs: none.
+# Output: pytest pass/fail result.
+#
+# A refused report is all-or-nothing, so the expensive failure is not a wrong
+# entry but a rejected batch. A type outside the four is carried as text.
+def test_an_unmappable_value_travels_as_text_rather_than_costing_the_report() -> None:
+
+    entry = training_module._setting_entry([10, 20], "job")
+
+    assert entry["type"] == "text"
+    assert entry["value"] == "[10, 20]"
+
+
+# test_a_boolean_is_not_reported_as_an_integer()
+# Verifies the one trap in Python's type system is handled.
+# Inputs: none.
+# Output: pytest pass/fail result.
+#
+# bool is a subclass of int, so an isinstance chain that tests int first reports
+# True as an integer. The mapping is keyed by type name precisely so it cannot.
+def test_a_boolean_is_not_reported_as_an_integer() -> None:
+
+    assert training_module._setting_entry(True, "job")["type"] == "bool"
+    assert training_module._setting_entry(1, "job")["type"] == "int"

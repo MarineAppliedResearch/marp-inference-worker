@@ -117,6 +117,49 @@ _TRAINING_DEFAULTS: dict[str, Any] = {
 }
 
 
+# The four type names MARP's settings contract accepts.
+#
+# They are not Python's, and the difference is not cosmetic. MARP validates
+# every entry against `real, int, bool, text`, and ONE entry typed "float" makes
+# it refuse the WHOLE report with a 400 -- so the attempt records no settings at
+# all. Run 205 resolved optimizer=AdamW, lr0=0.002 and momentum=0.9 exactly
+# right and stored none of them, because two words did not match (#268).
+#
+# The worker is the client and MARP's enum is the published contract, so the
+# translation belongs on this side. The tracking engine has always done this
+# through its own `_SETTING_TYPES`; training was written later and emitted
+# `type(value).__name__` instead, which is where the defect came from.
+#
+# Keyed by Python's type name rather than by isinstance, deliberately: bool is a
+# subclass of int, so an isinstance chain reports True as an integer unless bool
+# is tested first. A name lookup cannot make that mistake.
+_CONTRACT_TYPE_NAMES = {
+    "float": "real",
+    "int": "int",
+    "bool": "bool",
+    "str": "text",
+}
+
+
+# _setting_entry()
+# Builds one settings-report entry in the shape the coordinator validates.
+# Inputs: the value that will actually run, and where it came from.
+# Output: `{value, type, source}` with `type` in MARP's vocabulary.
+# Use this for EVERY entry, so the vocabulary lives in exactly one place and a
+# new report cannot reintroduce Python's names.
+def _setting_entry(value: Any, source: str) -> dict[str, Any]:
+
+    contract = _CONTRACT_TYPE_NAMES.get(type(value).__name__)
+
+    # Anything outside the four travels as text rather than being dropped or
+    # sent untranslated. A type the contract does not know would otherwise cost
+    # the entire report, and the entire report is what run 205 lost.
+    if contract is None:
+        return {"value": str(value), "type": "text", "source": source}
+
+    return {"value": value, "type": contract, "source": source}
+
+
 # _run_provenance()
 # The facts about a run that only the worker can state, as settings entries.
 # Inputs: the device this run resolved to.
@@ -139,19 +182,11 @@ def _run_provenance(device: str) -> dict[str, dict[str, Any]]:
     return {
         # Named for MARP's `training_runs.compute_device`. The resolved device,
         # which may or may not be the one the job named.
-        "compute_device": {
-            "value": device,
-            "type": "str",
-            "source": "worker",
-        },
+        "compute_device": _setting_entry(device, "worker"),
         # Named for MARP's `training_runs.train_script_commit`. A sha when the
         # worker runs from a checkout, the package version when it runs from an
         # installed wheel; see worker_revision() for why both are answers.
-        "train_script_commit": {
-            "value": worker_revision(),
-            "type": "str",
-            "source": "worker",
-        },
+        "train_script_commit": _setting_entry(worker_revision(), "worker"),
     }
 
 
@@ -184,11 +219,7 @@ def _resolved_training_settings(trainer: Any) -> dict[str, dict[str, Any]]:
 
     # The optimizer's class is the only honest statement of which one was
     # chosen; `args.optimizer` is still the request.
-    resolved["optimizer"] = {
-        "value": type(optimizer).__name__,
-        "type": "str",
-        "source": "resolved",
-    }
+    resolved["optimizer"] = _setting_entry(type(optimizer).__name__, "resolved")
 
     groups = getattr(optimizer, "param_groups", None) or []
     if not groups:
@@ -199,11 +230,7 @@ def _resolved_training_settings(trainer: Any) -> dict[str, dict[str, Any]]:
     # by the time anything can read it `lr` is no longer the run's lr0.
     first = groups[0]
     if "initial_lr" in first:
-        resolved["lr0"] = {
-            "value": float(first["initial_lr"]),
-            "type": "float",
-            "source": "resolved",
-        }
+        resolved["lr0"] = _setting_entry(float(first["initial_lr"]), "resolved")
 
     # Momentum lives in two places depending on which optimizer was chosen:
     # SGD-family optimizers have `momentum`, Adam-family ones keep it as the
@@ -213,11 +240,7 @@ def _resolved_training_settings(trainer: Any) -> dict[str, dict[str, Any]]:
         betas = first.get("betas") or ()
         momentum = betas[0] if betas else None
     if momentum is not None:
-        resolved["momentum"] = {
-            "value": float(momentum),
-            "type": "float",
-            "source": "resolved",
-        }
+        resolved["momentum"] = _setting_entry(float(momentum), "resolved")
 
     return resolved
 
@@ -421,7 +444,7 @@ class TrainingEngine(BaseEngine):
             ctx.report_settings(
                 self.engine_name,
                 {
-                    **{name: {"value": value, "type": type(value).__name__, "source": "job"}
+                    **{name: _setting_entry(value, "job")
                        for name, value in settings.items()},
                     **_run_provenance(device),
                 },

@@ -302,6 +302,32 @@ def _resolved_training_settings(trainer: Any) -> dict[str, dict[str, Any]]:
     return resolved
 
 
+# How often a live sample leaves the child, in seconds.
+#
+# Throttled by TIME rather than by batch count, because batches are not a unit
+# of time: a 4080 does several a second on small images and one every few
+# seconds on large ones, so "every N batches" gives a chart whose density
+# depends on the image size. A phase change always samples regardless.
+#
+# The rate is what a person watching can use, not what the wire can carry --
+# events are queued and batched upstream, so this costs little either way.
+_SAMPLE_INTERVAL_S = 2.5
+
+
+# The phase names live samples are filed under.
+#
+# **Distinct from the per-epoch rows on purpose.** Those already go through
+# report_metrics as `(epoch_number, "training", ...)`. If a batch sample used
+# the same phase, the two series would be told apart only by the magnitude of
+# `step` -- which works on every long run and collapses the first time a
+# one-epoch run makes both equal 1. Routing on a word cannot do that.
+#
+# PENDING: the exact strings belong to MARP's ingest and are not confirmed yet
+# (#268). They are here, in one place, so settling them is a two-line change.
+_BATCH_PHASE = "training_batch"
+_VAL_BATCH_PHASE = "validating_batch"
+
+
 # _epoch_metrics()
 # Everything one finished epoch can honestly say about itself.
 # Inputs: the Ultralytics trainer, at `on_fit_epoch_end`.
@@ -1153,6 +1179,17 @@ class TrainingEngine(BaseEngine):
         # fires from the trainer's constructor, where nothing is resolved yet.
         model.add_callback("on_train_start", state.on_train_start)
 
+        # The live ones. `on_train_batch_end` and `on_val_batch_end` fire once
+        # per batch -- many times a second on a fast card -- so both are
+        # throttled inside the handler rather than here.
+        #
+        # `on_val_batch_end` is handed the VALIDATOR, not the trainer: it has
+        # its own `batch_i` and `dataloader`, which is why the validator pause
+        # can have a bar at all.
+        model.add_callback("on_train_epoch_start", state.on_epoch_start)
+        model.add_callback("on_train_batch_end", state.on_batch_end)
+        model.add_callback("on_val_batch_end", state.on_val_batch_end)
+
         # `on_train_end` fires after final_eval() has validated the best
         # weights and after the plots are written (trainer.py:671-675), so it
         # is the first moment the run's own scores and files both exist. A
@@ -1196,6 +1233,13 @@ class _RunState:
 
         self.epochs_done = 0
         self.publishes = 0
+
+        # Live-sample bookkeeping. `_global_step` is monotonic across the whole
+        # run so batch points share one x axis; `_batch_in_epoch` resets each
+        # epoch because that is what the console line counts.
+        self._global_step = 0
+        self._batch_in_epoch = 0
+        self._last_sample_at = 0.0
         self.stopped_early = False
         self.best_metric: float | None = None
         self.last_metrics: dict[str, Any] = {}
@@ -1367,6 +1411,187 @@ class _RunState:
 
         if published:
             self._ctx.log(f"published {len(published)} run files")
+
+
+    # on_epoch_start()
+    # Resets the per-epoch batch counter and marks the phase change.
+    # Inputs: the Ultralytics trainer.
+    # Output: none.
+    def on_epoch_start(self, trainer: Any) -> None:
+
+        self._batch_in_epoch = 0
+
+        # A phase change always samples, however recently the last one went:
+        # it is the point of the chart that explains a flat stretch.
+        self._emit_sample(trainer, force=True)
+
+
+    # on_batch_end()
+    # Reports one live training sample, at most every few seconds.
+    # Inputs: the Ultralytics trainer.
+    # Output: none.
+    def on_batch_end(self, trainer: Any) -> None:
+
+        # Counted here rather than read off the trainer: Ultralytics keeps the
+        # batch index in a local variable inside its own loop and does not
+        # expose it. Counting the callback is exact, since it fires once per
+        # batch, and it is the only honest way to get the number.
+        self._batch_in_epoch += 1
+        self._global_step += 1
+
+        self._emit_sample(trainer)
+
+
+    # on_val_batch_end()
+    # Reports one live validation sample, at most every few seconds.
+    # Inputs: the VALIDATOR -- not the trainer.
+    # Output: none.
+    # Validation is a visible pause on the console, so it gets its own bar.
+    def on_val_batch_end(self, validator: Any) -> None:
+
+        now = time.monotonic()
+        if (now - self._last_sample_at) < _SAMPLE_INTERVAL_S:
+            return
+        self._last_sample_at = now
+
+        try:
+            sample: dict[str, Any] = {"at": time.time()}
+
+            batch = getattr(validator, "batch_i", None)
+            if batch is not None:
+                # batch_i is zero-based, and a person counts from one.
+                sample["batch"] = int(batch) + 1
+
+            loader = getattr(validator, "dataloader", None)
+            if loader is not None:
+                sample["batches_total"] = len(loader)
+
+            if len(sample) > 1:
+                self._ctx.report_metrics(self._global_step, _VAL_BATCH_PHASE, sample)
+        except Exception:
+            # A sample is worth nothing next to the run producing it.
+            pass
+
+
+    # _emit_sample()
+    # Builds and sends one live training sample.
+    # Inputs: the trainer, and whether to bypass the throttle.
+    # Output: none.
+    #
+    # **Every field is attempted separately and a failure drops only that
+    # field.** One unreadable number must never cost the sample, and no sample
+    # may ever cost the run -- training has real GPU hours in it and this is a
+    # chart (#268).
+    def _emit_sample(self, trainer: Any, force: bool = False) -> None:
+
+        now = time.monotonic()
+        if not force and (now - self._last_sample_at) < _SAMPLE_INTERVAL_S:
+            return
+        self._last_sample_at = now
+
+        try:
+            sample = self._live_sample(trainer)
+            if sample:
+                self._ctx.report_metrics(self._global_step, _BATCH_PHASE, sample)
+        except Exception:
+            pass
+
+
+    # _live_sample()
+    # What one live sample says, as numbers.
+    # Inputs: the trainer.
+    # Output: a JSON-safe mapping; empty when nothing could be read.
+    #
+    # Everything here is measured or derived from measurements. `it/s` and the
+    # epoch ETA are not reported by Ultralytics at all, but elapsed-since-epoch
+    # -start and the batch counts are real, so the division is arithmetic on
+    # measurements rather than an estimate dressed as one.
+    def _live_sample(self, trainer: Any) -> dict[str, Any]:
+
+        sample: dict[str, Any] = {
+            "at": time.time(),
+            "epoch": self.epochs_done + 1,
+            "epochs_total": self._total,
+            "batch": self._batch_in_epoch,
+        }
+
+        # Batches per epoch, for the denominator of the bar.
+        loader = getattr(trainer, "train_loader", None)
+        if loader is not None:
+            try:
+                sample["batches_total"] = len(loader)
+            except Exception:
+                pass
+
+        # The running mean losses, under the names the task itself uses --
+        # box/cls/dfl for a detector, a single `loss` for classify.
+        tloss = getattr(trainer, "tloss", None)
+        labeller = getattr(trainer, "label_loss_items", None)
+        if tloss is not None and callable(labeller):
+            try:
+                for name, value in labeller(tloss).items():
+                    number = _json_number(value)
+                    if number is not None:
+                        sample[str(name)] = number
+            except Exception:
+                pass
+
+        # The same number the console's GPU_mem column shows, in the same unit.
+        #
+        # `_get_memory()` is what trainer.py:594 formats into that column, and
+        # it already handles cuda, mps and cpu -- reaching for
+        # `accelerator.memory_reserved()` directly would be a second copy of
+        # that branching, wrong on two of the three. Private, so guarded: if a
+        # later Ultralytics drops it the field goes absent, which is the honest
+        # failure rather than a zero.
+        #
+        # Reads 0 on a CPU run, which is not a gap -- it is what the console
+        # prints, because no GPU memory is in use.
+        memory = getattr(trainer, "_get_memory", None)
+        if callable(memory):
+            try:
+                gigabytes = _json_number(memory())
+                if gigabytes is not None:
+                    sample["gpu_memory_gb"] = round(gigabytes, 3)
+            except Exception:
+                pass
+
+        args = getattr(trainer, "args", None)
+        imgsz = _json_number(getattr(args, "imgsz", None))
+        if imgsz is not None:
+            sample["imgsz"] = int(imgsz)
+
+        self._add_pace(trainer, sample)
+
+        return sample
+
+
+    # _add_pace()
+    # Adds iterations per second and the epoch's ETA, when they are knowable.
+    # Inputs: the trainer and the sample being built.
+    # Output: none; the sample is extended in place.
+    #
+    # Separate because it is the only part that divides, and division is where
+    # a plausible-looking wrong number comes from. Nothing is added before the
+    # first batch of an epoch has finished, because a rate over zero elapsed
+    # time is not slow -- it is undefined.
+    def _add_pace(self, trainer: Any, sample: dict[str, Any]) -> None:
+
+        started = _json_number(getattr(trainer, "epoch_time_start", None))
+        if started is None or self._batch_in_epoch <= 0:
+            return
+
+        elapsed = time.time() - started
+        if elapsed <= 0:
+            return
+
+        rate = self._batch_in_epoch / elapsed
+        sample["iterations_per_second"] = round(rate, 4)
+
+        total = sample.get("batches_total")
+        if isinstance(total, int) and total > self._batch_in_epoch and rate > 0:
+            remaining = (total - self._batch_in_epoch) / rate
+            sample["epoch_eta_seconds"] = round(remaining, 1)
 
 
     # best_weights_path()

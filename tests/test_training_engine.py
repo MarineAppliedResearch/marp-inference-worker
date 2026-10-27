@@ -20,6 +20,10 @@ import pytest
 import sys
 import types
 
+# time builds a trainer that has been running for a known number of seconds,
+# so the derived rate and ETA can be asserted against real arithmetic.
+import time
+
 # Path builds the fixture dataset and weights.
 from pathlib import Path
 
@@ -1784,3 +1788,243 @@ def test_the_engine_does_not_claim_to_be_a_detector() -> None:
 
     assert "task" not in described
     assert set(described["tasks"]) == {"detect", "segment", "classify"}
+
+
+# a_training_trainer()
+# A trainer as it looks mid-epoch, with the attributes the sampler reads.
+# Inputs: elapsed seconds since the epoch started, and batches per epoch.
+# Output: the fake trainer.
+def a_training_trainer(elapsed=2.0, batches=100):
+
+    trainer = FakeTrainer(0, {})
+    trainer.args = types.SimpleNamespace(task="detect", imgsz=640)
+    trainer.tloss = {"box_loss": 1.2, "cls_loss": 0.8, "dfl_loss": 0.9}
+    trainer.label_loss_items = lambda items, prefix="train": {
+        f"{prefix}/{k}": round(float(v), 5) for k, v in items.items()
+    }
+    trainer.train_loader = [None] * batches
+    trainer.epoch_time_start = time.time() - elapsed
+    trainer._get_memory = lambda: 7.25
+    return trainer
+
+
+# test_a_live_sample_carries_the_console_line()
+# Verifies the sample holds what a person watching the CLI would see.
+# Inputs: tmp_path and monkeypatch.
+# Output: pytest pass/fail result.
+def test_a_live_sample_carries_the_console_line(tmp_path, monkeypatch) -> None:
+
+    monkeypatch.setattr(training_module, "_SAMPLE_INTERVAL_S", 0.0)
+
+    ctx = RecordingContext()
+    state = training_module._RunState(ctx=ctx, total_epochs=10, run_root=tmp_path)
+
+    trainer = a_training_trainer(elapsed=2.0, batches=100)
+    state.on_batch_end(trainer)
+
+    step, phase, sample = ctx.metrics[-1]
+
+    assert phase == training_module._BATCH_PHASE
+    assert step == 1
+    assert sample["epoch"] == 1 and sample["epochs_total"] == 10
+    assert sample["batch"] == 1 and sample["batches_total"] == 100
+    assert sample["train/box_loss"] == pytest.approx(1.2)
+    assert sample["gpu_memory_gb"] == pytest.approx(7.25)
+    assert sample["imgsz"] == 640
+    assert "at" in sample
+
+
+# test_the_pace_is_arithmetic_on_measurements()
+# Verifies it/s and the ETA are derived, not estimated.
+# Inputs: tmp_path and monkeypatch.
+# Output: pytest pass/fail result.
+#
+# Elapsed-since-epoch-start and the batch counts are both real, so the division
+# is arithmetic rather than a guess. Ten batches in two seconds is five a
+# second, and ninety left at five a second is eighteen seconds.
+def test_the_pace_is_arithmetic_on_measurements(tmp_path, monkeypatch) -> None:
+
+    monkeypatch.setattr(training_module, "_SAMPLE_INTERVAL_S", 0.0)
+
+    ctx = RecordingContext()
+    state = training_module._RunState(ctx=ctx, total_epochs=1, run_root=tmp_path)
+
+    trainer = a_training_trainer(elapsed=2.0, batches=100)
+    for _ in range(10):
+        state.on_batch_end(trainer)
+
+    _step, _phase, sample = ctx.metrics[-1]
+
+    assert sample["iterations_per_second"] == pytest.approx(5.0, rel=0.05)
+    assert sample["epoch_eta_seconds"] == pytest.approx(18.0, rel=0.05)
+
+
+# test_no_pace_before_the_first_batch_finishes()
+# Verifies a rate over no elapsed work is omitted rather than reported as zero.
+# Inputs: tmp_path and monkeypatch.
+# Output: pytest pass/fail result.
+#
+# A rate measured over zero batches is not slow, it is undefined. Reporting 0.0
+# would draw a chart starting at the floor on every epoch.
+def test_no_pace_before_the_first_batch_finishes(tmp_path, monkeypatch) -> None:
+
+    monkeypatch.setattr(training_module, "_SAMPLE_INTERVAL_S", 0.0)
+
+    ctx = RecordingContext()
+    state = training_module._RunState(ctx=ctx, total_epochs=1, run_root=tmp_path)
+
+    # on_epoch_start forces a sample with no batches done yet.
+    state.on_epoch_start(a_training_trainer())
+
+    _step, _phase, sample = ctx.metrics[-1]
+
+    assert "iterations_per_second" not in sample
+    assert "epoch_eta_seconds" not in sample
+
+
+# test_samples_are_throttled_but_a_phase_change_always_reports()
+# Verifies a fast card cannot flood, and a phase change is never lost.
+# Inputs: tmp_path and monkeypatch.
+# Output: pytest pass/fail result.
+#
+# Throttled by TIME rather than batch count, because batches are not a unit of
+# time: "every N batches" gives a chart whose density depends on image size.
+def test_samples_are_throttled_but_a_phase_change_always_reports(tmp_path, monkeypatch) -> None:
+
+    # Long enough that nothing in this test can clear it.
+    monkeypatch.setattr(training_module, "_SAMPLE_INTERVAL_S", 3600.0)
+
+    ctx = RecordingContext()
+    state = training_module._RunState(ctx=ctx, total_epochs=1, run_root=tmp_path)
+    trainer = a_training_trainer()
+
+    state.on_epoch_start(trainer)
+    before = len(ctx.metrics)
+
+    for _ in range(500):
+        state.on_batch_end(trainer)
+
+    # Five hundred batches, none of them sampled.
+    assert len(ctx.metrics) == before
+
+    # But the counters still moved, so the next sample is accurate.
+    assert state._global_step == 500
+    assert state._batch_in_epoch == 500
+
+
+# test_the_batch_counter_resets_each_epoch_and_the_step_does_not()
+# Verifies the two counters mean different things.
+# Inputs: tmp_path and monkeypatch.
+# Output: pytest pass/fail result.
+#
+# `batch` is what the console counts and restarts every epoch; `step` is the
+# run's x axis and must not, or every epoch would overwrite the last.
+def test_the_batch_counter_resets_each_epoch_and_the_step_does_not(tmp_path, monkeypatch) -> None:
+
+    monkeypatch.setattr(training_module, "_SAMPLE_INTERVAL_S", 0.0)
+
+    ctx = RecordingContext()
+    state = training_module._RunState(ctx=ctx, total_epochs=2, run_root=tmp_path)
+    trainer = a_training_trainer()
+
+    state.on_epoch_start(trainer)
+    for _ in range(3):
+        state.on_batch_end(trainer)
+
+    state.on_epoch_start(trainer)
+    state.on_batch_end(trainer)
+
+    _step, _phase, sample = ctx.metrics[-1]
+
+    assert sample["batch"] == 1
+    assert state._global_step == 4
+
+
+# test_the_live_phases_are_not_the_epoch_phase()
+# Verifies the two series can be told apart by a word, not by magnitude.
+# Inputs: none.
+# Output: pytest pass/fail result.
+#
+# **The per-epoch rows already use report_metrics with phase "training" and
+# step = the epoch number.** If live samples shared that phase, the two series
+# would be distinguishable only by how big `step` is -- which works on every
+# long run and collapses the first time a one-epoch run makes both equal 1.
+def test_the_live_phases_are_not_the_epoch_phase() -> None:
+
+    assert training_module._BATCH_PHASE != "training"
+    assert training_module._VAL_BATCH_PHASE != "training"
+    assert training_module._BATCH_PHASE != training_module._VAL_BATCH_PHASE
+
+
+# test_a_validation_sample_counts_the_validators_batches()
+# Verifies the validation pause gets its own bar.
+# Inputs: tmp_path and monkeypatch.
+# Output: pytest pass/fail result.
+#
+# The validator is handed to this callback, not the trainer -- it has its own
+# zero-based batch_i and dataloader, which is the only reason a bar is possible.
+def test_a_validation_sample_counts_the_validators_batches(tmp_path, monkeypatch) -> None:
+
+    monkeypatch.setattr(training_module, "_SAMPLE_INTERVAL_S", 0.0)
+
+    ctx = RecordingContext()
+    state = training_module._RunState(ctx=ctx, total_epochs=1, run_root=tmp_path)
+
+    validator = types.SimpleNamespace(batch_i=4, dataloader=[None] * 20)
+    state.on_val_batch_end(validator)
+
+    _step, phase, sample = ctx.metrics[-1]
+
+    assert phase == training_module._VAL_BATCH_PHASE
+    # batch_i is zero-based and a person counts from one.
+    assert sample["batch"] == 5
+    assert sample["batches_total"] == 20
+
+
+# test_one_unreadable_field_does_not_cost_the_sample()
+# Verifies a sample degrades rather than disappearing.
+# Inputs: tmp_path and monkeypatch.
+# Output: pytest pass/fail result.
+def test_one_unreadable_field_does_not_cost_the_sample(tmp_path, monkeypatch) -> None:
+
+    monkeypatch.setattr(training_module, "_SAMPLE_INTERVAL_S", 0.0)
+
+    ctx = RecordingContext()
+    state = training_module._RunState(ctx=ctx, total_epochs=1, run_root=tmp_path)
+
+    trainer = a_training_trainer()
+
+    def exploding():
+        raise RuntimeError("driver reset")
+
+    trainer._get_memory = exploding
+
+    state.on_batch_end(trainer)
+
+    _step, _phase, sample = ctx.metrics[-1]
+
+    assert "gpu_memory_gb" not in sample
+    assert sample["train/box_loss"] == pytest.approx(1.2)
+    assert sample["batch"] == 1
+
+
+# test_sampling_never_fails_the_run()
+# Verifies a chart cannot throw away GPU hours.
+# Inputs: tmp_path and monkeypatch.
+# Output: pytest pass/fail result.
+def test_sampling_never_fails_the_run(tmp_path, monkeypatch) -> None:
+
+    monkeypatch.setattr(training_module, "_SAMPLE_INTERVAL_S", 0.0)
+
+    class Exploding(RecordingContext):
+        def report_metrics(self, step, phase, metrics) -> None:
+            raise RuntimeError("coordinator went away")
+
+    state = training_module._RunState(
+        ctx=Exploding(), total_epochs=1, run_root=tmp_path
+    )
+
+    # None of these may raise.
+    state.on_epoch_start(a_training_trainer())
+    state.on_batch_end(a_training_trainer())
+    state.on_val_batch_end(types.SimpleNamespace(batch_i=0, dataloader=[None]))

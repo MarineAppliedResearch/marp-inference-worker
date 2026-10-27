@@ -41,6 +41,47 @@ _MAX_EVENTS_PER_BATCH = 500
 _WORKER_EVENT_KINDS = ("metric", "log", "settings")
 
 
+# What each kind of artifact actually is, by file extension.
+#
+# MARP records whatever the uploader declares and hands it back later, and the
+# dashboard decides "show this image" versus "offer this download" from it. The
+# worker used to declare `application/octet-stream` for everything -- PNGs, CSV
+# and JSON alike -- so every plot a training run produced rendered as a
+# download (#268, job 21787).
+#
+# An explicit table rather than `mimetypes.guess_type`: that reads the Windows
+# registry, so the same file could be declared differently on two volunteers'
+# machines depending on what they have installed. A record of what a file IS
+# should not depend on who uploaded it.
+#
+# `.pt` is listed deliberately rather than left to the fallback. Torch weights
+# have no registered media type, so octet-stream is the right answer -- and
+# saying so here means a reader can tell a considered answer from a default.
+_CONTENT_TYPES = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".csv": "text/csv",
+    ".json": "application/json",
+    ".jsonl": "application/x-ndjson",
+    ".txt": "text/plain",
+    ".yaml": "application/yaml",
+    ".yml": "application/yaml",
+    ".pt": "application/octet-stream",
+}
+
+
+# content_type_for()
+# What to declare an artifact as when uploading it.
+# Inputs: the file being uploaded.
+# Output: a media type string.
+# Use this for every upload. Anything unrecognised is octet-stream, which is
+# the honest "these are bytes and I will not guess" answer.
+def content_type_for(path: Path) -> str:
+
+    return _CONTENT_TYPES.get(path.suffix.lower(), "application/octet-stream")
+
+
 # CoordinatorError
 # Raised when a coordinator call fails in a way the caller must see.
 # Transient network trouble is retried by the runner's loop, not here.
@@ -570,8 +611,11 @@ class CoordinatorClient:
                     content=file_handle,
                     # Recorded against the staged bytes and handed back later,
                     # so a reader knows what it is looking at rather than
-                    # guessing.
-                    headers={"Content-Type": "application/octet-stream"},
+                    # guessing. Derived from the file, because declaring
+                    # octet-stream for everything made that comment a wish:
+                    # the dashboard reads this to decide image versus
+                    # download, and every plot came through as a download.
+                    headers={"Content-Type": content_type_for(path)},
                     timeout=self._long_poll_timeout_s,
                 )
         except httpx.HTTPError as error:

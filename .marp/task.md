@@ -1,94 +1,166 @@
 ---
-task: MarineAppliedResearch/marp-inference-worker#65
-repos: [marp-inference-worker]
+task: MarineAppliedResearch/MARP_API#268
+repos: [marp-inference-worker, MARP_API]
 status: implementing
 needs: []
 ---
 
 ## Goal
 
-A worker machine ran out of disk. Everything was under `<state>/jobs`, one directory per
-attempt, never removed, and almost all of it was a Chromium profile rebuilt from scratch
-for every job. At 86-101 attempts in twelve hours that is 14-24 GB a day against roughly
-20 KB a day of actual job output.
+The ML Dashboard's training page can now queue a training job, and its forms offer four
+Ultralytics arguments the worker refuses: the `box`, `cls` and `dfl` loss weights, and
+`mask_ratio`. A job that sets them trains at the defaults and the record says they were
+ignored.
 
-When this is done a worker's disk use is flat: the browser profile is set up once per slot
-and reused, it stops fetching things it cannot use, and a job workspace is removed once
-MARP has the result.
+Separately, three of `training_runs`' columns in MARP_API are never filled. Two of them
+can only be filled by this worker, because it is the only thing that knows the answer:
+`compute_device`, which is whatever the worker resolved rather than whatever the job
+asked for, and `train_script_commit`, which is which build of this worker ran.
+
+When this is done a training job can set the loss weights and have them honoured, and
+every training attempt tells MARP which GPU it used and which build of the worker
+produced it.
+
+`loss_function` and `augmentation` are explicitly out of scope: they are not parameters
+anywhere today and need designing before anything can report them.
 
 ## What was found
 
-Measured against 31 real workspaces left in a checkout's `.marp/local/`:
+**The loss weights are safe to accept and the exclusions are not arbitrary.** The
+allow-list exists because a handful of `model.train()` arguments change what a result
+*means* -- `project` and `name` decide where weights land, `resume` reinterprets the whole
+call, `device` is the worker's decision because a job is pinned to a slot. `box`, `cls`
+and `dfl` are gains on the three terms the detection loss is summed from. They change how
+well a run trains, never where its output goes or how it is read.
 
-| | size |
-| --- | --- |
-| `chromium-profile/` | 69 MB median, 123 MB max, ~700 files |
-| everything else in the workspace | under 206 KB |
+**`mask_ratio` is segmentation-only and inert elsewhere, not harmful.** Read from
+Ultralytics 8.4.145 rather than from documentation: it is handed to the `Format` transform
+for every task, at `data/dataset.py:328`, but read only under `return_mask`, which comes
+from the dataset's `use_segments`. A detection run that sets it trains exactly as if it
+had not.
 
-Two profiles made days apart were 81 MB of 122 MB byte-identical. They are the same bytes,
-fetched once per job: `optimization_guide_model_store` 35.8 MB, Safe Browsing lists
-15.8 MB, `OnDeviceHeadSuggestModel` 7.6 MB, `component_crx_cache` 7.6 MB.
+**Types are the library's, not a guess.** `ultralytics.cfg` lists `box`, `cls` and `dfl`
+in `CFG_FLOAT_KEYS` and `mask_ratio` in `CFG_INT_KEYS`; defaults are 7.5, 0.5, 1.5 and 4.
 
-**None of it is for anything this window does.** The watch window is a display surface for
-marp-video-player: one local page on `127.0.0.1`, no address bar, no browsing, no user.
-Every background service Chromium starts for a fresh profile is for a feature the window
-cannot use.
+**There is exactly one structured channel from an attempt to MARP, and it is the settings
+report.** The terminal result route records an outcome, a failure reason and artifact
+hashes and nothing else (`coordinator_client.report_result`). The engine's own run summary
+reaches the coordinator only inside a final log event's `terminal` field
+(`runner._report_terminal_detail`), where no column can be read out of it. The `settings`
+event is the one thing already shaped as typed, named, sourced values, and MARP already
+writes it to `gpu_attempt_settings` and `gpu_attempt_ignored_params`
+(MARP_API#232).
 
 ## Requirements
 
-- **R1** - The Chromium profile is per slot, not per attempt. It lives outside the job
-  workspace, is created on first use and is reused by every job that runs in that slot.
-- **R2** - A worker's windows are still only ever its own. `close()`, `_profile_in_use()`
-  and `close_orphaned_windows()` keep identifying a window by the profile path on its
-  command line; a per-slot path is still unique per window that can exist at once.
-- **R3** - Orphan cleanup at start covers the profile root. This matters more than before:
-  a ghost browser from a crashed worker holds a profile that is now about to be *reused*,
-  and Chromium routes a second launch into the existing instance rather than starting one.
-- **R4** - Chromium does no background networking and no component updating, and its disk
-  cache is capped.
-- **R5** - A job workspace is removed once the coordinator has accepted the result, and
-  only then: a result held for retry is re-offered by hash at the next start, which needs
-  the artifact still on disk.
-- **R6** - Leftover workspaces from previous runs are pruned at worker start.
-- **R7** - Nothing is removed outside the worker's own roots.
+- **R1** A training job may set `box`, `cls` and `dfl`, cast to float, and they reach
+  Ultralytics rather than being reported ignored.
+- **R2** A training job may set `mask_ratio`, cast to int.
+- **R3** Widening the allow-list does not admit `project`, `name`, `resume` or `device`.
+- **R4** Every training attempt reports `compute_device` -- the device `resolve_device()`
+  settled on, which a job's request is only one input to -- in its settings report, with
+  `source: "worker"`.
+- **R5** Every training attempt reports `train_script_commit` the same way, and always has
+  an answer: a commit sha from a checkout, the package version from an installed wheel.
+- **R6** A run started from a checkout with uncommitted changes says so, so a provenance
+  record never claims a reproducibility it does not have.
+- **R7** Every training attempt reports the `optimizer`, `lr0` and `momentum` Ultralytics
+  actually resolved, with `source: "resolved"`, in a second settings report sent before
+  the first epoch.
+- **R8** A value that cannot be read off the live optimizer is omitted, never filled in
+  from a default or from what was requested.
+- **R9** Every finished epoch reports its mean losses and its duration alongside the
+  validator's metrics, at the epoch boundary rather than at the end of the run.
+- **R10** A metric source that is absent contributes nothing, never a zero; a genuine
+  measurement of zero is still reported.
 
-## Design
+## The contract this changes
 
-`<state>/chromium-profiles/slot-<n>` beside `<state>/jobs` and `<state>/datasets`, which is
-where the machine-wide dataset cache already went for the same reason.
+MARP_API should expect two new entries in a **training** attempt's settings report, in the
+shape it already accepts:
 
-The runner is the only thing that knows the state directory, and `WatchDisplay` is built in
-the child process by `tracking_engine`, so the root travels in `params` exactly as
-`dataset_cache` does.
+```json
+{
+  "kind": "settings",
+  "payload": {
+    "engine": "marp_training",
+    "settings": {
+      "epochs":              {"value": 100,      "type": "int",   "source": "job"},
+      "box":                 {"value": 9.0,      "type": "float", "source": "job"},
+      "compute_device":      {"value": "cuda:0", "type": "str",   "source": "worker"},
+      "train_script_commit": {"value": "1a2b…",  "type": "str",   "source": "worker"}
+    },
+    "ignored": {}
+  }
+}
+```
 
-`ultralytics/` in the workspace is `YOLO_CONFIG_DIR` - a settings file, about 1 KB, per
-attempt so two concurrent jobs do not fight over one settings file. Same reasoning as the
-profile at the same wrong granularity, but it costs nothing and is left alone.
+A **second** settings report follows, from `on_train_start`, before epoch 1:
 
-## Not in scope
+```json
+{
+  "kind": "settings",
+  "payload": {
+    "engine": "marp_training",
+    "settings": {
+      "optimizer": {"value": "AdamW", "type": "str",   "source": "resolved"},
+      "lr0":       {"value": 0.002,   "type": "float", "source": "resolved"},
+      "momentum":  {"value": 0.9,     "type": "float", "source": "resolved"}
+    },
+    "ignored": {}
+  }
+}
+```
 
-- **One window for the worker rather than one per job.** The cleaner end state, and where
-  the per-slot profile stops being needed at all. It is a redesign of `watch/display.py`
-  and belongs with #60.
-- **`installation/updater.py` keeping every installed version.** Named in the issue as
-  secondary and separate.
-- **Dataset cache and gpu-artifacts eviction.** Neither has an issue.
+Three things the API side needs to know:
+
+- **`source: "worker"` is the discriminator.** Everything else in `settings` is
+  `"job"`. A reader must not treat `compute_device` as something the submitter chose; it
+  is what the worker resolved, which a job's request is only one input to.
+- **`train_script_commit` has two forms and they are distinguishable.** Forty hex
+  characters is a git commit, optionally suffixed `+dirty`. Anything else is the worker's
+  package version, which is the honest answer from a volunteer's wheel.
+- **`source: "resolved"` means Ultralytics decided it, and it overrides the `"job"` entry
+  of the same name.** `optimizer` and `lr0` appear in both reports when the job set them.
+  The resolved one is what ran. They differ whenever the job left `optimizer` at `auto` --
+  and `auto` also discards an `lr0` the job *did* send, which Ultralytics says in its own
+  log line, so the two disagreeing is normal rather than a fault.
+- **The second report is a second event, and MARP_API treats the first settings report as
+  the record.** Taking these values therefore needs a deliberate change on the API side:
+  either merge later reports when `source` is `"resolved"`, or read the resolved values
+  off the event. This is the one part that does not work by itself.
+- **An absent key means "could not be read", never "the default".** Nothing in the
+  resolved report is reconstructed.
+- **Nothing else changes.** No new event kind, no new route, no change to the result
+  payload. The names were chosen to match the `training_runs` columns they are for.
 
 ## Open assumptions
 
-- [x] **A1 - architectural - blocking** - answered 2026-10-21: one profile per slot rather
-      than one per worker. One per worker is what a display surface should need, and the
-      only thing preventing it is that a worker runs several jobs at once - slots are
-      derived from VRAM and CPU - and Chromium will not run two processes against one
-      `--user-data-dir`. Per slot is "set up once" for every window that can exist, and it
-      leaves the find-and-kill-by-profile-path mechanism working unchanged.
-- [x] **A2 - behavioural - blocking** - answered 2026-10-21: a long-lived profile directory
-      on a volunteer's machine is acceptable. It holds no history and no credentials and
-      only ever loads `127.0.0.1`.
-- [x] **A3 - destructive - blocking** - answered 2026-10-15 in the issue: a workspace is
-      deleted after the result is accepted, and `jobs/` is pruned at start.
+- [x] **A1 - API contract - blocking** - answered by the brief and by what is already
+  built: the two facts ride in the existing `settings` event rather than in a new channel.
+  The result route cannot carry them and the terminal log line cannot be read as a column.
+- [x] **A2 - behavioural - non-blocking** - `mask_ratio` is accepted although this engine
+  describes itself as `detect` and Ultralytics will ignore it there. Accepted anyway
+  because the dashboard offers it on its segmentation form and a job that sets it should
+  have the value recorded rather than filed as unrecognised. It is documented as
+  segmentation-only at the allow-list.
+- [x] **A4 - API contract - non-blocking** - the resolved values go in a *second* settings
+  report rather than being folded into the first. The first is sent before the model is
+  loaded, so none of them exist yet, and moving it would lose the property that an attempt
+  dying during setup still carries its record (MARP_API#232). The cost is that MARP_API's
+  "first report is the record" rule has to learn about `source: "resolved"`.
+- [x] **A5 - scientific/data-meaning - non-blocking** - `momentum` is reported although no
+  `training_runs` column asks for it. `optimizer='auto'` overrides momentum exactly as it
+  overrides lr0, so recording two of the three would leave the record quietly wrong about
+  the third. The settings catalogue registers names it does not know, so an unused entry
+  costs nothing and a missing one cannot be recovered later.
+- [x] **A3 - environment - non-blocking** - `train_script_commit` falls back to the
+  package version rather than being left empty when there is no git. A volunteer's
+  installed worker is the common case, and an empty column for every volunteer run is the
+  thing this requirement exists to stop.
 
-## Status
+## Not covered
 
-- **Branch:** `65-worker-storage`, the one branch for this work stream.
-- **Notes:** G2. A1 and A2 answered 2026-10-21 in conversation, A3 by the issue itself.
+No real training run. Training needs a CUDA device; what is proven here is the plumbing --
+which settings reach the trainer and what the attempt reports -- exercised through `run()`
+with a stubbed `ultralytics`. A run on the hardware is the human's.

@@ -57,6 +57,7 @@ _MODULES = [
     "marp_inference_worker.models.model_spec",
     "marp_inference_worker.reduction.keyframes",
     "marp_inference_worker.system.device",
+    "marp_inference_worker.system.provenance",
     "marp_inference_worker.system.resource_monitor",
     "marp_inference_worker.tracking.byte_tracker_adapter",
     "marp_inference_worker.tracking.observations",

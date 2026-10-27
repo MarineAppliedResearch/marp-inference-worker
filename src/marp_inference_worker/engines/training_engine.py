@@ -18,6 +18,14 @@
 # are already on local disk by the time run() is called, because the parent
 # process holds the only credential and does every fetch (#67 A8).
 
+# json writes the two end-of-run reports to disk before they are published.
+import json
+
+# math screens NaN and infinity out of those reports. Ultralytics produces
+# both, and json.dumps writes them as bare NaN/Infinity, which is not valid
+# JSON -- so one unmeasured class would make the whole artifact unparseable.
+import math
+
 # time rate-limits how often weights are published.
 import time
 
@@ -411,6 +419,392 @@ def _epoch_metrics(trainer: Any) -> dict[str, Any]:
     return metrics
 
 
+# The metric families this worker can report, by the attribute Ultralytics
+# keeps each one on.
+#
+# `box` and `seg` are the strings MARP's `metric_family` enum accepts, settled
+# with the API side -- and they are NOT validated there, so a wrong word would
+# not throw. It would store a row nobody renders and a table that silently
+# never appears, which is why the spelling is pinned here and tested.
+#
+# `seg` rather than `mask` deliberately: it is the name of the attribute
+# Ultralytics itself uses (`SegmentMetrics.seg`), where `(M)` is only the
+# suffix on its metric keys.
+#
+# A tuple of pairs rather than a hard-coded `.box`, so a segmentation run
+# reports two families from the same code and classification can be added as
+# one entry rather than a rewrite (#268).
+_METRIC_FAMILIES = (("box", "box"), ("seg", "seg"))
+
+
+# How the worker labels the confusion matrix's orientation.
+#
+# Said in the artifact rather than left to documentation, because Ultralytics'
+# `matrix[p][t]` is predicted-by-true -- the transpose of how a person reads
+# one -- and a reader that assumes the other way round produces a confident lie
+# about which species is confused with which.
+_MATRIX_ORIENTATION = "rows_predicted_cols_true"
+
+
+# The curve labels Ultralytics uses, mapped to the keys MARP stores.
+# Matched on the labels Ultralytics itself attaches in `curves_results` rather
+# than by position, so a reordering upstream drops nothing silently.
+_CURVE_KEYS = {"precision": "precision", "recall": "recall", "f1": "f1"}
+
+
+# _json_number()
+# Turns one metric into something JSON can actually carry.
+# Inputs: any value Ultralytics produced.
+# Output: a float, or None when there is no number to state.
+#
+# NaN is the case that matters. Ultralytics yields it for a class it could not
+# score, and `json.dumps` writes it as a bare `NaN`, which is not valid JSON --
+# so one unmeasured class would cost the entire artifact. None becomes `null`,
+# which is what this work says everywhere else: absence, not zero.
+def _json_number(value: Any) -> float | None:
+
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+
+    return None if math.isnan(number) or math.isinf(number) else number
+
+
+# _confusion_matrix_report()
+# The confusion matrix as numbers, labelled with its own axes.
+# Inputs: the validator, once the final validation has run.
+# Output: the matrix block, or None when there is nothing to report.
+#
+# **The axes carry their own class list, and that is the whole point.**
+# `ConfusionMatrix.names` is the model's FULL vocabulary, while the per-class
+# metrics are indexed by `ap_class_index`, which holds only the classes that
+# appeared in validation. One shared list for both silently shifts every axis
+# label after any species that was never evaluated -- and the rare species are
+# exactly the ones a reader is looking for.
+def _confusion_matrix_report(validator: Any) -> dict[str, Any] | None:
+
+    holder = getattr(validator, "confusion_matrix", None)
+    raw = getattr(holder, "matrix", None)
+    if raw is None:
+        return None
+
+    try:
+        rows = [[_json_number(cell) for cell in row] for row in raw.tolist()]
+    except Exception:
+        return None
+    if not rows:
+        return None
+
+    # The vocabulary, in index order. Keyed by class id, so sorted by key
+    # rather than trusting the dict's insertion order.
+    names = getattr(holder, "names", None) or {}
+    classes = [str(names[key]) for key in sorted(names)]
+
+    report: dict[str, Any] = {
+        "orientation": _MATRIX_ORIENTATION,
+        "classes": classes,
+        "matrix": rows,
+    }
+
+    # Detection's matrix is (n+1) square, the extra row and column being
+    # background. Classification's is n square and has none -- so the key is
+    # absent rather than null, the same absence rule as everywhere else.
+    # Derived from the matrix's own size rather than from the task, so it
+    # cannot disagree with the array it describes.
+    if len(rows) == len(classes) + 1:
+        report["background_index"] = len(classes)
+
+    return report
+
+
+# _overall_metrics()
+# One family's aggregate numbers.
+# Inputs: an Ultralytics Metric object (`metrics.box`, `metrics.seg`).
+# Output: the aggregate mapping.
+#
+# `mean_results()` returns exactly four values -- mean precision, mean recall,
+# mAP50, mAP50-95 -- and no F1. There is deliberately no `f1` here: Ultralytics
+# exposes no aggregate one, and `2PR/(P+R)` of the means is a different
+# quantity it never computes. An absent field beats a plausible invention.
+#
+# Both means are over the EVALUATED classes, not the vocabulary, so "overall"
+# does not describe species validation never saw.
+def _overall_metrics(family: Any) -> dict[str, Any]:
+
+    overall: dict[str, Any] = {}
+
+    try:
+        precision, recall, map50, map5095 = family.mean_results()
+    except Exception:
+        return overall
+
+    overall["precision"] = _json_number(precision)
+    overall["recall"] = _json_number(recall)
+    overall["map50"] = _json_number(map50)
+    overall["map5095"] = _json_number(map5095)
+
+    # Ultralytics weights fitness [0, 0, 0, 1], so today this equals map5095
+    # exactly. Sent anyway: it is the number checkpoints are ranked by, and the
+    # weights are Ultralytics' to change.
+    try:
+        overall["fitness"] = _json_number(family.fitness())
+    except Exception:
+        pass
+
+    return overall
+
+
+# _per_class_metrics()
+# One row per class that validation actually scored.
+# Inputs: the family's Metric object and the validator's metrics holder.
+# Output: a list of rows, each naming its own class.
+#
+# **Two different indexes, read in one loop, and Ultralytics' own code mixes
+# them.** `p`, `r`, `f1`, `ap50` and `ap` are indexed by position within the
+# evaluated set; `names`, `nt_per_class` and `nt_per_image` are indexed by
+# CLASS ID. Zipping them blind attributes one species' instance count to
+# another whenever some class went unevaluated. Each row therefore names
+# itself, and nothing downstream has to know which index it came from.
+#
+# A class with no validation instances gets NO ROW -- not a row of zeros.
+# "Never evaluated" and "scored zero" are different facts, and on a species
+# list whose rare classes are the point, conflating them is the expensive one.
+def _per_class_metrics(family: Any, metrics: Any) -> list[dict[str, Any]]:
+
+    rows: list[dict[str, Any]] = []
+
+    # `is None` rather than `or []`: ap_class_index is a numpy array, and
+    # `array or []` raises ValueError on anything with more than one element.
+    # That is not hypothetical -- it is what Ultralytics actually hands us, and
+    # the broad except around this call turned the crash into a report that
+    # silently carried no metrics at all.
+    raw_ids = getattr(family, "ap_class_index", None)
+    class_ids = [] if raw_ids is None else list(raw_ids)
+    if not class_ids:
+        return rows
+
+    names = getattr(metrics, "names", None) or {}
+    support = getattr(metrics, "nt_per_class", None)
+    images = getattr(metrics, "nt_per_image", None)
+
+    for position, raw_id in enumerate(class_ids):
+        class_id = int(raw_id)
+        row: dict[str, Any] = {"class": str(names.get(class_id, class_id))}
+
+        # Indexed by POSITION within the evaluated set.
+        for key, attribute in (
+            ("precision", "p"), ("recall", "r"), ("f1", "f1"),
+            ("ap50", "ap50"), ("ap5095", "ap"),
+        ):
+            series = getattr(family, attribute, None)
+            try:
+                row[key] = _json_number(series[position])
+            except Exception:
+                pass
+
+        # Indexed by CLASS ID. Counted things, so reported as integers.
+        for key, series in (("support", support), ("images", images)):
+            try:
+                count = _json_number(series[class_id])
+                if count is not None:
+                    row[key] = int(count)
+            except Exception:
+                pass
+
+        rows.append(row)
+
+    return rows
+
+
+# _metric_families()
+# Every family this run reported, as blocks.
+# Inputs: the validator's metrics holder.
+# Output: a list of family blocks; empty when none could be read.
+# Use this rather than reaching for `.box`: a segmentation run reports two
+# families from the same code, and a failure in one must not cost the other.
+def _metric_families(metrics: Any) -> list[dict[str, Any]]:
+
+    blocks: list[dict[str, Any]] = []
+
+    for attribute, family_name in _METRIC_FAMILIES:
+        family = getattr(metrics, attribute, None)
+        if family is None:
+            continue
+
+        try:
+            block = {
+                "family": family_name,
+                "overall": _overall_metrics(family),
+                "per_class": _per_class_metrics(family, metrics),
+            }
+        except Exception:
+            # One family that cannot be read must not cost the others.
+            continue
+
+        if block["overall"] or block["per_class"]:
+            blocks.append(block)
+
+    return blocks
+
+
+# _evaluated_split()
+# Which split the final validation actually ran against.
+# Inputs: the trainer.
+# Output: "val", "test", or None when the dataset named neither.
+# Stated rather than assumed: Ultralytics builds its validation loader from
+# `data["val"] or data["test"]`, so a dataset supplying only `test` is
+# validated on test, and recording "val" would be a small lie in a record.
+def _evaluated_split(trainer: Any) -> str | None:
+
+    data = getattr(trainer, "data", None) or {}
+    try:
+        if data.get("val"):
+            return "val"
+        if data.get("test"):
+            return "test"
+    except Exception:
+        pass
+    return None
+
+
+# _final_metrics_report()
+# The end-of-run report: what the trained model scores, as numbers.
+# Inputs: the trainer, at `on_train_end`.
+# Output: the report, or None when there is nothing worth sending.
+#
+# Assembled section by section, each able to fail alone. The lesson of run 205
+# is that an all-or-nothing payload turns one bad value into a total loss, so a
+# matrix that cannot be read still leaves the per-class rows, and the reverse.
+def _final_metrics_report(trainer: Any) -> dict[str, Any] | None:
+
+    validator = getattr(trainer, "validator", None)
+    if validator is None:
+        return None
+
+    report: dict[str, Any] = {"schema": 1}
+
+    task = getattr(getattr(trainer, "args", None), "task", None)
+    if task:
+        report["task"] = str(task)
+
+    split = _evaluated_split(trainer)
+    if split:
+        report["split"] = split
+
+    try:
+        matrix = _confusion_matrix_report(validator)
+    except Exception:
+        matrix = None
+    if matrix:
+        report["confusion_matrix"] = matrix
+
+    metrics = getattr(validator, "metrics", None)
+    families = _metric_families(metrics) if metrics is not None else []
+    if families:
+        report["metrics"] = families
+
+    # Nothing measured means nothing to say. An empty report would be a file
+    # claiming a run was scored when it was not.
+    if "confusion_matrix" not in report and "metrics" not in report:
+        return None
+
+    return report
+
+
+# _curves_report()
+# The P, R and F1 curves over confidence, as numbers.
+# Inputs: the trainer and the split it evaluated.
+# Output: the curves report, or None.
+#
+# **Three curves, not four.** `curves_results` also carries the PR curve, whose
+# x axis is RECALL while the other three are confidence -- Ultralytics reuses
+# one `px` array for both meanings and distinguishes them only by the label it
+# attaches. Storing the PR curve against a confidence axis would record a
+# recall value as a confidence. It is kept as `PR_curve.png`, and precision and
+# recall at every threshold reconstruct it anyway.
+#
+# `confidence` is stored once: all three share the one x axis.
+def _curves_report(trainer: Any, split: str | None) -> dict[str, Any] | None:
+
+    metrics = getattr(getattr(trainer, "validator", None), "metrics", None)
+    if metrics is None:
+        return None
+
+    for attribute, family_name in _METRIC_FAMILIES:
+        family = getattr(metrics, attribute, None)
+        if family is None:
+            continue
+
+        try:
+            raw_curves = getattr(family, "curves_results", None)
+            results = [] if raw_curves is None else list(raw_curves)
+        except Exception:
+            continue
+
+        confidence: list[Any] | None = None
+        curves: dict[str, Any] = {}
+
+        for entry in results:
+            try:
+                x_values, y_values, x_label, y_label = entry
+            except Exception:
+                continue
+
+            # Only the confidence-indexed curves. The PR curve's x is recall.
+            if str(x_label).strip().lower() != "confidence":
+                continue
+
+            key = _CURVE_KEYS.get(str(y_label).strip().lower())
+            if key is None:
+                continue
+
+            try:
+                # 5 decimals: these are 0-1 metrics interpolated over 1000
+                # points, so the sixth place is noise and the file halves.
+                curves[key] = [
+                    [_rounded(value) for value in series] for series in y_values
+                ]
+                if confidence is None:
+                    confidence = [_rounded(value) for value in x_values]
+            except Exception:
+                curves.pop(key, None)
+
+        if not curves or confidence is None:
+            continue
+
+        names = getattr(metrics, "names", None) or {}
+        # Same numpy trap as in _per_class_metrics: `array or []` raises.
+        raw_ids = getattr(family, "ap_class_index", None)
+        classes = [
+            str(names.get(int(c), int(c)))
+            for c in ([] if raw_ids is None else list(raw_ids))
+        ]
+
+        report: dict[str, Any] = {
+            "schema": 1,
+            "family": family_name,
+            "classes": classes,
+            "confidence": confidence,
+            "curves": curves,
+        }
+        if split:
+            report["split"] = split
+        return report
+
+    return None
+
+
+# _rounded()
+# One curve point, at the precision worth storing.
+# Inputs: a value from a curve array.
+# Output: the value to 5 decimals, or None when it is not a number.
+def _rounded(value: Any) -> float | None:
+
+    number = _json_number(value)
+    return None if number is None else round(number, 5)
+
+
 # TrainingEngine
 # Runs one YOLO training job and publishes the weights it produces.
 # Constructed once by the registry; every run happens in its own child process,
@@ -625,6 +1019,13 @@ class TrainingEngine(BaseEngine):
         # exists, and it is still before epoch 1. `on_pretrain_routine_start`
         # fires from the trainer's constructor, where nothing is resolved yet.
         model.add_callback("on_train_start", state.on_train_start)
+
+        # `on_train_end` fires after final_eval() has validated the best
+        # weights and after the plots are written (trainer.py:671-675), so it
+        # is the first moment the run's own scores and files both exist. A
+        # stopped run never reaches it, which is correct: there was no final
+        # validation, so there is nothing to report.
+        model.add_callback("on_train_end", state.on_train_end)
         model.add_callback("on_fit_epoch_end", state.on_epoch_end)
 
 
@@ -695,6 +1096,144 @@ class _RunState:
                 f"could not report what this run resolved: {type(error).__name__}: {error}",
                 level="warning",
             )
+
+
+    # on_train_end()
+    # Publishes what the finished run measured, and the files it drew.
+    # Inputs: the Ultralytics trainer, after the final validation.
+    # Output: none.
+    #
+    # Three kinds of thing leave here, and they are separate artifacts on
+    # purpose. The numbers are what MARP charts and compares between runs; the
+    # images are what the trainer actually produced and are kept as a fallback;
+    # the curves are a megabyte of their own and a reader who does not want them
+    # should not have to parse them to skip them.
+    #
+    # **Nothing here may fail the run.** Training has finished and the weights
+    # are already published by the time this runs, so a fault in bookkeeping
+    # would throw away a result that is complete. Every piece is attempted
+    # independently and every failure is a warning.
+    def on_train_end(self, trainer: Any) -> None:
+
+        split = None
+        try:
+            split = _evaluated_split(trainer)
+        except Exception:
+            pass
+
+        # The scores. Role is lower case and exact: MARP looks this one up by
+        # name, where the plot roles below are opaque to it.
+        try:
+            report = _final_metrics_report(trainer)
+            if report:
+                self._publish_json(report, "final_metrics")
+        except Exception as error:
+            self._ctx.log(
+                f"could not publish this run's metrics: {type(error).__name__}: {error}",
+                level="warning",
+            )
+
+        # The curves. Also looked up by name, also exact.
+        try:
+            curves = _curves_report(trainer, split)
+            if curves:
+                self._publish_json(curves, "metrics_curves")
+        except Exception as error:
+            self._ctx.log(
+                f"could not publish this run's curves: {type(error).__name__}: {error}",
+                level="warning",
+            )
+
+        # The plots Ultralytics drew.
+        try:
+            self._publish_run_files(trainer)
+        except Exception as error:
+            self._ctx.log(
+                f"could not publish this run's plots: {type(error).__name__}: {error}",
+                level="warning",
+            )
+
+
+    # _publish_json()
+    # Writes one report beside the run and hands it over.
+    # Inputs: the report and the role to publish it under.
+    # Output: none.
+    # Written to the attempt's own directory rather than the run directory, so
+    # it cannot collide with anything Ultralytics writes there.
+    def _publish_json(self, report: dict, role: str) -> None:
+
+        path = Path(self._ctx.checkpoint_dir) / f"{role}.json"
+
+        # allow_nan=False turns a stray NaN into an exception here rather than
+        # into a file MARP cannot parse. _json_number() should have caught them
+        # all; this is the check that says so.
+        path.write_text(
+            json.dumps(report, indent=1, allow_nan=False), encoding="utf-8"
+        )
+
+        sha256 = self._ctx.publish_artifact(path, role)
+        self._ctx.log(f"published {role} sha256={sha256}")
+
+
+    # _publish_run_files()
+    # Hands over the plots and the CSV Ultralytics wrote for this run.
+    # Inputs: the trainer, for its save_dir.
+    # Output: none.
+    #
+    # **The role is the real filename stem, verbatim.** `PR_curve`, not
+    # `pr_curve`: MARP stores the role as sent and serves it back under that
+    # name, and the dashboard keys off it, so lower-casing would make the record
+    # disagree with the run directory for no gain. There is no allow-list, which
+    # is the point -- a plot a later Ultralytics adds arrives rather than being
+    # dropped by a filter neither of us remembered to update.
+    #
+    # Top level only. `weights/` sits below this directory and holds best.pt and
+    # last.pt, which are around 130 MB each and are published separately.
+    def _publish_run_files(self, trainer: Any) -> None:
+
+        run_dir = None
+        save_dir = getattr(trainer, "save_dir", None)
+        if save_dir:
+            run_dir = Path(str(save_dir))
+        if run_dir is None or not run_dir.is_dir():
+            best = self.best_weights_path()
+            run_dir = best.parent.parent if best is not None else None
+        if run_dir is None or not run_dir.is_dir():
+            return
+
+        # Roles must be unique within an attempt -- the runner files artifacts
+        # into a mapping keyed by role, so a second one of the same name would
+        # replace the first in the record rather than sitting beside it.
+        published: set[str] = set()
+
+        for path in sorted(run_dir.iterdir()):
+            if not path.is_file():
+                continue
+            if path.suffix.lower() not in {".png", ".jpg", ".jpeg", ".csv"}:
+                continue
+
+            role = path.stem
+            if role in published:
+                self._ctx.log(
+                    f"two run files share the name {role!r}; kept the first",
+                    level="warning",
+                )
+                continue
+
+            try:
+                self._ctx.publish_artifact(path, role)
+            except Exception as error:
+                # One plot that could not be handed over is not a failed run.
+                self._ctx.log(
+                    f"could not publish {path.name}: {type(error).__name__}: {error}",
+                    level="warning",
+                )
+                continue
+
+            published.add(role)
+
+        if published:
+            self._ctx.log(f"published {len(published)} run files")
 
 
     # best_weights_path()

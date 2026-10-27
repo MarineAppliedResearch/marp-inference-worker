@@ -1160,3 +1160,422 @@ def test_naming_the_card_never_costs_the_run(monkeypatch) -> None:
 
     assert training_module._device_hardware("cuda:0") == "cuda:0"
     assert training_module._run_provenance("cuda:0")["compute_device"]["value"] == "cuda:0"
+
+
+# The only `metric_family` values MARP's enum accepts.
+# Written out here, copied from the API side's built enum, and deliberately NOT
+# imported from the engine -- a test that imported our own constant would agree
+# with whatever we emit, which is the failure this pins. MARP does not validate
+# this field, so a wrong word would not throw: it would store a row nobody
+# renders and a table that silently never appears.
+CONTRACT_METRIC_FAMILIES = {"box", "seg", "classify"}
+
+# The two roles MARP looks up by name. Everything else is opaque to it and is
+# stored under whatever the worker sent.
+CONTRACT_EXACT_ROLES = {"final_metrics", "metrics_curves"}
+
+
+# FakeFamily
+# The attributes the end-of-run readers touch on an Ultralytics Metric.
+class FakeFamily:
+
+    def __init__(self, ap_class_index, p, r, f1, ap50, ap, curves=None) -> None:
+
+        self.ap_class_index = ap_class_index
+        self.p, self.r, self.f1, self.ap50, self.ap = p, r, f1, ap50, ap
+        self.curves_results = curves or []
+
+    def mean_results(self):
+        return [0.81, 0.74, 0.79, 0.52]
+
+    def fitness(self):
+        return 0.52
+
+
+# FakeMetrics
+# The validator's metrics holder: one family plus the class-id-indexed counts.
+class FakeMetrics:
+
+    def __init__(self, names, family, nt_per_class=None, nt_per_image=None) -> None:
+
+        self.names = names
+        self.box = family
+        self.nt_per_class = nt_per_class
+        self.nt_per_image = nt_per_image
+
+
+# FakeConfusion
+# Ultralytics' ConfusionMatrix, as far as the reader is concerned.
+class FakeConfusion:
+
+    def __init__(self, names, matrix) -> None:
+
+        self.names = names
+        self.matrix = matrix
+
+
+# FakeValidator
+class FakeValidator:
+
+    def __init__(self, confusion, metrics) -> None:
+
+        self.confusion_matrix = confusion
+        self.metrics = metrics
+
+
+# a_finished_trainer()
+# A trainer as it looks at on_train_end, with three classes and two evaluated.
+# Inputs: optional overrides.
+# Output: the fake trainer.
+#
+# Three in the vocabulary and two evaluated is the shape that matters: it is
+# the case where the confusion matrix's axes and the per-class rows disagree,
+# which is the defect this whole artifact shape was corrected for.
+def a_finished_trainer(matrix=None, curves=None, names=None):
+
+    import numpy as np
+
+    names = names if names is not None else {0: "Lingcod", 1: "Rockfish", 2: "Cookie star"}
+    family = FakeFamily(
+        ap_class_index=np.array([0, 2]),           # class 1 never evaluated
+        p=[0.90, 0.60], r=[0.80, 0.50], f1=[0.85, 0.55],
+        ap50=[0.88, 0.40], ap=[0.61, 0.22],
+        curves=curves,
+    )
+    metrics = FakeMetrics(
+        names=names,
+        family=family,
+        nt_per_class=[142, 0, 7],                  # indexed by CLASS ID
+        nt_per_image=[37, 0, 5],
+    )
+    if matrix is None:
+        matrix = np.array([[8.0, 1, 1, 0], [0, 9, 1, 0], [2, 0, 8, 0], [1, 0, 2, 0]])
+
+    trainer = FakeTrainer(0, {})
+    trainer.args = types.SimpleNamespace(task="detect")
+    trainer.data = {"val": "images/val"}
+    trainer.validator = FakeValidator(FakeConfusion(names, matrix), metrics)
+    return trainer
+
+
+# test_the_matrix_axes_carry_the_full_vocabulary()
+# Verifies the correction that this artifact shape exists for.
+# Inputs: none.
+# Output: pytest pass/fail result.
+#
+# **`ConfusionMatrix.names` is the FULL vocabulary; `ap_class_index` is only
+# what validation scored.** A species absent from validation is on the matrix
+# axes and has no metrics row. Labelling the axes from the evaluated list would
+# shift every label after it -- silently, and precisely on the rare species a
+# reader is looking for.
+def test_the_matrix_axes_carry_the_full_vocabulary() -> None:
+
+    report = training_module._final_metrics_report(a_finished_trainer())
+    matrix = report["confusion_matrix"]
+
+    assert matrix["classes"] == ["Lingcod", "Rockfish", "Cookie star"]
+
+    # Rockfish was never evaluated: on the axes, absent from the rows.
+    scored = [row["class"] for row in report["metrics"][0]["per_class"]]
+    assert scored == ["Lingcod", "Cookie star"]
+    assert "Rockfish" not in scored
+
+
+# test_background_is_derived_from_the_matrix_not_the_task()
+# Verifies background_index is checkable rather than trusted.
+# Inputs: none.
+# Output: pytest pass/fail result.
+def test_background_is_derived_from_the_matrix_not_the_task() -> None:
+
+    import numpy as np
+
+    report = training_module._final_metrics_report(a_finished_trainer())
+    matrix = report["confusion_matrix"]
+
+    # Always exactly len(classes), so a reader can verify rather than trust.
+    assert matrix["background_index"] == len(matrix["classes"]) == 3
+    assert len(matrix["matrix"]) == len(matrix["classes"]) + 1
+
+    # A square matrix has no background row, and the key is ABSENT rather than
+    # null -- the same absence rule as everywhere else in this work.
+    square = a_finished_trainer(matrix=np.zeros((3, 3)))
+    assert "background_index" not in training_module._final_metrics_report(
+        square
+    )["confusion_matrix"]
+
+
+# test_the_orientation_is_stated_rather_than_assumed()
+# Verifies the transpose trap is named in the payload.
+# Inputs: none.
+# Output: pytest pass/fail result.
+#
+# Ultralytics fills matrix[predicted][true], the transpose of how a person reads
+# one. A reader that assumes the other way round produces a confident lie about
+# which species is confused with which, so the array says which way it is.
+def test_the_orientation_is_stated_rather_than_assumed() -> None:
+
+    report = training_module._final_metrics_report(a_finished_trainer())
+
+    assert report["confusion_matrix"]["orientation"] == "rows_predicted_cols_true"
+
+
+# test_per_class_counts_come_from_the_class_id_not_the_position()
+# Verifies the dual-index trap is handled.
+# Inputs: none.
+# Output: pytest pass/fail result.
+#
+# `p`/`r`/`f1` are indexed by position within the evaluated set; `nt_per_class`
+# and `nt_per_image` are indexed by CLASS ID. Ultralytics' own code reads both
+# in one loop. Cookie star is class 2 but evaluated position 1, so a reader that
+# used the position would give it Rockfish's counts.
+def test_per_class_counts_come_from_the_class_id_not_the_position() -> None:
+
+    rows = training_module._final_metrics_report(
+        a_finished_trainer()
+    )["metrics"][0]["per_class"]
+
+    cookie = next(row for row in rows if row["class"] == "Cookie star")
+
+    # Class id 2 -> support 7, images 5. Position 1 would have given 0 and 0.
+    assert cookie["support"] == 7
+    assert cookie["images"] == 5
+    assert cookie["precision"] == pytest.approx(0.60)
+
+
+# test_the_family_is_a_word_marp_accepts()
+# The vocabulary test, against the contract rather than our own output.
+# Inputs: none.
+# Output: pytest pass/fail result.
+#
+# MARP does not validate this field: a wrong word is stored, renders nowhere,
+# and the table silently never appears. Nothing would throw, so only a test
+# naming the permitted values can catch it.
+def test_the_family_is_a_word_marp_accepts() -> None:
+
+    report = training_module._final_metrics_report(a_finished_trainer())
+
+    for block in report["metrics"]:
+        assert block["family"] in CONTRACT_METRIC_FAMILIES
+
+    assert report["metrics"][0]["family"] == "box"
+
+    # And the constant itself, since segmentation has no fake here yet.
+    assert {name for _attr, name in training_module._METRIC_FAMILIES} <= (
+        CONTRACT_METRIC_FAMILIES
+    )
+    assert ("seg", "seg") in training_module._METRIC_FAMILIES
+    assert not any(name == "mask" for _attr, name in training_module._METRIC_FAMILIES)
+
+
+# test_no_aggregate_f1_is_invented()
+# Verifies the one number Ultralytics does not expose stays absent.
+# Inputs: none.
+# Output: pytest pass/fail result.
+#
+# mean_results() returns four values and none is an F1. 2PR/(P+R) of the means
+# is a third quantity Ultralytics never computes, and it would sit in a column
+# whose other rows hold a real measurement.
+def test_no_aggregate_f1_is_invented() -> None:
+
+    overall = training_module._final_metrics_report(
+        a_finished_trainer()
+    )["metrics"][0]["overall"]
+
+    assert "f1" not in overall
+    assert overall["map50"] == pytest.approx(0.79)
+    assert overall["fitness"] == pytest.approx(0.52)
+
+
+# test_a_nan_becomes_null_rather_than_breaking_the_file()
+# Verifies an unscored class cannot cost the whole artifact.
+# Inputs: none.
+# Output: pytest pass/fail result.
+#
+# **json.dumps writes NaN as a bare `NaN`, which is not valid JSON.** Ultralytics
+# yields NaN for a class it could not score, so without this one unmeasured
+# species would make the entire report unparseable -- the run 205 failure in a
+# new place.
+def test_a_nan_becomes_null_rather_than_breaking_the_file() -> None:
+
+    import json as _json
+    import numpy as np
+
+    trainer = a_finished_trainer()
+    trainer.validator.metrics.box.p = [float("nan"), 0.60]
+
+    report = training_module._final_metrics_report(trainer)
+    rows = report["metrics"][0]["per_class"]
+
+    assert rows[0]["precision"] is None
+
+    # The real check: it survives a strict encode.
+    _json.dumps(report, allow_nan=False)
+
+
+# test_only_the_confidence_curves_are_sent()
+# Verifies the PR curve is dropped, and why.
+# Inputs: none.
+# Output: pytest pass/fail result.
+#
+# Ultralytics reuses ONE px array for two meanings: the PR curve's x axis is
+# recall, the other three are confidence. It distinguishes them only by the
+# label it attaches. Storing the PR curve against a confidence axis would record
+# a recall value as a confidence.
+def test_only_the_confidence_curves_are_sent() -> None:
+
+    px = [0.0, 0.5, 1.0]
+    curves = [
+        [px, [[0.9, 0.5, 0.1]], "Recall", "Precision"],      # the PR curve
+        [px, [[0.8, 0.6, 0.2]], "Confidence", "F1"],
+        [px, [[0.7, 0.5, 0.3]], "Confidence", "Precision"],
+        [px, [[0.6, 0.4, 0.2]], "Confidence", "Recall"],
+    ]
+
+    report = training_module._curves_report(a_finished_trainer(curves=curves), "val")
+
+    assert set(report["curves"]) == {"precision", "recall", "f1"}
+
+    # The confidence axis is stored once, not per curve.
+    assert report["confidence"] == [0.0, 0.5, 1.0]
+
+    # Precision came from the Confidence-labelled curve, not the PR one.
+    assert report["curves"]["precision"] == [[0.7, 0.5, 0.3]]
+
+    # The curve rows are the EVALUATED classes, parallel to the arrays.
+    assert report["classes"] == ["Lingcod", "Cookie star"]
+    assert report["family"] == "box"
+
+
+# test_one_unreadable_section_does_not_cost_the_others()
+# Verifies the run 205 lesson is built in.
+# Inputs: none.
+# Output: pytest pass/fail result.
+#
+# An all-or-nothing payload turns one bad value into a total loss. A matrix that
+# cannot be read must still leave the per-class rows.
+def test_one_unreadable_section_does_not_cost_the_others() -> None:
+
+    trainer = a_finished_trainer()
+    trainer.validator.confusion_matrix = None
+
+    report = training_module._final_metrics_report(trainer)
+
+    assert "confusion_matrix" not in report
+    assert len(report["metrics"][0]["per_class"]) == 2
+
+
+# test_a_run_that_measured_nothing_sends_nothing()
+# Verifies an empty report is not written.
+# Inputs: none.
+# Output: pytest pass/fail result.
+#
+# A file saying `{"schema": 1}` would claim a run was scored when it was not.
+def test_a_run_that_measured_nothing_sends_nothing() -> None:
+
+    trainer = a_finished_trainer()
+    trainer.validator.confusion_matrix = None
+    trainer.validator.metrics = None
+
+    assert training_module._final_metrics_report(trainer) is None
+
+
+# PublishingContext
+# A RunContext that remembers every role it was asked to publish.
+class PublishingContext(RunContext):
+
+    def __init__(self, checkpoint_dir) -> None:
+
+        super().__init__(checkpoint_dir)
+        self.published: list[str] = []
+
+    def publish_artifact(self, path, kind) -> str:
+        assert path.is_file(), f"{path} was published but does not exist"
+        self.published.append(kind)
+        return "0" * 64
+
+
+# test_the_plot_roles_are_the_real_filename_stems()
+# Verifies case is preserved and nothing is filtered.
+# Inputs: tmp_path.
+# Output: pytest pass/fail result.
+#
+# MARP stores the role as sent and serves it back under that name, and the
+# dashboard keys off it, so `PR_curve` must not become `pr_curve` -- that would
+# make the record disagree with the run directory for no gain. There is no
+# allow-list on either side, which is the point: a plot a later Ultralytics adds
+# arrives rather than being dropped by a filter nobody updated.
+def test_the_plot_roles_are_the_real_filename_stems(tmp_path) -> None:
+
+    run_dir = tmp_path / "train" / "run"
+    (run_dir / "weights").mkdir(parents=True)
+    for name in (
+        "confusion_matrix.png", "confusion_matrix_normalized.png", "PR_curve.png",
+        "F1_curve.png", "labels_correlogram.jpg", "val_batch0_pred.jpg",
+        "results.csv", "a_plot_nobody_has_seen_yet.png",
+    ):
+        (run_dir / name).write_bytes(b"x")
+    # Weights are published separately and are ~130 MB; they must not come here.
+    (run_dir / "weights" / "best.pt").write_bytes(b"x")
+
+    ctx = PublishingContext(tmp_path)
+    state = training_module._RunState(ctx=ctx, total_epochs=1, run_root=tmp_path / "train")
+
+    trainer = a_finished_trainer()
+    trainer.save_dir = run_dir
+    state._publish_run_files(trainer)
+
+    assert "PR_curve" in ctx.published
+    assert "F1_curve" in ctx.published
+    assert "pr_curve" not in ctx.published
+    assert "results" in ctx.published
+
+    # A stem neither side anticipated arrives rather than being filtered.
+    assert "a_plot_nobody_has_seen_yet" in ctx.published
+
+    # And the weights did not.
+    assert "best" not in ctx.published
+
+
+# test_the_two_looked_up_roles_are_exactly_lowercase()
+# Verifies the two names MARP matches literally.
+# Inputs: tmp_path.
+# Output: pytest pass/fail result.
+#
+# Every other role is opaque to MARP and stored as sent. These two are looked up
+# by name, so their spelling is a contract rather than a label.
+def test_the_two_looked_up_roles_are_exactly_lowercase(tmp_path) -> None:
+
+    ctx = PublishingContext(tmp_path)
+    state = training_module._RunState(ctx=ctx, total_epochs=1, run_root=tmp_path)
+
+    state.on_train_end(a_finished_trainer(curves=[
+        [[0.0, 1.0], [[0.5, 0.4]], "Confidence", "F1"],
+        [[0.0, 1.0], [[0.6, 0.3]], "Confidence", "Precision"],
+        [[0.0, 1.0], [[0.7, 0.2]], "Confidence", "Recall"],
+    ]))
+
+    assert "final_metrics" in ctx.published
+    assert "metrics_curves" in ctx.published
+    assert CONTRACT_EXACT_ROLES <= set(ctx.published)
+
+
+# test_bookkeeping_never_fails_a_finished_run()
+# Verifies a publishing fault cannot throw away a completed run.
+# Inputs: tmp_path.
+# Output: pytest pass/fail result.
+#
+# By the time this callback runs the training is done and the weights are
+# already published. A fault here would discard a complete result over a report.
+def test_bookkeeping_never_fails_a_finished_run(tmp_path) -> None:
+
+    class Exploding(PublishingContext):
+        def publish_artifact(self, path, kind) -> str:
+            raise RuntimeError("coordinator went away")
+
+    ctx = Exploding(tmp_path)
+    state = training_module._RunState(ctx=ctx, total_epochs=1, run_root=tmp_path)
+
+    # Must not raise.
+    state.on_train_end(a_finished_trainer())
+
+    assert any("could not publish" in line for line in ctx.logs)

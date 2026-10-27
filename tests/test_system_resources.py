@@ -149,3 +149,84 @@ def test_one_unreadable_block_does_not_cost_the_others(monkeypatch) -> None:
 
     assert "memory" not in sample
     assert "cpu" in sample and "disk" in sample
+
+
+# test_the_first_cpu_sample_is_null_not_zero()
+# Verifies "not measured yet" does not draw as "idle".
+# Inputs: monkeypatch.
+# Output: pytest pass/fail result.
+#
+# **psutil returns 0.0 when it has no previous call to compare against.** On a
+# chart a zero means the machine was idle, and "no window yet" is not that: a
+# line breaks on null and draws a gap, but draws a zero as a floor. Every
+# worker's chart would have opened with a dip to the bottom that never
+# happened.
+#
+# Only this side can tell them apart -- here it is just "is this the first
+# call", and from the series a worker's first sample looks exactly like a
+# genuinely idle minute after a restart.
+def test_the_first_cpu_sample_is_null_not_zero(monkeypatch) -> None:
+
+    monkeypatch.setattr(resource_monitor, "_CPU_SAMPLED_BEFORE", False)
+    monkeypatch.setattr(psutil, "cpu_percent", lambda interval=None, percpu=False: 0.0)
+
+    first = resource_monitor._get_sampled_cpu()
+    assert first["cpu_percent"] is None
+
+    # The counts are real on the first sample and are still reported.
+    assert first["physical_cpu_count"] is not None
+
+
+# test_a_genuine_zero_is_still_reported()
+# The control for the test above.
+# Inputs: monkeypatch.
+# Output: pytest pass/fail result.
+#
+# Without it, returning None unconditionally would pass -- and an idle machine
+# would then be indistinguishable from an unmeasured one, which is the same
+# defect pointing the other way.
+def test_a_genuine_zero_is_still_reported(monkeypatch) -> None:
+
+    monkeypatch.setattr(resource_monitor, "_CPU_SAMPLED_BEFORE", True)
+    monkeypatch.setattr(psutil, "cpu_percent", lambda interval=None, percpu=False: 0.0)
+
+    assert resource_monitor._get_sampled_cpu()["cpu_percent"] == 0.0
+
+
+# test_the_first_call_still_primes_the_next_one()
+# Verifies withholding the value does not cost the following sample.
+# Inputs: monkeypatch.
+# Output: pytest pass/fail result.
+#
+# psutil measures against its own previous call, so the first read must still
+# HAPPEN even though its value is withheld -- otherwise the second sample would
+# be the one with no window, and the gap would just move.
+def test_the_first_call_still_primes_the_next_one(monkeypatch) -> None:
+
+    calls = []
+    monkeypatch.setattr(resource_monitor, "_CPU_SAMPLED_BEFORE", False)
+    monkeypatch.setattr(
+        psutil, "cpu_percent",
+        lambda interval=None, percpu=False: (calls.append(1), 41.0)[1],
+    )
+
+    assert resource_monitor._get_sampled_cpu()["cpu_percent"] is None
+    assert len(calls) == 1, "psutil was not primed on the first sample"
+
+    assert resource_monitor._get_sampled_cpu()["cpu_percent"] == 41.0
+
+
+# test_the_sampled_memory_and_disk_keys_match_the_snapshot()
+# Verifies a chart keyed on the snapshot's names finds them in the sample.
+# Inputs: none.
+# Output: pytest pass/fail result.
+def test_the_sampled_memory_and_disk_keys_match_the_snapshot() -> None:
+
+    sample = resource_monitor.get_gpu_telemetry() or {}
+    snapshot = resource_monitor.get_system_resources()
+
+    for block in ("memory", "disk"):
+        assert set(sample[block]) == set(snapshot[block]), f"{block} keys differ"
+
+    for name in ("used_bytes", "total_bytes", "percent_used"):
+        assert name in sample["memory"]

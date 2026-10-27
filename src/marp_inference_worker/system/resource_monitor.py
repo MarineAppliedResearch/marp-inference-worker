@@ -83,6 +83,14 @@ def _get_sampled_system() -> dict[str, Any]:
     return sampled
 
 
+# Whether the non-blocking CPU read has been called in this process yet.
+#
+# psutil measures `cpu_percent(interval=None)` against its own previous call, so
+# the first one in a process has no window and reports 0.0. This flag is how the
+# sampler tells "not measured yet" from "idle".
+_CPU_SAMPLED_BEFORE = False
+
+
 # _get_sampled_cpu()
 # CPU pressure, read without blocking the heartbeat loop.
 #
@@ -95,12 +103,30 @@ def _get_sampled_system() -> dict[str, Any]:
 # is exactly what a once-every-ten-seconds sampler wants: the figure covers the
 # gap between samples rather than a tenth of a second snapshot of it.
 #
-# The first call after process start returns 0.0 by definition, having nothing
-# to compare against. That is one sample at the beginning of a worker's life.
+# **The first call reports None, not 0.0, and that distinction is the point.**
+# psutil returns 0.0 when it has no previous call to compare against -- but a
+# zero on a CPU chart means "this machine was idle", and "not measured yet" is
+# not that. A chart breaks its line on null and draws a gap; it draws a zero as
+# a floor, so every worker's chart would open with a dip to the bottom that
+# never happened.
+#
+# Only this side can tell the difference: here it is simply "is this the first
+# call", and from the series a worker's first sample is indistinguishable from
+# a genuinely idle minute after a restart. Same rule as everywhere else in this
+# work -- a gap must never read as a measurement.
 def _get_sampled_cpu() -> dict[str, Any]:
 
+    global _CPU_SAMPLED_BEFORE
+
+    # Primes psutil's baseline either way, so the NEXT call has a real window
+    # to measure over. Only the value is withheld.
+    percent = psutil.cpu_percent(interval=None)
+    if not _CPU_SAMPLED_BEFORE:
+        _CPU_SAMPLED_BEFORE = True
+        percent = None
+
     return {
-        "cpu_percent": psutil.cpu_percent(interval=None),
+        "cpu_percent": percent,
         "physical_cpu_count": psutil.cpu_count(logical=False),
         "logical_cpu_count": psutil.cpu_count(logical=True),
     }

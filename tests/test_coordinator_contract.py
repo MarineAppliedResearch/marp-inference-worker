@@ -34,6 +34,13 @@ from typing import Any
 
 import pytest
 
+# Path types the artifact filenames the content-type table is asserted against.
+from pathlib import Path
+
+# The module itself, for the content-type table, which is module-level rather
+# than a client method: what a file IS does not depend on a connection.
+from marp_inference_worker.jobs import coordinator_client
+
 from marp_inference_worker.jobs.coordinator_client import (
     CoordinatorClient,
     CoordinatorError,
@@ -684,9 +691,15 @@ def test_artifact_upload_posts_to_the_url_the_check_answered_with(coordinator, t
     assert upload["path"].startswith("/api/v2/gpu/artifacts/upload/" + "d" * 64)
     assert "attempt_id=228" in upload["path"]
 
-    # The bytes themselves, all of them, and labelled.
+    # The bytes themselves, all of them, and labelled as what they are.
+    #
+    # This asserted `application/octet-stream` and passed, because that is what
+    # the worker hard-coded for every artifact -- so the test agreed with the
+    # defect rather than with the file. MARP records what the uploader declares
+    # and the dashboard reads it to decide image-versus-download, which is why
+    # every plot job 21787 produced rendered as a download (#268).
     assert upload["raw_bytes"] == artifact.stat().st_size
-    assert upload["headers"]["Content-Type"] == "application/octet-stream"
+    assert upload["headers"]["Content-Type"] == "application/x-ndjson"
 
 
 # test_an_upload_the_coordinator_refuses_is_not_a_delivered_result()
@@ -1033,3 +1046,105 @@ def test_heartbeat_omits_telemetry_when_the_machine_has_no_gpu(coordinator) -> N
     body = recorder.for_path("/heartbeat")[-1]["body"]
 
     assert "telemetry" not in body
+
+
+# The artifact filenames a real training run actually produces.
+#
+# Taken from job 21787's artifacts rather than from what this worker's code
+# looks like it writes -- the detection curves arrive as `BoxPR_curve.png`, not
+# `PR_curve.png`, because Ultralytics prefixes them by task, and `train_batch0`
+# and `val_batch0_labels` come through as well. A test written from the source
+# would have missed all of those.
+REAL_TRAINING_ARTIFACTS = {
+    "BoxPR_curve.png": "image/png",
+    "BoxF1_curve.png": "image/png",
+    "BoxP_curve.png": "image/png",
+    "BoxR_curve.png": "image/png",
+    "confusion_matrix.png": "image/png",
+    "confusion_matrix_normalized.png": "image/png",
+    "labels.jpg": "image/jpeg",
+    "labels_correlogram.jpg": "image/jpeg",
+    "train_batch0.jpg": "image/jpeg",
+    "val_batch0_labels.jpg": "image/jpeg",
+    "val_batch0_pred.jpg": "image/jpeg",
+    "results.csv": "text/csv",
+    "final_metrics.json": "application/json",
+    "metrics_curves.json": "application/json",
+    "best.pt": "application/octet-stream",
+    "observations.jsonl": "application/x-ndjson",
+}
+
+
+# test_every_real_artifact_declares_what_it_is()
+# Verifies each file a run produces is declared as its own type.
+# Inputs: none.
+# Output: pytest pass/fail result.
+#
+# **MARP records whatever the uploader declares, and the dashboard reads it to
+# decide image-versus-download.** The worker declared `application/octet-stream`
+# for everything, so every plot job 21787 produced rendered as a download
+# rather than a picture. Nothing threw; it just looked wrong.
+def test_every_real_artifact_declares_what_it_is() -> None:
+
+    for filename, expected in REAL_TRAINING_ARTIFACTS.items():
+        actual = coordinator_client.content_type_for(Path(filename))
+        assert actual == expected, f"{filename} declared {actual}, expected {expected}"
+
+
+# test_the_images_are_not_downloads()
+# The sharp version of the test above.
+# Inputs: none.
+# Output: pytest pass/fail result.
+#
+# The one property that actually mattered: an image must not be octet-stream.
+# Stated separately because the table test would still pass if somebody
+# "corrected" both the map and the expectation to octet-stream together.
+def test_the_images_are_not_downloads() -> None:
+
+    for filename in REAL_TRAINING_ARTIFACTS:
+        if filename.endswith((".png", ".jpg", ".jpeg")):
+            declared = coordinator_client.content_type_for(Path(filename))
+            assert declared.startswith("image/"), f"{filename} would render as a download"
+
+
+# test_an_unknown_extension_is_not_guessed()
+# Verifies the fallback says "bytes" rather than inventing a type.
+# Inputs: none.
+# Output: pytest pass/fail result.
+def test_an_unknown_extension_is_not_guessed() -> None:
+
+    assert coordinator_client.content_type_for(Path("x.weird")) == "application/octet-stream"
+    assert coordinator_client.content_type_for(Path("noextension")) == "application/octet-stream"
+
+
+# test_the_type_does_not_depend_on_the_machine()
+# Verifies the table is explicit rather than read from the OS.
+# Inputs: monkeypatch.
+# Output: pytest pass/fail result.
+#
+# `mimetypes.guess_type` reads the Windows registry, so the same PNG could be
+# declared differently on two volunteers' machines depending on what they have
+# installed. A record of what a file IS must not depend on who uploaded it.
+def test_the_type_does_not_depend_on_the_machine(monkeypatch) -> None:
+
+    import mimetypes
+
+    def should_not_be_called(*_args, **_kwargs):
+        raise AssertionError("content type was read from the machine, not the table")
+
+    monkeypatch.setattr(mimetypes, "guess_type", should_not_be_called)
+
+    assert coordinator_client.content_type_for(Path("BoxPR_curve.png")) == "image/png"
+
+
+# test_case_does_not_change_the_answer()
+# Verifies an upper-case extension still declares its type.
+# Inputs: none.
+# Output: pytest pass/fail result.
+#
+# Ultralytics writes lower-case, but a dataset's own images may not, and a
+# `.JPG` silently becoming a download is the same defect in a new costume.
+def test_case_does_not_change_the_answer() -> None:
+
+    assert coordinator_client.content_type_for(Path("PHOTO.JPG")) == "image/jpeg"
+    assert coordinator_client.content_type_for(Path("CHART.PNG")) == "image/png"

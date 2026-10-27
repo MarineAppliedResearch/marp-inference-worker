@@ -1547,12 +1547,22 @@ class _RunState:
         #
         # Reads 0 on a CPU run, which is not a gap -- it is what the console
         # prints, because no GPU memory is in use.
+        #
+        # **Sent as BYTES, although the console shows gigabytes.** At gigabyte
+        # precision a 700 MB reservation rounds to 0.0, which reads as "no
+        # memory" when it means "less than half a gigabyte" -- the same
+        # gap-that-looks-like-a-measurement this work keeps guarding against.
+        # The reader can scale; it cannot un-round.
+        #
+        # The multiplication is exact rather than approximate: `_get_memory()`
+        # divides the byte count by 2**30, and multiplying a float64 back by
+        # the same power of two recovers the original integer bit for bit.
         memory = getattr(trainer, "_get_memory", None)
         if callable(memory):
             try:
                 gigabytes = _json_number(memory())
                 if gigabytes is not None:
-                    sample["gpu_memory_gb"] = round(gigabytes, 3)
+                    sample["gpu_memory_bytes"] = int(round(gigabytes * (2 ** 30)))
             except Exception:
                 pass
 

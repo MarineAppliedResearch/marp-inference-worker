@@ -1829,7 +1829,9 @@ def test_a_live_sample_carries_the_console_line(tmp_path, monkeypatch) -> None:
     assert sample["epoch"] == 1 and sample["epochs_total"] == 10
     assert sample["batch"] == 1 and sample["batches_total"] == 100
     assert sample["train/box_loss"] == pytest.approx(1.2)
-    assert sample["gpu_memory_gb"] == pytest.approx(7.25)
+    # Bytes, not gigabytes: at GB precision a 700 MB reservation rounds to 0.0
+    # and reads as "no memory" when it means "less than half a gigabyte".
+    assert sample["gpu_memory_bytes"] == 7.25 * (2 ** 30)
     assert sample["imgsz"] == 640
     assert "at" in sample
 
@@ -2003,7 +2005,7 @@ def test_one_unreadable_field_does_not_cost_the_sample(tmp_path, monkeypatch) ->
 
     _step, _phase, sample = ctx.metrics[-1]
 
-    assert "gpu_memory_gb" not in sample
+    assert "gpu_memory_bytes" not in sample
     assert sample["train/box_loss"] == pytest.approx(1.2)
     assert sample["batch"] == 1
 
@@ -2028,3 +2030,35 @@ def test_sampling_never_fails_the_run(tmp_path, monkeypatch) -> None:
     state.on_epoch_start(a_training_trainer())
     state.on_batch_end(a_training_trainer())
     state.on_val_batch_end(types.SimpleNamespace(batch_i=0, dataloader=[None]))
+
+
+# test_a_sub_gigabyte_reservation_does_not_read_as_zero()
+# Verifies the unit choice that the GB form would have got wrong.
+# Inputs: tmp_path and monkeypatch.
+# Output: pytest pass/fail result.
+#
+# Ultralytics' console shows GPU_mem in gigabytes, and sending that number
+# would have been the obvious match. But at gigabyte precision a 700 MB
+# reservation rounds to 0.0, which reads as "no memory in use" when it means
+# "less than half a gigabyte" -- a gap wearing a measurement's clothes, which
+# is the failure this work keeps finding in new places.
+#
+# Bytes let the reader scale. A reader cannot un-round.
+def test_a_sub_gigabyte_reservation_does_not_read_as_zero(tmp_path, monkeypatch) -> None:
+
+    monkeypatch.setattr(training_module, "_SAMPLE_INTERVAL_S", 0.0)
+
+    ctx = RecordingContext()
+    state = training_module._RunState(ctx=ctx, total_epochs=1, run_root=tmp_path)
+
+    trainer = a_training_trainer()
+    seven_hundred_mb = 700 * 1024 * 1024
+    # _get_memory() reports gigabytes, which is what the console formats.
+    trainer._get_memory = lambda: seven_hundred_mb / (2 ** 30)
+
+    state.on_batch_end(trainer)
+
+    _step, _phase, sample = ctx.metrics[-1]
+
+    assert sample["gpu_memory_bytes"] == seven_hundred_mb
+    assert sample["gpu_memory_bytes"] != 0

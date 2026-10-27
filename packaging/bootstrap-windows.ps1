@@ -354,6 +354,12 @@ foreach ($Sid in @('*S-1-15-2-1', '*S-1-15-2-2')) {
     compute_runtime = $ComputeRuntime
     torch_version = $RuntimeTable.torch_version
     entrypoint = 'runtime/Scripts/marp-worker.exe'
+    # The commit this build came from, carried through from the payload so the
+    # INSTALLED worker can name it. Without this an installed worker has no
+    # .git to ask and reports its package version instead, so every run of
+    # every 0.1.8 build records the same `train_script_commit` and the column
+    # cannot distinguish two builds of one version (#268).
+    worker_commit = $BootstrapManifest.worker_commit
 } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $VersionRoot 'manifest.json') -Encoding utf8
 
 Copy-Item -LiteralPath (Join-Path $PayloadRoot 'launcher-windows.ps1') -Destination (Join-Path $InstallRoot 'launcher.ps1') -Force

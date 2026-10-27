@@ -12,6 +12,9 @@
 # machine it runs on -- that is `device.py` and `resource_monitor.py` -- and
 # anything about the coordinator.
 
+# json reads the commit an installed build recorded for itself.
+import json
+
 # subprocess asks git for the commit, when there is a git to ask.
 import subprocess
 
@@ -65,7 +68,48 @@ def _resolve_revision() -> str:
     if commit:
         return commit
 
+    # An installed build has no .git, but the installer wrote the commit into
+    # the version's manifest. Preferred over the package version because two
+    # builds of one version are otherwise indistinguishable in the record.
+    commit = _installed_commit()
+    if commit:
+        return commit
+
     return worker_version()
+
+
+# _installed_commit()
+# Reads the commit the installer recorded for this build.
+# Inputs: none.
+# Output: the sha, or None when this is not an installed build.
+#
+# Searched upward from this module rather than computed from a known layout.
+# The package sits several directories inside the version root
+# (`<version>/runtime/Lib/site-packages/marp_inference_worker/system/`), and a
+# path built from that depth would break silently the first time the installer
+# changed where it puts things. Walking up and looking for the file cannot.
+#
+# Bounded, so a source checkout does not walk to the filesystem root, and
+# matched on the key rather than the filename -- `manifest.json` is a common
+# enough name that finding one proves nothing on its own.
+def _installed_commit() -> str | None:
+
+    for parent in list(Path(__file__).resolve().parents)[:8]:
+        candidate = parent / "manifest.json"
+        if not candidate.is_file():
+            continue
+
+        try:
+            recorded = json.loads(candidate.read_text(encoding="utf-8-sig"))
+        except Exception:
+            # A manifest that will not parse is not this one.
+            continue
+
+        commit = recorded.get("worker_commit") if isinstance(recorded, dict) else None
+        if commit:
+            return str(commit)
+
+    return None
 
 
 # _git_commit()

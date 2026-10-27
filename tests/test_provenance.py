@@ -124,3 +124,102 @@ def test_this_checkout_can_say_what_it_is() -> None:
 
     assert isinstance(revision, str)
     assert revision.strip()
+
+
+# test_an_installed_build_names_its_commit(tmp_path, monkeypatch)
+# Verifies a worker with no git still records which build it is.
+# Inputs: tmp_path and monkeypatch.
+# Output: pytest pass/fail result.
+#
+# This is the volunteer's case and the common one. Until the installer carried
+# the commit through, an installed worker had no .git to ask and fell back to
+# its package version -- so every run of every 0.1.8 build recorded the same
+# `train_script_commit`, and the column could not tell two builds apart. That
+# is the whole job of that column.
+def test_an_installed_build_names_its_commit(tmp_path, monkeypatch) -> None:
+
+    clear_the_cache()
+    monkeypatch.setattr(provenance, "_git_commit", lambda: None)
+    monkeypatch.setattr(provenance, "worker_version", lambda: "0.1.8")
+
+    # The layout an install produces: the manifest sits several directories
+    # above the package, so it is found by searching upward.
+    version_root = tmp_path / "versions" / "0.1.8-cu128"
+    package = version_root / "runtime" / "Lib" / "site-packages" / "marp" / "system"
+    package.mkdir(parents=True)
+    (version_root / "manifest.json").write_text(
+        '{"version": "0.1.8", "worker_commit": "' + "a" * 40 + '"}', encoding="utf-8"
+    )
+
+    monkeypatch.setattr(provenance, "__file__", str(package / "provenance.py"))
+
+    assert provenance.worker_revision() == "a" * 40
+
+
+# test_a_manifest_without_a_commit_is_not_mistaken_for_one(tmp_path, monkeypatch)
+# Verifies the search matches on the key, not the filename.
+# Inputs: tmp_path and monkeypatch.
+# Output: pytest pass/fail result.
+#
+# `manifest.json` is a common enough name that finding one proves nothing.
+# Every install before this change wrote one WITHOUT a commit, so those must
+# fall through to the version rather than being treated as an answer.
+def test_a_manifest_without_a_commit_is_not_mistaken_for_one(tmp_path, monkeypatch) -> None:
+
+    clear_the_cache()
+    monkeypatch.setattr(provenance, "_git_commit", lambda: None)
+    monkeypatch.setattr(provenance, "worker_version", lambda: "0.1.7")
+
+    version_root = tmp_path / "versions" / "0.1.7-cu128"
+    package = version_root / "runtime" / "Lib" / "site-packages" / "marp" / "system"
+    package.mkdir(parents=True)
+
+    # Exactly what 0.1.4 through 0.1.8 wrote: no worker_commit.
+    (version_root / "manifest.json").write_text(
+        '{"version": "0.1.7", "platform": "windows"}', encoding="utf-8"
+    )
+
+    monkeypatch.setattr(provenance, "__file__", str(package / "provenance.py"))
+
+    assert provenance.worker_revision() == "0.1.7"
+
+
+# test_a_checkout_still_prefers_its_own_git(tmp_path, monkeypatch)
+# Verifies the order of preference did not invert.
+# Inputs: tmp_path and monkeypatch.
+# Output: pytest pass/fail result.
+#
+# A developer's checkout can say `+dirty`, which an installed manifest never
+# can, so git stays first. Without this test, a manifest left lying around in a
+# source tree would quietly outrank the real commit.
+def test_a_checkout_still_prefers_its_own_git(tmp_path, monkeypatch) -> None:
+
+    clear_the_cache()
+    monkeypatch.setattr(provenance, "_git_commit", lambda: "b" * 40 + "+dirty")
+
+    package = tmp_path / "pkg"
+    package.mkdir()
+    (tmp_path / "manifest.json").write_text(
+        '{"worker_commit": "' + "c" * 40 + '"}', encoding="utf-8"
+    )
+    monkeypatch.setattr(provenance, "__file__", str(package / "provenance.py"))
+
+    assert provenance.worker_revision() == "b" * 40 + "+dirty"
+
+
+# test_an_unreadable_manifest_is_skipped(tmp_path, monkeypatch)
+# Verifies a broken file does not cost the answer.
+# Inputs: tmp_path and monkeypatch.
+# Output: pytest pass/fail result.
+def test_an_unreadable_manifest_is_skipped(tmp_path, monkeypatch) -> None:
+
+    clear_the_cache()
+    monkeypatch.setattr(provenance, "_git_commit", lambda: None)
+    monkeypatch.setattr(provenance, "worker_version", lambda: "0.1.8")
+
+    package = tmp_path / "a" / "b"
+    package.mkdir(parents=True)
+    (tmp_path / "a" / "manifest.json").write_text("{not json", encoding="utf-8")
+    monkeypatch.setattr(provenance, "__file__", str(package / "provenance.py"))
+
+    assert provenance.worker_revision() == "0.1.8"

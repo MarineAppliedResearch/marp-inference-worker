@@ -46,17 +46,87 @@ import psutil
 # *before* the machine starts work. Averaged over a day of real jobs that reads
 # half a percent utilization, so a chart drawn from it would show a GPU farm that
 # is permanently idle. The reading only means anything taken while work runs.
+def _get_process_resources() -> dict[str, Any]:
+
+    # How long this worker process has been up, which is the one thing on the
+    # Workers page MARP cannot answer for itself: it knows when a worker last
+    # spoke, not when it started, so a machine that restarted between two polls
+    # looks identical to one that has been up for a week.
+    try:
+        started = psutil.Process().create_time()
+        return {"uptime_s": round(time.time() - started, 1), "pid": os.getpid()}
+    except Exception:
+        # One unreadable sensor never costs the report.
+        return {}
+
+
+# _get_sampled_system() helper, see get_gpu_telemetry().
+def _get_sampled_system() -> dict[str, Any]:
+
+    # The three blocks that belong on a chart over time rather than in a
+    # snapshot, under exactly the names `resources` already uses for them --
+    # two spellings of one fact is how a reader ends up not knowing which is
+    # current.
+    sampled: dict[str, Any] = {}
+    for name, read in (
+        ("cpu", _get_sampled_cpu),
+        ("memory", _get_memory_resources),
+        ("disk", lambda: _get_disk_resources(Path.cwd())),
+    ):
+        try:
+            block = read()
+            if block:
+                sampled[name] = block
+        except Exception:
+            # One block that will not read must not cost the other two.
+            continue
+    return sampled
+
+
+# _get_sampled_cpu()
+# CPU pressure, read without blocking the heartbeat loop.
+#
+# **`cpu_percent(interval=0.1)` BLOCKS for a tenth of a second**, which is what
+# the snapshot route uses and is fine there. This runs on the loop that
+# heartbeats every job on the machine, once per job every ten seconds, so four
+# slots would spend four tenths of a second a cycle sleeping inside a timer.
+#
+# `interval=None` returns the percentage since the previous call instead, which
+# is exactly what a once-every-ten-seconds sampler wants: the figure covers the
+# gap between samples rather than a tenth of a second snapshot of it.
+#
+# The first call after process start returns 0.0 by definition, having nothing
+# to compare against. That is one sample at the beginning of a worker's life.
+def _get_sampled_cpu() -> dict[str, Any]:
+
+    return {
+        "cpu_percent": psutil.cpu_percent(interval=None),
+        "physical_cpu_count": psutil.cpu_count(logical=False),
+        "logical_cpu_count": psutil.cpu_count(logical=True),
+    }
+
+
 def get_gpu_telemetry() -> dict[str, Any] | None:
 
     nvidia = _get_nvidia_resources()
     devices = nvidia.get("devices") or []
 
-    # None rather than an empty list, so the coordinator can tell "this machine
-    # has no GPU" from "this machine has one and it reported nothing".
-    if not devices:
-        return None
+    # CPU, memory and disk ride with the GPU numbers because they belong on the
+    # same chart: a snapshot in `capabilities` cannot show pressure over time,
+    # and these are the three Isaac asked to watch per worker.
+    #
+    # They are the same objects under the same names `resources` uses, so MARP
+    # does not end up holding two spellings of one fact.
+    sampled = _get_sampled_system()
 
-    return {"devices": devices}
+    # None rather than an empty list, so the coordinator can tell "this machine
+    # has no GPU" from "this machine has one and it reported nothing". A machine
+    # with no GPU still has a CPU worth charting, so the system blocks go up
+    # either way.
+    if not devices:
+        return {**sampled} or None
+
+    return {"devices": devices, **sampled}
 
 
 # Build one coordinator-friendly resource snapshot for this worker.
@@ -74,6 +144,7 @@ def get_system_resources() -> dict[str, Any]:
         "cpu": _get_cpu_resources(),
         "memory": _get_memory_resources(),
         "disk": _get_disk_resources(current_path),
+        "process": _get_process_resources(),
         "python": _get_python_resources(),
         "torch": _get_torch_resources(),
         "nvidia": _get_nvidia_resources(),

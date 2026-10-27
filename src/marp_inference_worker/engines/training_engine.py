@@ -35,7 +35,11 @@ from marp_inference_worker.engines.base_engine import (
 )
 
 # Device selection is the worker's decision, not the engine's.
-from marp_inference_worker.system.device import cuda_device_count, resolve_device
+from marp_inference_worker.system.device import (
+    cuda_device_count,
+    describe_cuda_devices,
+    resolve_device,
+)
 
 # Which build of this worker produced the run, for the attempt's record.
 from marp_inference_worker.system.provenance import worker_revision
@@ -179,15 +183,60 @@ def _setting_entry(value: Any, source: str) -> dict[str, Any]:
 # what lets a reader tell it apart from a request.
 def _run_provenance(device: str) -> dict[str, dict[str, Any]]:
 
-    return {
-        # Named for MARP's `training_runs.compute_device`. The resolved device,
-        # which may or may not be the one the job named.
-        "compute_device": _setting_entry(device, "worker"),
+    provenance = {
+        # Named for MARP's `training_runs.compute_device`, and carrying what
+        # that column actually asks for.
+        #
+        # **The column wants hardware, not a slot.** Its comment in the schema
+        # reads 'Hardware used for training (e.g. "RTX 6000 Ada", "A100 GPU")'.
+        # This used to send `cuda:0`, which answers a different question -- it
+        # says which device index the job was pinned to, not what the model was
+        # trained on. Two runs on two different cards both report "cuda:0", so
+        # the column could not have done its job even once it was being read.
+        "compute_device": _setting_entry(_device_hardware(device), "worker"),
+        # The slot is still worth keeping, it is just not the hardware. Which
+        # index ran matters when a multi-GPU machine misbehaves on one card.
+        "compute_device_index": _setting_entry(device, "worker"),
         # Named for MARP's `training_runs.train_script_commit`. A sha when the
         # worker runs from a checkout, the package version when it runs from an
         # installed wheel; see worker_revision() for why both are answers.
         "train_script_commit": _setting_entry(worker_revision(), "worker"),
     }
+
+    return provenance
+
+
+# _device_hardware()
+# Turns a resolved device string into the name of the thing that will run.
+# Inputs: the device string resolve_device() settled on ("cuda:0", "cpu").
+# Output: the card's model name, or the device string when there is no name.
+#
+# Falls back rather than inventing: a CPU run has no card to name, and a driver
+# that will not answer get_device_properties leaves describe_cuda_devices()
+# reporting an error for that index. In both cases the device string is the most
+# specific true thing available, which is what the old behaviour sent anyway.
+def _device_hardware(device: str) -> str:
+
+    text = str(device).strip().lower()
+    if not text.startswith("cuda"):
+        return str(device)
+
+    # "cuda" with no index means this slot's card, which resolve_device() has
+    # already turned into "cuda:N" by the time run() calls us. Guard anyway.
+    try:
+        index = int(text.split(":", 1)[1])
+    except (IndexError, ValueError):
+        return str(device)
+
+    try:
+        for described in describe_cuda_devices():
+            if described.get("index") == index and described.get("name"):
+                return str(described["name"])
+    except Exception:
+        # Naming the card is bookkeeping; it must never cost the run.
+        pass
+
+    return str(device)
 
 
 # _resolved_training_settings()

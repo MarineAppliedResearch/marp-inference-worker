@@ -482,7 +482,11 @@ def test_a_run_reports_its_provenance_and_passes_its_loss_weights(tmp_path, monk
     _engine, reported, _ignored = ctx.settings_reports[0]
 
     assert reported["compute_device"]["source"] == "worker"
-    assert reported["compute_device"]["value"] == summary["device"]
+
+    # `compute_device` is the CARD, not the slot -- MARP's column asks for
+    # hardware. The slot travels beside it, and that is what matches the
+    # summary's device string.
+    assert reported["compute_device_index"]["value"] == summary["device"]
     assert reported["train_script_commit"]["source"] == "worker"
     assert reported["train_script_commit"]["value"] == summary["train_script_commit"]
 
@@ -1090,3 +1094,69 @@ def test_a_boolean_is_not_reported_as_an_integer() -> None:
 
     assert training_module._setting_entry(True, "job")["type"] == "bool"
     assert training_module._setting_entry(1, "job")["type"] == "int"
+
+
+# test_compute_device_names_the_card_not_the_slot()
+# Verifies the column gets what it asks for.
+# Inputs: monkeypatch.
+# Output: pytest pass/fail result.
+#
+# MARP's schema comments that column 'Hardware used for training (e.g. "RTX
+# 6000 Ada", "A100 GPU")'. The worker used to send "cuda:0", which answers a
+# different question: it says which index the job was pinned to, not what the
+# model was trained on. Two runs on two different cards both report "cuda:0",
+# so the column could not have done its job even once something read it.
+def test_compute_device_names_the_card_not_the_slot(monkeypatch) -> None:
+
+    monkeypatch.setattr(
+        training_module, "describe_cuda_devices",
+        lambda: [{"index": 0, "name": "NVIDIA RTX 6000 Ada"},
+                 {"index": 1, "name": "NVIDIA A100"}],
+    )
+
+    assert training_module._device_hardware("cuda:1") == "NVIDIA A100"
+
+    provenance = training_module._run_provenance("cuda:1")
+    assert provenance["compute_device"]["value"] == "NVIDIA A100"
+
+    # And the slot is not lost -- which card misbehaved still matters.
+    assert provenance["compute_device_index"]["value"] == "cuda:1"
+
+
+# test_a_run_with_no_card_reports_the_device_it_had()
+# Verifies the fallbacks name something true rather than nothing.
+# Inputs: monkeypatch.
+# Output: pytest pass/fail result.
+#
+# A CPU run has no card to name, and a driver that will not answer leaves
+# describe_cuda_devices() without a name for that index. In both cases the
+# device string is the most specific true thing available.
+def test_a_run_with_no_card_reports_the_device_it_had(monkeypatch) -> None:
+
+    monkeypatch.setattr(training_module, "describe_cuda_devices", lambda: [])
+
+    assert training_module._device_hardware("cpu") == "cpu"
+    assert training_module._device_hardware("cuda:0") == "cuda:0"
+
+    # An index this machine does not have falls back rather than guessing at
+    # whichever card happens to be first.
+    monkeypatch.setattr(
+        training_module, "describe_cuda_devices",
+        lambda: [{"index": 0, "name": "NVIDIA A100"}],
+    )
+    assert training_module._device_hardware("cuda:3") == "cuda:3"
+
+
+# test_naming_the_card_never_costs_the_run()
+# Verifies a driver that throws does not take the report down with it.
+# Inputs: monkeypatch.
+# Output: pytest pass/fail result.
+def test_naming_the_card_never_costs_the_run(monkeypatch) -> None:
+
+    def exploding():
+        raise RuntimeError("driver reset")
+
+    monkeypatch.setattr(training_module, "describe_cuda_devices", exploding)
+
+    assert training_module._device_hardware("cuda:0") == "cuda:0"
+    assert training_module._run_provenance("cuda:0")["compute_device"]["value"] == "cuda:0"

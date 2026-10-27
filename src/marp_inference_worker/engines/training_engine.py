@@ -124,9 +124,49 @@ _ALLOWED_TRAINING_PARAMS = {
 # this worker's version rather than of whichever library version was installed.
 _TRAINING_DEFAULTS: dict[str, Any] = {
     "epochs": 100,
-    "imgsz": 640,
     "patience": 50,
 }
+
+
+# The image size a run falls back to, by what kind of dataset it was given.
+#
+# **These are different numbers because the tasks are different problems**, and
+# one default for both was wrong for whichever it was not chosen for.
+#
+# 640 is the detection size: ROV frames are large and the animals in them are
+# small, so resolution is the whole difficulty.
+#
+# 224 is what the pretrained `-cls` weights were themselves trained at, so a
+# classification run starts from the size its backbone expects. The crops are
+# 320x320 mosaic tiles, and 320 is a selection away in the dashboard for anyone
+# who wants to compare -- but the worker's own fallback had been 640, which
+# upscaled every tile fourfold for no new information and nobody had chosen it.
+#
+# A job that sets `imgsz` always wins over both; these only apply when it says
+# nothing.
+_DETECTION_IMGSZ = 640
+_CLASSIFY_IMGSZ = 224
+
+
+# _default_imgsz()
+# The image size to use when the job did not name one.
+# Inputs: the job params.
+# Output: the fallback size for this kind of dataset.
+#
+# Decided from what is on disk, the same way the data argument is: a data.yaml
+# means detection or segmentation, a directory means classification. The job
+# cannot declare a task -- the checkpoint owns that -- and this runs before
+# anything loads the checkpoint.
+def _default_imgsz(params: Mapping[str, Any]) -> int:
+
+    data = _training_data_argument(params)
+    if data is not None and data.is_dir():
+        return _CLASSIFY_IMGSZ
+
+    # A dataset that is unusable is refused by preflight anyway; falling back
+    # to the detection size here keeps the old behaviour for every job that
+    # has a data.yaml.
+    return _DETECTION_IMGSZ
 
 
 # The four type names MARP's settings contract accepts.
@@ -1143,6 +1183,10 @@ class TrainingEngine(BaseEngine):
 
         settings: dict[str, Any] = dict(_TRAINING_DEFAULTS)
         ignored: dict[str, Any] = {}
+
+        # Set before the job's own params are applied, so a job that names
+        # `imgsz` still overrides it below.
+        settings["imgsz"] = _default_imgsz(params)
 
         for name, value in params.items():
             # The worker's own keys are not submitter settings and are not

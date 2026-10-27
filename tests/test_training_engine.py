@@ -2062,3 +2062,59 @@ def test_a_sub_gigabyte_reservation_does_not_read_as_zero(tmp_path, monkeypatch)
 
     assert sample["gpu_memory_bytes"] == seven_hundred_mb
     assert sample["gpu_memory_bytes"] != 0
+
+
+# test_a_classification_run_defaults_to_the_size_its_weights_expect()
+# Verifies a classify job with no imgsz does not train at the detection size.
+# Inputs: tmp_path.
+# Output: pytest pass/fail result.
+#
+# **224 is what the pretrained `-cls` weights were themselves trained at**, so a
+# classification run starts from the size its backbone expects. The worker's own
+# fallback was 640, chosen for ROV frames where the animals are small and
+# resolution is the whole difficulty. Left alone, a classify run on 320x320
+# mosaic tiles would have upscaled every one of them fourfold, for no new
+# information, because nobody had chosen a number for it.
+def test_a_classification_run_defaults_to_the_size_its_weights_expect(tmp_path) -> None:
+
+    spec = a_classification_spec(tmp_path)
+
+    settings, _ignored = TrainingEngine()._training_settings(spec["params"])
+
+    assert settings["imgsz"] == 224
+
+
+# test_a_detection_run_still_defaults_to_the_frame_size()
+# The control: the classification default must not move detection.
+# Inputs: tmp_path.
+# Output: pytest pass/fail result.
+def test_a_detection_run_still_defaults_to_the_frame_size(tmp_path) -> None:
+
+    settings, _ignored = TrainingEngine()._training_settings(
+        a_runnable_spec(tmp_path)["params"]
+    )
+
+    assert settings["imgsz"] == 640
+
+
+# test_a_job_that_names_an_image_size_gets_it()
+# Verifies the defaults are only ever fallbacks.
+# Inputs: tmp_path.
+# Output: pytest pass/fail result.
+#
+# 320 matches the mosaic tiles exactly and is one selection away in the
+# dashboard, so one run of each can settle 224-versus-320 with data rather than
+# argument. That only works if an explicit choice actually wins.
+def test_a_job_that_names_an_image_size_gets_it(tmp_path) -> None:
+
+    engine = TrainingEngine()
+
+    classify, _ = engine._training_settings(
+        a_classification_spec(tmp_path, imgsz=320)["params"]
+    )
+    assert classify["imgsz"] == 320
+
+    detect, _ = engine._training_settings(
+        a_runnable_spec(tmp_path, imgsz=1280)["params"]
+    )
+    assert detect["imgsz"] == 1280

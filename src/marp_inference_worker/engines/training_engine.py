@@ -437,6 +437,19 @@ def _epoch_metrics(trainer: Any) -> dict[str, Any]:
 _METRIC_FAMILIES = (("box", "box"), ("seg", "seg"))
 
 
+# What a classification run reports instead, since it has no box or seg family.
+#
+# `ClassifyMetrics` carries no per-class anything -- no precision, recall or AP
+# per class, only these two aggregates -- so a classify block has no `per_class`
+# and its confusion matrix is the only per-class information the run produces.
+#
+# Read off a real one-epoch run rather than from documentation: the keys are
+# `metrics/accuracy_top1` and `metrics/accuracy_top5`, with no `(B)`/`(M)`
+# suffix, because that suffix distinguishes box from mask and classification is
+# neither.
+_CLASSIFY_ACCURACIES = (("accuracy_top1", "top1"), ("accuracy_top5", "top5"))
+
+
 # How the worker labels the confusion matrix's orientation.
 #
 # Said in the artifact rather than left to documentation, because Ultralytics'
@@ -633,19 +646,58 @@ def _metric_families(metrics: Any) -> list[dict[str, Any]]:
             continue
 
         try:
-            block = {
+            block: dict[str, Any] = {
                 "family": family_name,
                 "overall": _overall_metrics(family),
-                "per_class": _per_class_metrics(family, metrics),
             }
+            # Omitted when empty rather than sent as []: no rows means nothing
+            # was scored per class, which is absence, not an empty measurement.
+            rows = _per_class_metrics(family, metrics)
+            if rows:
+                block["per_class"] = rows
         except Exception:
             # One family that cannot be read must not cost the others.
             continue
 
-        if block["overall"] or block["per_class"]:
+        if block["overall"] or block.get("per_class"):
             blocks.append(block)
 
+    # Classification has neither family, so without this a classify run would
+    # send a confusion matrix and no metrics at all.
+    if not blocks:
+        classify = _classify_metrics(metrics)
+        if classify:
+            blocks.append(classify)
+
     return blocks
+
+
+# _classify_metrics()
+# A classification run's one aggregate block.
+# Inputs: the validator's metrics holder.
+# Output: the block, or None when this is not a classification run.
+#
+# No `per_class`: ClassifyMetrics has no per-class quantities at all. The
+# confusion matrix is the only per-class information a classify run produces,
+# and it is reported separately.
+def _classify_metrics(metrics: Any) -> dict[str, Any] | None:
+
+    overall: dict[str, Any] = {}
+
+    for key, attribute in _CLASSIFY_ACCURACIES:
+        value = _json_number(getattr(metrics, attribute, None))
+        if value is not None:
+            overall[key] = value
+
+    if not overall:
+        return None
+
+    # Ultralytics ranks classification checkpoints on fitness too.
+    fitness = _json_number(getattr(metrics, "fitness", None))
+    if fitness is not None:
+        overall["fitness"] = fitness
+
+    return {"family": "classify", "overall": overall}
 
 
 # _evaluated_split()
@@ -805,6 +857,77 @@ def _rounded(value: Any) -> float | None:
     return None if number is None else round(number, 5)
 
 
+# _training_data_argument()
+# What this job should pass to Ultralytics as `data`, if anything.
+# Inputs: the job params.
+# Output: the data.yaml for a detection or segmentation run, the dataset root
+#   for a classification one, or None when neither is usable.
+#
+# Two shapes, because Ultralytics takes two. Detection and segmentation are
+# given a `data.yaml`; **classification is given a DIRECTORY** and reads its
+# class vocabulary from the subfolder names -- there is no names list anywhere
+# in a classify dataset.
+#
+# Decided from what is on disk rather than from a task the job declares,
+# because the job does not declare one: the checkpoint decides the task, and
+# preflight runs before anything loads the checkpoint.
+def _training_data_argument(params: Mapping[str, Any]) -> Path | None:
+
+    data_yaml = params.get("data_yaml")
+    if data_yaml and Path(str(data_yaml)).is_file():
+        return Path(str(data_yaml))
+
+    root = params.get("dataset_path")
+    if root and Path(str(root)).is_dir() and (Path(str(root)) / "train").is_dir():
+        return Path(str(root))
+
+    return None
+
+
+# _why_the_dataset_is_unusable()
+# The reason a job cannot train, in words a person can act on.
+# Inputs: the job params.
+# Output: the refusal message.
+#
+# **The `train/` case is the one that matters, and it is a refusal rather than
+# a fallback on purpose.** Given a directory with images but no `train/`,
+# Ultralytics does not fail -- it SILENTLY SPLITS 80/20 at random
+# (`split_classify_dataset`, data/utils.py:718-726) and logs it at INFO. MARP
+# splits deliberately and temporally, so a random split puts frames from the
+# same dive seconds apart on both sides and produces accuracy that looks
+# excellent and means nothing, with nothing downstream saying so. Refusing is
+# the only honest answer.
+def _why_the_dataset_is_unusable(params: Mapping[str, Any]) -> str:
+
+    data_yaml = params.get("data_yaml")
+    root = params.get("dataset_path")
+
+    if not data_yaml and not root:
+        return "the job carried no dataset; nothing was prepared to train on"
+
+    if root and Path(str(root)).is_dir() and not (Path(str(root)) / "train").is_dir():
+        return (
+            f"the dataset at {root} has no data.yaml and no train/ directory. A "
+            "classification dataset must carry its own train/ split -- Ultralytics "
+            "would otherwise invent a random 80/20 one, which is not the split "
+            "this dataset was built with"
+        )
+
+    if data_yaml:
+        return f"the dataset's data.yaml is missing from {data_yaml}"
+
+    return f"the dataset at {root} is not on disk"
+
+
+# _dataset_root()
+# The directory a dataset lives in, whichever shape it is.
+# Inputs: the data argument this run will pass to Ultralytics.
+# Output: the dataset's own directory.
+def _dataset_root(data_path: Path) -> Path:
+
+    return data_path.parent if data_path.is_file() else data_path
+
+
 # TrainingEngine
 # Runs one YOLO training job and publishes the weights it produces.
 # Constructed once by the registry; every run happens in its own child process,
@@ -825,10 +948,21 @@ class TrainingEngine(BaseEngine):
     def describe(self) -> dict[str, Any]:
 
         return {
-            "name": self.engine_name,
+            # `engine`, not `name`: every other engine in this worker reports
+            # itself under that key, and /status was listing this one under a
+            # key nothing else used -- so a consumer iterating engines by
+            # entry["engine"] skipped it or died on it. The suite's own
+            # test_status_lists_the_engines_actually_registered was red because
+            # of this before the classification work touched the file.
+            "engine": self.engine_name,
             "kind": "training",
             "requires_gpu": True,
-            "task": "detect",
+            # What this engine can run, not what it will run. The TASK IS
+            # DECIDED BY THE CHECKPOINT -- Ultralytics reads it off the .pt and
+            # ignores any task argument for one -- so the engine does not know
+            # until a job names its weights. This used to claim "detect", which
+            # was simply false for a segmentation run (#268).
+            "tasks": ["detect", "segment", "classify"],
         }
 
     # preflight()
@@ -850,11 +984,8 @@ class TrainingEngine(BaseEngine):
         # The dataset is fetched by the parent before the child starts, so by
         # the time preflight runs it is either on disk or the job is already
         # broken. Saying which is the point of this check.
-        data_yaml = params.get("data_yaml")
-        if not data_yaml:
-            raise JobUnrunnable("the job carried no dataset; nothing was prepared to train on")
-        if not Path(str(data_yaml)).is_file():
-            raise JobUnrunnable(f"the dataset's data.yaml is missing from {data_yaml}")
+        if _training_data_argument(params) is None:
+            raise JobUnrunnable(_why_the_dataset_is_unusable(params))
 
         if not params.get("model_path"):
             raise JobUnrunnable("the job carried no starting weights")
@@ -868,7 +999,9 @@ class TrainingEngine(BaseEngine):
         started_at = time.monotonic()
         params = dict(spec.get("params") or {})
 
-        data_yaml = Path(str(params["data_yaml"]))
+        data_path = _training_data_argument(params)
+        if data_path is None:
+            raise JobUnrunnable(_why_the_dataset_is_unusable(params))
         weights_in = Path(str(params["model_path"]))
         device = resolve_device(params.get("device"), int(params.get("slot_index") or 0))
 
@@ -877,7 +1010,7 @@ class TrainingEngine(BaseEngine):
 
         ctx.report_progress(0, total_epochs, "epochs", phase="loading_model")
         ctx.log(
-            f"training {weights_in.name} on {data_yaml.parent.name} for {total_epochs} epochs "
+            f"training {weights_in.name} on {_dataset_root(data_path).name} for {total_epochs} epochs "
             f"on {device}"
         )
 
@@ -923,7 +1056,7 @@ class TrainingEngine(BaseEngine):
 
         try:
             model.train(
-                data=str(data_yaml),
+                data=str(data_path),
                 device=device,
                 project=str(run_root),
                 name="run",
@@ -962,7 +1095,7 @@ class TrainingEngine(BaseEngine):
             # terminal log line a failure is diagnosed from says which build
             # produced it, without having to go and find the settings report.
             "train_script_commit": worker_revision(),
-            "dataset": str(data_yaml.parent),
+            "dataset": str(_dataset_root(data_path)),
             "epochs_requested": total_epochs,
             "epochs_completed": state.epochs_done,
             "checkpoints_published": state.publishes,

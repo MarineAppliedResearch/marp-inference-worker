@@ -55,7 +55,11 @@ def test_the_engine_describes_itself_as_training() -> None:
 
     described = TrainingEngine().describe()
 
-    assert described["name"] == "marp_training"
+    # `engine`, the key every other engine in this worker uses. This asserted
+    # `name` and passed, while test_status, which iterates engines by
+    # entry["engine"], was red -- a test agreeing with its own module rather
+    # than with the thing that consumes it.
+    assert described["engine"] == "marp_training"
     assert described["kind"] == "training"
     assert described["requires_gpu"] is True
 
@@ -1579,3 +1583,204 @@ def test_bookkeeping_never_fails_a_finished_run(tmp_path) -> None:
     state.on_train_end(a_finished_trainer())
 
     assert any("could not publish" in line for line in ctx.logs)
+
+
+# a_classification_spec()
+# A job whose dataset is a classify directory rather than a data.yaml.
+# Inputs: tmp_path, whether to give it a train/ split, and any param overrides.
+# Output: the spec mapping.
+#
+# Ultralytics classify takes a DIRECTORY and reads its class vocabulary from the
+# subfolder names; there is no names list anywhere in a classify dataset.
+def a_classification_spec(tmp_path: Path, with_train: bool = True, **params) -> dict:
+
+    root = tmp_path / "cls-dataset"
+    if with_train:
+        for split in ("train", "val"):
+            for name in ("Lingcod", "Rockfish"):
+                (root / split / name).mkdir(parents=True, exist_ok=True)
+                (root / split / name / "a.jpg").write_bytes(b"x")
+    else:
+        # Images, but no split: exactly the shape Ultralytics would silently
+        # split 80/20 for itself.
+        (root / "Lingcod").mkdir(parents=True, exist_ok=True)
+        (root / "Lingcod" / "a.jpg").write_bytes(b"x")
+
+    weights = tmp_path / "yolo11n-cls.pt"
+    weights.write_bytes(b"not-really-weights")
+
+    base = {"dataset_path": str(root), "model_path": str(weights)}
+    base.update(params)
+    return {"engine": "marp_training", "params": base}
+
+
+# test_a_classification_dataset_with_no_split_is_refused()
+# Verifies the worker refuses rather than letting Ultralytics invent a split.
+# Inputs: tmp_path and monkeypatch.
+# Output: pytest pass/fail result.
+#
+# **This is the most important check in the classification work.** Handed a
+# directory with images and no `train/`, Ultralytics does not fail -- it
+# silently splits 80/20 at random (`split_classify_dataset`,
+# data/utils.py:718-726) and logs it at INFO.
+#
+# MARP splits deliberately and temporally. A random split puts frames from the
+# same dive seconds apart on both sides of it, so the model is scored on
+# near-duplicates of what it trained on: accuracy that looks excellent and means
+# nothing, with nothing downstream saying so. Refusing before training starts is
+# the only honest answer, and it costs a volunteer minutes rather than hours.
+def test_a_classification_dataset_with_no_split_is_refused(tmp_path, monkeypatch) -> None:
+
+    monkeypatch.setattr(training_module, "cuda_device_count", lambda: 1)
+
+    spec = a_classification_spec(tmp_path, with_train=False)
+
+    with pytest.raises(JobUnrunnable) as refusal:
+        TrainingEngine().preflight(spec)
+
+    # The reason has to say what is wrong and why it is not just fixed up.
+    message = str(refusal.value)
+    assert "train/" in message
+    assert "80/20" in message
+
+
+# test_a_classification_dataset_with_a_split_is_accepted()
+# The control for the refusal above.
+# Inputs: tmp_path and monkeypatch.
+# Output: pytest pass/fail result.
+#
+# Without it, a preflight that refused every classification dataset would pass
+# the test above and nobody would notice until a real job.
+def test_a_classification_dataset_with_a_split_is_accepted(tmp_path, monkeypatch) -> None:
+
+    monkeypatch.setattr(training_module, "cuda_device_count", lambda: 1)
+
+    TrainingEngine().preflight(a_classification_spec(tmp_path))
+
+
+# test_a_classification_run_is_given_the_directory_not_a_yaml()
+# Verifies what actually reaches Ultralytics.
+# Inputs: tmp_path and monkeypatch.
+# Output: pytest pass/fail result.
+#
+# The preflight accepting it means nothing if run() still passes a data.yaml
+# that does not exist. This watches the argument the trainer receives.
+def test_a_classification_run_is_given_the_directory_not_a_yaml(tmp_path, monkeypatch) -> None:
+
+    model = a_stubbed_ultralytics(monkeypatch)
+    spec = a_classification_spec(tmp_path, epochs=1)
+
+    ctx = RunContext(tmp_path / "attempt")
+    ctx.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+    summary = TrainingEngine().run(ctx, spec)
+
+    passed = Path(model.train_kwargs["data"])
+    assert passed.is_dir()
+    assert passed.name == "cls-dataset"
+
+    # And the summary names the dataset rather than a yaml's parent.
+    assert Path(summary["dataset"]).name == "cls-dataset"
+
+
+# test_a_detection_run_still_gets_its_data_yaml()
+# The control: adding classification must not move detection.
+# Inputs: tmp_path and monkeypatch.
+# Output: pytest pass/fail result.
+def test_a_detection_run_still_gets_its_data_yaml(tmp_path, monkeypatch) -> None:
+
+    model = a_stubbed_ultralytics(monkeypatch)
+    spec = a_runnable_spec(tmp_path, epochs=1)
+
+    ctx = RunContext(tmp_path / "attempt")
+    ctx.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+    TrainingEngine().run(ctx, spec)
+
+    passed = Path(model.train_kwargs["data"])
+    assert passed.is_file()
+    assert passed.name == "data.yaml"
+
+
+# FakeClassifyMetrics
+# ClassifyMetrics as far as the reader is concerned: two accuracies, a fitness,
+# and no box, no seg, no per-class anything.
+class FakeClassifyMetrics:
+
+    def __init__(self, top1=0.82, top5=0.97) -> None:
+
+        self.top1 = top1
+        self.top5 = top5
+        self.fitness = 0.895
+        self.names = {0: "Lingcod", 1: "Rockfish"}
+
+
+# test_a_classification_run_reports_its_accuracies()
+# Verifies classify produces a metrics block at all.
+# Inputs: none.
+# Output: pytest pass/fail result.
+#
+# `_metric_families` iterates box and seg; ClassifyMetrics has neither, so
+# without a classify branch a classification run would send a confusion matrix
+# and NO metrics block -- which looks like a run that measured nothing.
+#
+# The key names come from a real one-epoch run: `accuracy_top1` and
+# `accuracy_top5`, with no (B)/(M) suffix, because that suffix distinguishes box
+# from mask and classification is neither.
+def test_a_classification_run_reports_its_accuracies() -> None:
+
+    blocks = training_module._metric_families(FakeClassifyMetrics())
+
+    assert len(blocks) == 1
+    assert blocks[0]["family"] == "classify"
+    assert blocks[0]["overall"]["accuracy_top1"] == pytest.approx(0.82)
+    assert blocks[0]["overall"]["accuracy_top5"] == pytest.approx(0.97)
+
+    # The family is still a word MARP accepts.
+    assert blocks[0]["family"] in CONTRACT_METRIC_FAMILIES
+
+
+# test_a_classification_block_has_no_per_class()
+# Verifies the absence is deliberate rather than an empty list.
+# Inputs: none.
+# Output: pytest pass/fail result.
+#
+# ClassifyMetrics has no per-class quantities at all -- no precision, recall or
+# AP per class. The confusion matrix is the only per-class information a
+# classify run produces, so an empty `per_class` would imply rows were measured
+# and came back empty.
+def test_a_classification_block_has_no_per_class() -> None:
+
+    block = training_module._metric_families(FakeClassifyMetrics())[0]
+
+    assert "per_class" not in block
+
+
+# test_a_detection_family_still_wins_over_the_classify_branch()
+# Verifies the classify branch is a fallback, not a competitor.
+# Inputs: none.
+# Output: pytest pass/fail result.
+def test_a_detection_family_still_wins_over_the_classify_branch() -> None:
+
+    blocks = training_module._metric_families(
+        a_finished_trainer().validator.metrics
+    )
+
+    assert [block["family"] for block in blocks] == ["box"]
+
+
+# test_the_engine_does_not_claim_to_be_a_detector()
+# Verifies /status stops asserting a task the engine cannot know.
+# Inputs: none.
+# Output: pytest pass/fail result.
+#
+# **The task is decided by the checkpoint.** Ultralytics reads it off the .pt
+# and ignores any task argument for one, so the engine does not learn the task
+# until a job names its weights. describe() used to say "detect" flatly, which
+# was false for every segmentation run.
+def test_the_engine_does_not_claim_to_be_a_detector() -> None:
+
+    described = TrainingEngine().describe()
+
+    assert "task" not in described
+    assert set(described["tasks"]) == {"detect", "segment", "classify"}

@@ -351,7 +351,22 @@ def _resolved_training_settings(trainer: Any) -> dict[str, dict[str, Any]]:
 #
 # The rate is what a person watching can use, not what the wire can carry --
 # events are queued and batched upstream, so this costs little either way.
-_SAMPLE_INTERVAL_S = 2.5
+#
+# **0.5s, measured rather than chosen.** At 2.5s a real detection epoch produced
+# ZERO samples with a batch number above zero (job 21802): the whole batch loop
+# fits inside one window, so the only training points on the chart were the
+# epoch-start markers. Isaac asked for updates as often as the command line
+# gives them, and at two a second a long run is still a few thousand points,
+# which the strided read handles.
+_SAMPLE_INTERVAL_S = 0.5
+
+
+# The same, for a validation pass.
+#
+# Left at the original 2.5s because validation is the part that already reports
+# well: it runs at a few iterations a second and a pass gets its first sample
+# unconditionally, so it does not need the density the training loop does.
+_VAL_SAMPLE_INTERVAL_S = 2.5
 
 
 # The phase names live samples are filed under.
@@ -1567,7 +1582,7 @@ class _RunState:
     def on_val_batch_end(self, validator: Any) -> None:
 
         now = time.monotonic()
-        if (now - self._last_val_sample_at) < _SAMPLE_INTERVAL_S:
+        if (now - self._last_val_sample_at) < _VAL_SAMPLE_INTERVAL_S:
             return
         self._last_val_sample_at = now
 

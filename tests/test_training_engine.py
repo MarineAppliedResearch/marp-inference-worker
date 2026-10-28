@@ -2149,11 +2149,16 @@ def test_roughly_one_sample_per_interval_over_a_long_epoch(tmp_path, monkeypatch
 
     samples = [m for _s, p, m in ctx.metrics if p == training_module._BATCH_PHASE]
 
-    # 150 seconds at one per 2.5 means about 60, plus the forced one. Asserted
-    # as a range rather than a number: the batch granularity moves it a little.
-    expected = seconds / training_module._SAMPLE_INTERVAL_S
+    # **Bounded by two things, and the smaller one wins.** The interval caps
+    # how often a sample may go out; the batch rate caps how often one CAN,
+    # because a sample is only ever emitted from a batch callback. With 144
+    # batches across 150 seconds the batches are the slower of the two, so
+    # every batch samples and the count is the batch count.
+    by_time = seconds / training_module._SAMPLE_INTERVAL_S
+    expected = min(by_time, batches)
     assert expected * 0.8 <= len(samples) <= expected * 1.2 + 1, (
-        f"{len(samples)} samples over {seconds}s at a {training_module._SAMPLE_INTERVAL_S}s interval"
+        f"{len(samples)} samples over {seconds}s from {batches} batches "
+        f"at a {training_module._SAMPLE_INTERVAL_S}s interval"
     )
 
     # And the pace fields are there once a batch has finished.
@@ -2349,3 +2354,49 @@ def test_every_validation_pass_gets_its_first_sample(tmp_path, monkeypatch) -> N
     validating = [m for _s, p, m in ctx.metrics if p == training_module._VAL_BATCH_PHASE]
 
     assert len(validating) == 2
+
+
+# test_the_training_loop_samples_often_enough_to_draw()
+# Verifies a short batch loop now yields more than its opening point.
+# Inputs: tmp_path and monkeypatch.
+# Output: pytest pass/fail result.
+#
+# **Measured, not chosen.** At 2.5s a real detection epoch produced zero samples
+# with a batch number above zero (job 21802) -- the whole batch loop fits inside
+# one window, so the chart had only epoch-start markers. This asserts that a
+# two-second batch loop now produces several points rather than one.
+def test_the_training_loop_samples_often_enough_to_draw(tmp_path, monkeypatch) -> None:
+
+    clock = [700.0]
+    monkeypatch.setattr(training_module.time, "monotonic", lambda: clock[0])
+
+    ctx = RecordingContext()
+    state = training_module._RunState(ctx=ctx, total_epochs=1, run_root=tmp_path)
+
+    trainer = a_training_trainer(elapsed=0.0, batches=120)
+    state.on_epoch_start(trainer)
+
+    # 120 batches across two seconds, the shape job 21802 actually had.
+    for _index in range(120):
+        clock[0] += 2.0 / 120
+        state.on_batch_end(trainer)
+
+    mid = [m for _s, p, m in ctx.metrics
+           if p == training_module._BATCH_PHASE and m.get("batch", 0) > 0]
+
+    # Two seconds at half a second each.
+    assert len(mid) >= 3, f"only {len(mid)} mid-epoch samples from a 2s batch loop"
+
+
+# test_validation_keeps_the_slower_interval()
+# Verifies the two throttles are independent numbers, not one shared constant.
+# Inputs: none.
+# Output: pytest pass/fail result.
+#
+# Validation already reports well -- it runs at a few iterations a second and
+# every pass gets its first sample unconditionally -- so it does not need the
+# density the training loop does.
+def test_validation_keeps_the_slower_interval() -> None:
+
+    assert training_module._SAMPLE_INTERVAL_S == 0.5
+    assert training_module._VAL_SAMPLE_INTERVAL_S == 2.5

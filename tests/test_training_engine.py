@@ -2118,3 +2118,88 @@ def test_a_job_that_names_an_image_size_gets_it(tmp_path) -> None:
         a_runnable_spec(tmp_path, imgsz=1280)["params"]
     )
     assert detect["imgsz"] == 1280
+
+
+# test_roughly_one_sample_per_interval_over_a_long_epoch()
+# Verifies the throttle emits steadily across many windows, not once.
+# Inputs: tmp_path and monkeypatch.
+# Output: pytest pass/fail result.
+#
+# Job 21799 sent three samples for two epochs of 144 batches, and the suspicion
+# was that the throttle's clock was being reset on every call. It was not --
+# this asserts the rate directly, with a controlled clock, over 150 seconds of
+# batches. The real cause was elsewhere: on that run almost none of the epoch's
+# wall time was spent in the batch loop.
+def test_roughly_one_sample_per_interval_over_a_long_epoch(tmp_path, monkeypatch) -> None:
+
+    clock = [1000.0]
+    monkeypatch.setattr(training_module.time, "monotonic", lambda: clock[0])
+
+    ctx = RecordingContext()
+    state = training_module._RunState(ctx=ctx, total_epochs=1, run_root=tmp_path)
+
+    batches, seconds = 144, 150.0
+    trainer = a_training_trainer(elapsed=0.0, batches=batches)
+
+    state.on_epoch_start(trainer)
+    for index in range(batches):
+        clock[0] += seconds / batches
+        trainer.epoch_time_start = time.time() - (index + 1) * (seconds / batches)
+        state.on_batch_end(trainer)
+
+    samples = [m for _s, p, m in ctx.metrics if p == training_module._BATCH_PHASE]
+
+    # 150 seconds at one per 2.5 means about 60, plus the forced one. Asserted
+    # as a range rather than a number: the batch granularity moves it a little.
+    expected = seconds / training_module._SAMPLE_INTERVAL_S
+    assert expected * 0.8 <= len(samples) <= expected * 1.2 + 1, (
+        f"{len(samples)} samples over {seconds}s at a {training_module._SAMPLE_INTERVAL_S}s interval"
+    )
+
+    # And the pace fields are there once a batch has finished.
+    mid = [m for m in samples if m.get("batch", 0) > 0]
+    assert mid, "no sample was emitted mid-epoch"
+    assert "iterations_per_second" in mid[0]
+    assert "epoch_eta_seconds" in mid[0]
+
+
+# test_the_quiet_phases_are_marked()
+# Verifies a flat stretch on the chart says which phase it was.
+# Inputs: tmp_path.
+# Output: pytest pass/fail result.
+#
+# **Sampling only from batch callbacks leaves the chart blank wherever there
+# are none** -- validating, saving, scanning a dataset. On job 21799 those were
+# most of each epoch's 150 seconds, so a chart fed from batch hooks alone had
+# almost nothing to draw and no way to say why.
+def test_the_quiet_phases_are_marked(tmp_path) -> None:
+
+    ctx = RecordingContext()
+    state = training_module._RunState(ctx=ctx, total_epochs=2, run_root=tmp_path)
+
+    # The object differs between these hooks -- validator, then trainer -- so
+    # the handler must not read anything off it.
+    state.on_phase_change("validating")(object())
+    state.on_phase_change("saving")(object())
+
+    entered = [m.get("phase_entered") for _s, _p, m in ctx.metrics]
+    assert entered == ["validating", "saving"]
+
+    # Each still says where in the run it happened.
+    assert all(m["epochs_total"] == 2 for _s, _p, m in ctx.metrics)
+
+
+# test_a_phase_marker_cannot_fail_the_run()
+# Verifies the boundary markers are as safe as everything else here.
+# Inputs: tmp_path.
+# Output: pytest pass/fail result.
+def test_a_phase_marker_cannot_fail_the_run(tmp_path) -> None:
+
+    class Exploding(RecordingContext):
+        def report_metrics(self, step, phase, metrics) -> None:
+            raise RuntimeError("coordinator went away")
+
+    state = training_module._RunState(ctx=Exploding(), total_epochs=1, run_root=tmp_path)
+
+    # Must not raise.
+    state.on_phase_change("validating")(object())

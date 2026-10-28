@@ -1234,6 +1234,19 @@ class TrainingEngine(BaseEngine):
         model.add_callback("on_train_batch_end", state.on_batch_end)
         model.add_callback("on_val_batch_end", state.on_val_batch_end)
 
+        # **The quiet stretches, which is where the chart went blank.**
+        # Sampling only from batch callbacks means nothing is reported while
+        # Ultralytics is validating, saving or scanning a dataset -- and on a
+        # real run those are most of an epoch's wall time. Job 21799 spent
+        # ~150s an epoch of which only a few seconds were batches, so a chart
+        # fed from batch hooks alone had almost nothing to draw.
+        #
+        # These carry no numbers of their own; they mark the boundary, so a
+        # flat stretch on the chart says WHICH phase it was.
+        model.add_callback("on_val_start", state.on_phase_change("validating"))
+        model.add_callback("on_val_end", state.on_phase_change("validated"))
+        model.add_callback("on_model_save", state.on_phase_change("saving"))
+
         # `on_train_end` fires after final_eval() has validated the best
         # weights and after the plots are written (trainer.py:671-675), so it
         # is the first moment the run's own scores and files both exist. A
@@ -1484,6 +1497,34 @@ class _RunState:
         self._global_step += 1
 
         self._emit_sample(trainer)
+
+
+    # on_phase_change()
+    # Builds a callback that records entering a named phase.
+    # Inputs: the phase name.
+    # Output: a callback Ultralytics can hold.
+    #
+    # Always samples, bypassing the throttle: a phase boundary is the point of
+    # the chart that explains a flat stretch, and there are only a handful of
+    # them per epoch. The object handed to these hooks differs -- the validator
+    # for val hooks, the trainer for save -- so nothing is read off it.
+    def on_phase_change(self, phase: str):
+
+        def record(_whatever: Any) -> None:
+            try:
+                self._ctx.report_metrics(
+                    self._global_step,
+                    _BATCH_PHASE,
+                    {"at": time.time(), "phase_entered": phase,
+                     "epoch": self.epochs_done + 1, "epochs_total": self._total},
+                )
+                # Counts as a sample, so a boundary does not also trigger the
+                # next throttled one a millisecond later.
+                self._last_sample_at = time.monotonic()
+            except Exception:
+                pass
+
+        return record
 
 
     # on_val_batch_end()

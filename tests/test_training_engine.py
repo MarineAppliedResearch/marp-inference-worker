@@ -2295,3 +2295,57 @@ def test_each_validation_pass_is_timed_from_its_own_start(tmp_path, monkeypatch)
     _step, _phase, sample = ctx.metrics[-1]
 
     assert sample["iterations_per_second"] == pytest.approx(2.0)
+
+
+# test_a_short_validation_pass_still_reports()
+# Verifies training cannot starve validation out of the chart entirely.
+# Inputs: tmp_path and monkeypatch.
+# Output: pytest pass/fail result.
+#
+# **This is why job 21801 sent no validation samples at all.** The two shared
+# one throttle clock, and a pass of 23 batches on a fast card finishes inside a
+# single 2.5s window that the training loop's last sample had already claimed.
+# The callback fired for every batch and every one was discarded.
+def test_a_short_validation_pass_still_reports(tmp_path, monkeypatch) -> None:
+
+    clock = [900.0]
+    monkeypatch.setattr(training_module.time, "monotonic", lambda: clock[0])
+
+    ctx = RecordingContext()
+    state = training_module._RunState(ctx=ctx, total_epochs=1, run_root=tmp_path)
+
+    # Training speaks, then validation begins immediately after.
+    state.on_batch_end(a_training_trainer())
+    state.on_phase_change("validating")(object())
+
+    # A whole pass inside one throttle window.
+    for index in range(23):
+        clock[0] += 0.05
+        state.on_val_batch_end(types.SimpleNamespace(batch_i=index, dataloader=[None] * 23))
+
+    validating = [m for _s, p, m in ctx.metrics if p == training_module._VAL_BATCH_PHASE]
+
+    assert validating, "a short validation pass vanished from the chart"
+    assert validating[0]["batch"] == 1
+
+
+# test_every_validation_pass_gets_its_first_sample()
+# Verifies the second pass is not throttled by the first.
+# Inputs: tmp_path and monkeypatch.
+# Output: pytest pass/fail result.
+def test_every_validation_pass_gets_its_first_sample(tmp_path, monkeypatch) -> None:
+
+    clock = [900.0]
+    monkeypatch.setattr(training_module.time, "monotonic", lambda: clock[0])
+
+    ctx = RecordingContext()
+    state = training_module._RunState(ctx=ctx, total_epochs=2, run_root=tmp_path)
+
+    for _pass in range(2):
+        state.on_phase_change("validating")(object())
+        clock[0] += 0.05
+        state.on_val_batch_end(types.SimpleNamespace(batch_i=0, dataloader=[None] * 10))
+
+    validating = [m for _s, p, m in ctx.metrics if p == training_module._VAL_BATCH_PHASE]
+
+    assert len(validating) == 2

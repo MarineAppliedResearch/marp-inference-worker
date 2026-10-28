@@ -1309,6 +1309,16 @@ class _RunState:
         # When the current validation pass began, so its rate is measured over
         # the pass rather than over the whole run.
         self._val_started_at: float | None = None
+
+        # Validation throttles on its OWN clock.
+        #
+        # Sharing one with training starved it completely: a pass of 23 batches
+        # on a fast card finishes inside a single 2.5s window, and the training
+        # loop's last sample had already claimed that window — so job 21801
+        # sent no validation samples at all despite the callback firing for
+        # every batch. Reset at the start of each pass, so the first batch of
+        # one always reports however recently training spoke.
+        self._last_val_sample_at = 0.0
         self.stopped_early = False
         self.best_metric: float | None = None
         self.last_metrics: dict[str, Any] = {}
@@ -1530,6 +1540,9 @@ class _RunState:
                 # the pass rather than the whole run.
                 if phase == "validating":
                     self._val_started_at = time.monotonic()
+                    # A new pass starts with its throttle clear, so its first
+                    # batch always reports.
+                    self._last_val_sample_at = 0.0
 
                 self._ctx.report_metrics(
                     self._global_step,
@@ -1554,9 +1567,9 @@ class _RunState:
     def on_val_batch_end(self, validator: Any) -> None:
 
         now = time.monotonic()
-        if (now - self._last_sample_at) < _SAMPLE_INTERVAL_S:
+        if (now - self._last_val_sample_at) < _SAMPLE_INTERVAL_S:
             return
-        self._last_sample_at = now
+        self._last_val_sample_at = now
 
         try:
             sample: dict[str, Any] = {"at": time.time()}

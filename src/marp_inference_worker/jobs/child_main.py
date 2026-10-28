@@ -179,7 +179,11 @@ def _fetch_dataset_if_named(ctx: Any, spec: dict[str, Any]) -> None:
         on_progress=on_progress,
     )
 
-    params["data_yaml"] = str(result["data_yaml"])
+    # Only set when the dataset actually has one. A classification archive does
+    # not, and setting the key to the string "None" would make the engine test
+    # a path that cannot exist rather than simply not finding the key.
+    if result["data_yaml"] is not None:
+        params["data_yaml"] = str(result["data_yaml"])
     params["dataset_path"] = str(result["path"])
     ctx.log(
         f"dataset ready at {result['path']}"

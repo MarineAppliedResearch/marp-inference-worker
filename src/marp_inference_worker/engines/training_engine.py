@@ -351,7 +351,32 @@ def _resolved_training_settings(trainer: Any) -> dict[str, dict[str, Any]]:
 #
 # The rate is what a person watching can use, not what the wire can carry --
 # events are queued and batched upstream, so this costs little either way.
-_SAMPLE_INTERVAL_S = 2.5
+#
+# **0.5s, measured rather than chosen.** At 2.5s a real detection epoch produced
+# ZERO samples with a batch number above zero (job 21802): the whole batch loop
+# fits inside one window, so the only training points on the chart were the
+# epoch-start markers. Isaac asked for updates as often as the command line
+# gives them, and at two a second a long run is still a few thousand points,
+# which the strided read handles.
+_SAMPLE_INTERVAL_S = 0.5
+
+
+# The same, for a validation pass.
+#
+# Left at the original 2.5s because validation is the part that already reports
+# well: it runs at a few iterations a second and a pass gets its first sample
+# unconditionally, so it does not need the density the training loop does.
+_VAL_SAMPLE_INTERVAL_S = 2.5
+
+
+# What the validation phases are called once training itself has finished.
+#
+# Ultralytics validates the best weights again after the last epoch
+# (`final_eval()`), and those callbacks arrive with every epoch already
+# counted. Reported as an ordinary validating phase they read as "epoch 4 of
+# 3", which is not a thing that happened -- the same defect the epoch counter
+# already had to fix, in a second place.
+_FINAL_PHASES = {"validating": "final_validation", "validated": "final_validated"}
 
 
 # The phase names live samples are filed under.
@@ -1234,6 +1259,19 @@ class TrainingEngine(BaseEngine):
         model.add_callback("on_train_batch_end", state.on_batch_end)
         model.add_callback("on_val_batch_end", state.on_val_batch_end)
 
+        # **The quiet stretches, which is where the chart went blank.**
+        # Sampling only from batch callbacks means nothing is reported while
+        # Ultralytics is validating, saving or scanning a dataset -- and on a
+        # real run those are most of an epoch's wall time. Job 21799 spent
+        # ~150s an epoch of which only a few seconds were batches, so a chart
+        # fed from batch hooks alone had almost nothing to draw.
+        #
+        # These carry no numbers of their own; they mark the boundary, so a
+        # flat stretch on the chart says WHICH phase it was.
+        model.add_callback("on_val_start", state.on_phase_change("validating"))
+        model.add_callback("on_val_end", state.on_phase_change("validated"))
+        model.add_callback("on_model_save", state.on_phase_change("saving"))
+
         # `on_train_end` fires after final_eval() has validated the best
         # weights and after the plots are written (trainer.py:671-675), so it
         # is the first moment the run's own scores and files both exist. A
@@ -1284,6 +1322,28 @@ class _RunState:
         self._global_step = 0
         self._batch_in_epoch = 0
         self._last_sample_at = 0.0
+
+        # The trainer, kept from whichever callback last saw one.
+        #
+        # Validation callbacks are handed the VALIDATOR, which has no memory
+        # accessor of its own -- but it is validating for this trainer, so the
+        # GPU figure on a validation sample is the same number from the same
+        # source as on a training one.
+        self._trainer: Any = None
+
+        # When the current validation pass began, so its rate is measured over
+        # the pass rather than over the whole run.
+        self._val_started_at: float | None = None
+
+        # Validation throttles on its OWN clock.
+        #
+        # Sharing one with training starved it completely: a pass of 23 batches
+        # on a fast card finishes inside a single 2.5s window, and the training
+        # loop's last sample had already claimed that window — so job 21801
+        # sent no validation samples at all despite the callback firing for
+        # every batch. Reset at the start of each pass, so the first batch of
+        # one always reports however recently training spoke.
+        self._last_val_sample_at = 0.0
         self.stopped_early = False
         self.best_metric: float | None = None
         self.last_metrics: dict[str, Any] = {}
@@ -1457,12 +1517,30 @@ class _RunState:
             self._ctx.log(f"published {len(published)} run files")
 
 
+    # _epoch_fields()
+    # Which epoch a sample belongs to, when it belongs to one at all.
+    # Inputs: none.
+    # Output: a mapping to merge into a sample.
+    #
+    # **Empty once every epoch is done.** Ultralytics runs a final validation
+    # after the last epoch, and `epochs_done + 1` is one past the end by then --
+    # a reader saw "epoch 4 of 3". There is no fourth epoch, so the honest
+    # answer is to say nothing rather than to name one.
+    def _epoch_fields(self) -> dict[str, Any]:
+
+        if self.epochs_done >= self._total:
+            return {"epochs_total": self._total}
+
+        return {"epoch": self.epochs_done + 1, "epochs_total": self._total}
+
+
     # on_epoch_start()
     # Resets the per-epoch batch counter and marks the phase change.
     # Inputs: the Ultralytics trainer.
     # Output: none.
     def on_epoch_start(self, trainer: Any) -> None:
 
+        self._trainer = trainer
         self._batch_in_epoch = 0
 
         # A phase change always samples, however recently the last one went:
@@ -1480,10 +1558,52 @@ class _RunState:
         # batch index in a local variable inside its own loop and does not
         # expose it. Counting the callback is exact, since it fires once per
         # batch, and it is the only honest way to get the number.
+        self._trainer = trainer
         self._batch_in_epoch += 1
         self._global_step += 1
 
         self._emit_sample(trainer)
+
+
+    # on_phase_change()
+    # Builds a callback that records entering a named phase.
+    # Inputs: the phase name.
+    # Output: a callback Ultralytics can hold.
+    #
+    # Always samples, bypassing the throttle: a phase boundary is the point of
+    # the chart that explains a flat stretch, and there are only a handful of
+    # them per epoch. The object handed to these hooks differs -- the validator
+    # for val hooks, the trainer for save -- so nothing is read off it.
+    def on_phase_change(self, phase: str):
+
+        def record(_whatever: Any) -> None:
+            try:
+                # A validation pass times itself from here, so its rate covers
+                # the pass rather than the whole run.
+                if phase == "validating":
+                    self._val_started_at = time.monotonic()
+                    # A new pass starts with its throttle clear, so its first
+                    # batch always reports.
+                    self._last_val_sample_at = 0.0
+
+                # After the last epoch this is Ultralytics revalidating the
+                # best weights, not an epoch's own pass.
+                named = phase
+                if self.epochs_done >= self._total:
+                    named = _FINAL_PHASES.get(phase, phase)
+
+                self._ctx.report_metrics(
+                    self._global_step,
+                    _BATCH_PHASE,
+                    {"at": time.time(), "phase_entered": named, **self._epoch_fields()},
+                )
+                # Counts as a sample, so a boundary does not also trigger the
+                # next throttled one a millisecond later.
+                self._last_sample_at = time.monotonic()
+            except Exception:
+                pass
+
+        return record
 
 
     # on_val_batch_end()
@@ -1494,9 +1614,9 @@ class _RunState:
     def on_val_batch_end(self, validator: Any) -> None:
 
         now = time.monotonic()
-        if (now - self._last_sample_at) < _SAMPLE_INTERVAL_S:
+        if (now - self._last_val_sample_at) < _VAL_SAMPLE_INTERVAL_S:
             return
-        self._last_sample_at = now
+        self._last_val_sample_at = now
 
         try:
             sample: dict[str, Any] = {"at": time.time()}
@@ -1509,6 +1629,33 @@ class _RunState:
             loader = getattr(validator, "dataloader", None)
             if loader is not None:
                 sample["batches_total"] = len(loader)
+
+            # The validator's own rate, over this pass. Omitted rather than
+            # zeroed when there is no start or no completed batch, for the same
+            # reason it is on the training side: a rate over no work is
+            # undefined, not slow.
+            done = sample.get("batch", 0)
+            if self._val_started_at is not None and done > 0:
+                elapsed = time.monotonic() - self._val_started_at
+                if elapsed > 0:
+                    rate = done / elapsed
+                    sample["iterations_per_second"] = round(rate, 4)
+                    total = sample.get("batches_total")
+                    if isinstance(total, int) and total > done:
+                        sample["eta_seconds"] = round((total - done) / rate, 1)
+
+            # The same GPU number a training sample carries, from the trainer
+            # this validator belongs to -- the validator has no accessor of its
+            # own, and reaching for NVML here would be a second source for one
+            # fact.
+            memory = getattr(self._trainer, "_get_memory", None)
+            if callable(memory):
+                try:
+                    gigabytes = _json_number(memory())
+                    if gigabytes is not None:
+                        sample["gpu_memory_bytes"] = int(round(gigabytes * (2 ** 30)))
+                except Exception:
+                    pass
 
             if len(sample) > 1:
                 self._ctx.report_metrics(self._global_step, _VAL_BATCH_PHASE, sample)
@@ -1554,9 +1701,8 @@ class _RunState:
 
         sample: dict[str, Any] = {
             "at": time.time(),
-            "epoch": self.epochs_done + 1,
-            "epochs_total": self._total,
             "batch": self._batch_in_epoch,
+            **self._epoch_fields(),
         }
 
         # Batches per epoch, for the denominator of the bar.

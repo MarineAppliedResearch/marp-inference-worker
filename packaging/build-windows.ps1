@@ -247,6 +247,20 @@ try {
         $Version = [regex]::Match($ProjectText, '(?m)^version = "([^"]+)"\r?$').Groups[1].Value
     }
 
+    # One output root per version, unless the caller named one.
+    #
+    # The clear below wipes the whole root, and Windows will not delete a
+    # running executable -- so building 0.1.11 while somebody was installing
+    # 0.1.10 from the shared folder failed outright, after the enrolment check
+    # had already passed. Two people cannot share one output root while either
+    # of their installers is open.
+    #
+    # Appended here rather than in the parameter default because the version is
+    # not known until the block above has read it out of pyproject.toml.
+    if (-not $PSBoundParameters.ContainsKey('OutputRoot')) {
+        $OutputRoot = Join-Path $OutputRoot $Version
+    }
+
     if (Test-Path -LiteralPath $OutputRoot) { Remove-Item -LiteralPath $OutputRoot -Recurse -Force }
     $Payload = New-Item -ItemType Directory -Force -Path (Join-Path $OutputRoot 'payload')
     $Wheels = New-Item -ItemType Directory -Force -Path (Join-Path $Payload 'wheels')

@@ -2118,3 +2118,361 @@ def test_a_job_that_names_an_image_size_gets_it(tmp_path) -> None:
         a_runnable_spec(tmp_path, imgsz=1280)["params"]
     )
     assert detect["imgsz"] == 1280
+
+
+# test_roughly_one_sample_per_interval_over_a_long_epoch()
+# Verifies the throttle emits steadily across many windows, not once.
+# Inputs: tmp_path and monkeypatch.
+# Output: pytest pass/fail result.
+#
+# Job 21799 sent three samples for two epochs of 144 batches, and the suspicion
+# was that the throttle's clock was being reset on every call. It was not --
+# this asserts the rate directly, with a controlled clock, over 150 seconds of
+# batches. The real cause was elsewhere: on that run almost none of the epoch's
+# wall time was spent in the batch loop.
+def test_roughly_one_sample_per_interval_over_a_long_epoch(tmp_path, monkeypatch) -> None:
+
+    clock = [1000.0]
+    monkeypatch.setattr(training_module.time, "monotonic", lambda: clock[0])
+
+    ctx = RecordingContext()
+    state = training_module._RunState(ctx=ctx, total_epochs=1, run_root=tmp_path)
+
+    batches, seconds = 144, 150.0
+    trainer = a_training_trainer(elapsed=0.0, batches=batches)
+
+    state.on_epoch_start(trainer)
+    for index in range(batches):
+        clock[0] += seconds / batches
+        trainer.epoch_time_start = time.time() - (index + 1) * (seconds / batches)
+        state.on_batch_end(trainer)
+
+    samples = [m for _s, p, m in ctx.metrics if p == training_module._BATCH_PHASE]
+
+    # **Bounded by two things, and the smaller one wins.** The interval caps
+    # how often a sample may go out; the batch rate caps how often one CAN,
+    # because a sample is only ever emitted from a batch callback. With 144
+    # batches across 150 seconds the batches are the slower of the two, so
+    # every batch samples and the count is the batch count.
+    by_time = seconds / training_module._SAMPLE_INTERVAL_S
+    expected = min(by_time, batches)
+    assert expected * 0.8 <= len(samples) <= expected * 1.2 + 1, (
+        f"{len(samples)} samples over {seconds}s from {batches} batches "
+        f"at a {training_module._SAMPLE_INTERVAL_S}s interval"
+    )
+
+    # And the pace fields are there once a batch has finished.
+    mid = [m for m in samples if m.get("batch", 0) > 0]
+    assert mid, "no sample was emitted mid-epoch"
+    assert "iterations_per_second" in mid[0]
+    assert "epoch_eta_seconds" in mid[0]
+
+
+# test_the_quiet_phases_are_marked()
+# Verifies a flat stretch on the chart says which phase it was.
+# Inputs: tmp_path.
+# Output: pytest pass/fail result.
+#
+# **Sampling only from batch callbacks leaves the chart blank wherever there
+# are none** -- validating, saving, scanning a dataset. On job 21799 those were
+# most of each epoch's 150 seconds, so a chart fed from batch hooks alone had
+# almost nothing to draw and no way to say why.
+def test_the_quiet_phases_are_marked(tmp_path) -> None:
+
+    ctx = RecordingContext()
+    state = training_module._RunState(ctx=ctx, total_epochs=2, run_root=tmp_path)
+
+    # The object differs between these hooks -- validator, then trainer -- so
+    # the handler must not read anything off it.
+    state.on_phase_change("validating")(object())
+    state.on_phase_change("saving")(object())
+
+    entered = [m.get("phase_entered") for _s, _p, m in ctx.metrics]
+    assert entered == ["validating", "saving"]
+
+    # Each still says where in the run it happened.
+    assert all(m["epochs_total"] == 2 for _s, _p, m in ctx.metrics)
+
+
+# test_a_phase_marker_cannot_fail_the_run()
+# Verifies the boundary markers are as safe as everything else here.
+# Inputs: tmp_path.
+# Output: pytest pass/fail result.
+def test_a_phase_marker_cannot_fail_the_run(tmp_path) -> None:
+
+    class Exploding(RecordingContext):
+        def report_metrics(self, step, phase, metrics) -> None:
+            raise RuntimeError("coordinator went away")
+
+    state = training_module._RunState(ctx=Exploding(), total_epochs=1, run_root=tmp_path)
+
+    # Must not raise.
+    state.on_phase_change("validating")(object())
+
+
+# test_a_validation_sample_carries_its_own_pace_and_memory()
+# Verifies the validation pause charts like the training loop does.
+# Inputs: tmp_path and monkeypatch.
+# Output: pytest pass/fail result.
+#
+# The CLI shows validation progress, so a chart of "what the command line
+# shows" needs it. The validator has no memory accessor of its own, so the GPU
+# figure comes from the trainer it is validating for -- the same number from
+# the same source as a training sample, rather than a second reading.
+def test_a_validation_sample_carries_its_own_pace_and_memory(tmp_path, monkeypatch) -> None:
+
+    monkeypatch.setattr(training_module, "_SAMPLE_INTERVAL_S", 0.0)
+
+    clock = [500.0]
+    monkeypatch.setattr(training_module.time, "monotonic", lambda: clock[0])
+
+    ctx = RecordingContext()
+    state = training_module._RunState(ctx=ctx, total_epochs=1, run_root=tmp_path)
+
+    # A training batch first, so the state has seen the trainer.
+    state.on_batch_end(a_training_trainer())
+
+    # Validation begins, then four of twenty batches pass in two seconds.
+    state.on_phase_change("validating")(object())
+    clock[0] += 2.0
+    state.on_val_batch_end(types.SimpleNamespace(batch_i=3, dataloader=[None] * 20))
+
+    _step, phase, sample = ctx.metrics[-1]
+
+    assert phase == training_module._VAL_BATCH_PHASE
+    assert sample["batch"] == 4 and sample["batches_total"] == 20
+    # Four batches in two seconds, sixteen left at two a second.
+    assert sample["iterations_per_second"] == pytest.approx(2.0)
+    assert sample["eta_seconds"] == pytest.approx(8.0)
+    assert sample["gpu_memory_bytes"] == 7.25 * (2 ** 30)
+
+
+# test_a_validation_rate_needs_a_start_and_a_finished_batch()
+# Verifies an undefined rate is omitted rather than reported as zero.
+# Inputs: tmp_path and monkeypatch.
+# Output: pytest pass/fail result.
+#
+# Same rule as the training side. The first validation callback of a pass, and
+# any pass whose start was never seen, have nothing to divide by.
+def test_a_validation_rate_needs_a_start_and_a_finished_batch(tmp_path, monkeypatch) -> None:
+
+    monkeypatch.setattr(training_module, "_SAMPLE_INTERVAL_S", 0.0)
+
+    ctx = RecordingContext()
+    state = training_module._RunState(ctx=ctx, total_epochs=1, run_root=tmp_path)
+
+    # No `validating` marker seen, so no start to measure from.
+    state.on_val_batch_end(types.SimpleNamespace(batch_i=5, dataloader=[None] * 20))
+
+    _step, _phase, sample = ctx.metrics[-1]
+
+    assert sample["batch"] == 6
+    assert "iterations_per_second" not in sample
+    assert "eta_seconds" not in sample
+
+
+# test_each_validation_pass_is_timed_from_its_own_start()
+# Verifies the second epoch's validation is not measured from the first's.
+# Inputs: tmp_path and monkeypatch.
+# Output: pytest pass/fail result.
+#
+# Without resetting, a run's later validation passes would appear to slow down
+# steadily as the divisor grew to include every earlier pass.
+def test_each_validation_pass_is_timed_from_its_own_start(tmp_path, monkeypatch) -> None:
+
+    monkeypatch.setattr(training_module, "_SAMPLE_INTERVAL_S", 0.0)
+
+    clock = [100.0]
+    monkeypatch.setattr(training_module.time, "monotonic", lambda: clock[0])
+
+    ctx = RecordingContext()
+    state = training_module._RunState(ctx=ctx, total_epochs=2, run_root=tmp_path)
+
+    state.on_phase_change("validating")(object())
+    clock[0] += 60.0          # a long first pass
+    state.on_phase_change("validated")(object())
+
+    # Second pass, two batches in one second.
+    state.on_phase_change("validating")(object())
+    clock[0] += 1.0
+    state.on_val_batch_end(types.SimpleNamespace(batch_i=1, dataloader=[None] * 10))
+
+    _step, _phase, sample = ctx.metrics[-1]
+
+    assert sample["iterations_per_second"] == pytest.approx(2.0)
+
+
+# test_a_short_validation_pass_still_reports()
+# Verifies training cannot starve validation out of the chart entirely.
+# Inputs: tmp_path and monkeypatch.
+# Output: pytest pass/fail result.
+#
+# **This is why job 21801 sent no validation samples at all.** The two shared
+# one throttle clock, and a pass of 23 batches on a fast card finishes inside a
+# single 2.5s window that the training loop's last sample had already claimed.
+# The callback fired for every batch and every one was discarded.
+def test_a_short_validation_pass_still_reports(tmp_path, monkeypatch) -> None:
+
+    clock = [900.0]
+    monkeypatch.setattr(training_module.time, "monotonic", lambda: clock[0])
+
+    ctx = RecordingContext()
+    state = training_module._RunState(ctx=ctx, total_epochs=1, run_root=tmp_path)
+
+    # Training speaks, then validation begins immediately after.
+    state.on_batch_end(a_training_trainer())
+    state.on_phase_change("validating")(object())
+
+    # A whole pass inside one throttle window.
+    for index in range(23):
+        clock[0] += 0.05
+        state.on_val_batch_end(types.SimpleNamespace(batch_i=index, dataloader=[None] * 23))
+
+    validating = [m for _s, p, m in ctx.metrics if p == training_module._VAL_BATCH_PHASE]
+
+    assert validating, "a short validation pass vanished from the chart"
+    assert validating[0]["batch"] == 1
+
+
+# test_every_validation_pass_gets_its_first_sample()
+# Verifies the second pass is not throttled by the first.
+# Inputs: tmp_path and monkeypatch.
+# Output: pytest pass/fail result.
+def test_every_validation_pass_gets_its_first_sample(tmp_path, monkeypatch) -> None:
+
+    clock = [900.0]
+    monkeypatch.setattr(training_module.time, "monotonic", lambda: clock[0])
+
+    ctx = RecordingContext()
+    state = training_module._RunState(ctx=ctx, total_epochs=2, run_root=tmp_path)
+
+    for _pass in range(2):
+        state.on_phase_change("validating")(object())
+        clock[0] += 0.05
+        state.on_val_batch_end(types.SimpleNamespace(batch_i=0, dataloader=[None] * 10))
+
+    validating = [m for _s, p, m in ctx.metrics if p == training_module._VAL_BATCH_PHASE]
+
+    assert len(validating) == 2
+
+
+# test_the_training_loop_samples_often_enough_to_draw()
+# Verifies a short batch loop now yields more than its opening point.
+# Inputs: tmp_path and monkeypatch.
+# Output: pytest pass/fail result.
+#
+# **Measured, not chosen.** At 2.5s a real detection epoch produced zero samples
+# with a batch number above zero (job 21802) -- the whole batch loop fits inside
+# one window, so the chart had only epoch-start markers. This asserts that a
+# two-second batch loop now produces several points rather than one.
+def test_the_training_loop_samples_often_enough_to_draw(tmp_path, monkeypatch) -> None:
+
+    clock = [700.0]
+    monkeypatch.setattr(training_module.time, "monotonic", lambda: clock[0])
+
+    ctx = RecordingContext()
+    state = training_module._RunState(ctx=ctx, total_epochs=1, run_root=tmp_path)
+
+    trainer = a_training_trainer(elapsed=0.0, batches=120)
+    state.on_epoch_start(trainer)
+
+    # 120 batches across two seconds, the shape job 21802 actually had.
+    for _index in range(120):
+        clock[0] += 2.0 / 120
+        state.on_batch_end(trainer)
+
+    mid = [m for _s, p, m in ctx.metrics
+           if p == training_module._BATCH_PHASE and m.get("batch", 0) > 0]
+
+    # Two seconds at half a second each.
+    assert len(mid) >= 3, f"only {len(mid)} mid-epoch samples from a 2s batch loop"
+
+
+# test_validation_keeps_the_slower_interval()
+# Verifies the two throttles are independent numbers, not one shared constant.
+# Inputs: none.
+# Output: pytest pass/fail result.
+#
+# Validation already reports well -- it runs at a few iterations a second and
+# every pass gets its first sample unconditionally -- so it does not need the
+# density the training loop does.
+def test_validation_keeps_the_slower_interval() -> None:
+
+    assert training_module._SAMPLE_INTERVAL_S == 0.5
+    assert training_module._VAL_SAMPLE_INTERVAL_S == 2.5
+
+
+# test_the_pass_after_the_last_epoch_is_not_an_epoch()
+# Verifies a reader never sees epoch 4 of 3.
+# Inputs: tmp_path.
+# Output: pytest pass/fail result.
+#
+# **Ultralytics validates the best weights again after the last epoch.** Those
+# callbacks arrive with every epoch already counted, so `epochs_done + 1` is one
+# past the end and the dashboard's phase strip read "Training - epoch 4" on a
+# three-epoch run. There is no fourth epoch: the sample says which phase it is
+# and declines to name an epoch, rather than naming one that never happened.
+#
+# This is the same defect the epoch counter already had to fix once, in a second
+# place -- the extra callback is a persistent trap in this API.
+def test_the_pass_after_the_last_epoch_is_not_an_epoch(tmp_path) -> None:
+
+    ctx = RecordingContext()
+    state = training_module._RunState(ctx=ctx, total_epochs=3, run_root=tmp_path)
+
+    # Three epochs happen.
+    state.epochs_done = 3
+
+    state.on_phase_change("validating")(object())
+    state.on_phase_change("validated")(object())
+
+    for _step, _phase, sample in ctx.metrics:
+        assert "epoch" not in sample, f"named an epoch after the last: {sample}"
+        assert sample["epochs_total"] == 3
+
+    entered = [m["phase_entered"] for _s, _p, m in ctx.metrics]
+    assert entered == ["final_validation", "final_validated"]
+
+
+# test_an_epochs_own_validation_is_still_that_epochs()
+# The control: only the pass AFTER the last epoch is renamed.
+# Inputs: tmp_path.
+# Output: pytest pass/fail result.
+#
+# Epoch 2 of 3 validates mid-run, and that pass belongs to epoch 2. Without this
+# every validation would be reported as the final one.
+def test_an_epochs_own_validation_is_still_that_epochs(tmp_path) -> None:
+
+    ctx = RecordingContext()
+    state = training_module._RunState(ctx=ctx, total_epochs=3, run_root=tmp_path)
+
+    # One epoch finished; this is epoch 2's own validation.
+    state.epochs_done = 1
+
+    state.on_phase_change("validating")(object())
+
+    _step, _phase, sample = ctx.metrics[-1]
+
+    assert sample["phase_entered"] == "validating"
+    assert sample["epoch"] == 2
+    assert sample["epochs_total"] == 3
+
+
+# test_a_training_sample_never_names_an_epoch_past_the_end()
+# Verifies the live samples use the same rule as the markers.
+# Inputs: tmp_path and monkeypatch.
+# Output: pytest pass/fail result.
+def test_a_training_sample_never_names_an_epoch_past_the_end(tmp_path, monkeypatch) -> None:
+
+    monkeypatch.setattr(training_module, "_SAMPLE_INTERVAL_S", 0.0)
+
+    ctx = RecordingContext()
+    state = training_module._RunState(ctx=ctx, total_epochs=2, run_root=tmp_path)
+    state.epochs_done = 2
+
+    state.on_batch_end(a_training_trainer())
+
+    _step, _phase, sample = ctx.metrics[-1]
+
+    assert "epoch" not in sample
+    assert sample["epochs_total"] == 2

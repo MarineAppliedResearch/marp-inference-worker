@@ -2400,3 +2400,79 @@ def test_validation_keeps_the_slower_interval() -> None:
 
     assert training_module._SAMPLE_INTERVAL_S == 0.5
     assert training_module._VAL_SAMPLE_INTERVAL_S == 2.5
+
+
+# test_the_pass_after_the_last_epoch_is_not_an_epoch()
+# Verifies a reader never sees epoch 4 of 3.
+# Inputs: tmp_path.
+# Output: pytest pass/fail result.
+#
+# **Ultralytics validates the best weights again after the last epoch.** Those
+# callbacks arrive with every epoch already counted, so `epochs_done + 1` is one
+# past the end and the dashboard's phase strip read "Training - epoch 4" on a
+# three-epoch run. There is no fourth epoch: the sample says which phase it is
+# and declines to name an epoch, rather than naming one that never happened.
+#
+# This is the same defect the epoch counter already had to fix once, in a second
+# place -- the extra callback is a persistent trap in this API.
+def test_the_pass_after_the_last_epoch_is_not_an_epoch(tmp_path) -> None:
+
+    ctx = RecordingContext()
+    state = training_module._RunState(ctx=ctx, total_epochs=3, run_root=tmp_path)
+
+    # Three epochs happen.
+    state.epochs_done = 3
+
+    state.on_phase_change("validating")(object())
+    state.on_phase_change("validated")(object())
+
+    for _step, _phase, sample in ctx.metrics:
+        assert "epoch" not in sample, f"named an epoch after the last: {sample}"
+        assert sample["epochs_total"] == 3
+
+    entered = [m["phase_entered"] for _s, _p, m in ctx.metrics]
+    assert entered == ["final_validation", "final_validated"]
+
+
+# test_an_epochs_own_validation_is_still_that_epochs()
+# The control: only the pass AFTER the last epoch is renamed.
+# Inputs: tmp_path.
+# Output: pytest pass/fail result.
+#
+# Epoch 2 of 3 validates mid-run, and that pass belongs to epoch 2. Without this
+# every validation would be reported as the final one.
+def test_an_epochs_own_validation_is_still_that_epochs(tmp_path) -> None:
+
+    ctx = RecordingContext()
+    state = training_module._RunState(ctx=ctx, total_epochs=3, run_root=tmp_path)
+
+    # One epoch finished; this is epoch 2's own validation.
+    state.epochs_done = 1
+
+    state.on_phase_change("validating")(object())
+
+    _step, _phase, sample = ctx.metrics[-1]
+
+    assert sample["phase_entered"] == "validating"
+    assert sample["epoch"] == 2
+    assert sample["epochs_total"] == 3
+
+
+# test_a_training_sample_never_names_an_epoch_past_the_end()
+# Verifies the live samples use the same rule as the markers.
+# Inputs: tmp_path and monkeypatch.
+# Output: pytest pass/fail result.
+def test_a_training_sample_never_names_an_epoch_past_the_end(tmp_path, monkeypatch) -> None:
+
+    monkeypatch.setattr(training_module, "_SAMPLE_INTERVAL_S", 0.0)
+
+    ctx = RecordingContext()
+    state = training_module._RunState(ctx=ctx, total_epochs=2, run_root=tmp_path)
+    state.epochs_done = 2
+
+    state.on_batch_end(a_training_trainer())
+
+    _step, _phase, sample = ctx.metrics[-1]
+
+    assert "epoch" not in sample
+    assert sample["epochs_total"] == 2

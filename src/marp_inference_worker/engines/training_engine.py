@@ -369,6 +369,16 @@ _SAMPLE_INTERVAL_S = 0.5
 _VAL_SAMPLE_INTERVAL_S = 2.5
 
 
+# What the validation phases are called once training itself has finished.
+#
+# Ultralytics validates the best weights again after the last epoch
+# (`final_eval()`), and those callbacks arrive with every epoch already
+# counted. Reported as an ordinary validating phase they read as "epoch 4 of
+# 3", which is not a thing that happened -- the same defect the epoch counter
+# already had to fix, in a second place.
+_FINAL_PHASES = {"validating": "final_validation", "validated": "final_validated"}
+
+
 # The phase names live samples are filed under.
 #
 # **Distinct from the per-epoch rows on purpose.** Those already go through
@@ -1507,6 +1517,23 @@ class _RunState:
             self._ctx.log(f"published {len(published)} run files")
 
 
+    # _epoch_fields()
+    # Which epoch a sample belongs to, when it belongs to one at all.
+    # Inputs: none.
+    # Output: a mapping to merge into a sample.
+    #
+    # **Empty once every epoch is done.** Ultralytics runs a final validation
+    # after the last epoch, and `epochs_done + 1` is one past the end by then --
+    # a reader saw "epoch 4 of 3". There is no fourth epoch, so the honest
+    # answer is to say nothing rather than to name one.
+    def _epoch_fields(self) -> dict[str, Any]:
+
+        if self.epochs_done >= self._total:
+            return {"epochs_total": self._total}
+
+        return {"epoch": self.epochs_done + 1, "epochs_total": self._total}
+
+
     # on_epoch_start()
     # Resets the per-epoch batch counter and marks the phase change.
     # Inputs: the Ultralytics trainer.
@@ -1559,11 +1586,16 @@ class _RunState:
                     # batch always reports.
                     self._last_val_sample_at = 0.0
 
+                # After the last epoch this is Ultralytics revalidating the
+                # best weights, not an epoch's own pass.
+                named = phase
+                if self.epochs_done >= self._total:
+                    named = _FINAL_PHASES.get(phase, phase)
+
                 self._ctx.report_metrics(
                     self._global_step,
                     _BATCH_PHASE,
-                    {"at": time.time(), "phase_entered": phase,
-                     "epoch": self.epochs_done + 1, "epochs_total": self._total},
+                    {"at": time.time(), "phase_entered": named, **self._epoch_fields()},
                 )
                 # Counts as a sample, so a boundary does not also trigger the
                 # next throttled one a millisecond later.
@@ -1669,9 +1701,8 @@ class _RunState:
 
         sample: dict[str, Any] = {
             "at": time.time(),
-            "epoch": self.epochs_done + 1,
-            "epochs_total": self._total,
             "batch": self._batch_in_epoch,
+            **self._epoch_fields(),
         }
 
         # Batches per epoch, for the denominator of the bar.

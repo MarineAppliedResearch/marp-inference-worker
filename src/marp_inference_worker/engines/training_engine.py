@@ -1297,6 +1297,18 @@ class _RunState:
         self._global_step = 0
         self._batch_in_epoch = 0
         self._last_sample_at = 0.0
+
+        # The trainer, kept from whichever callback last saw one.
+        #
+        # Validation callbacks are handed the VALIDATOR, which has no memory
+        # accessor of its own -- but it is validating for this trainer, so the
+        # GPU figure on a validation sample is the same number from the same
+        # source as on a training one.
+        self._trainer: Any = None
+
+        # When the current validation pass began, so its rate is measured over
+        # the pass rather than over the whole run.
+        self._val_started_at: float | None = None
         self.stopped_early = False
         self.best_metric: float | None = None
         self.last_metrics: dict[str, Any] = {}
@@ -1476,6 +1488,7 @@ class _RunState:
     # Output: none.
     def on_epoch_start(self, trainer: Any) -> None:
 
+        self._trainer = trainer
         self._batch_in_epoch = 0
 
         # A phase change always samples, however recently the last one went:
@@ -1493,6 +1506,7 @@ class _RunState:
         # batch index in a local variable inside its own loop and does not
         # expose it. Counting the callback is exact, since it fires once per
         # batch, and it is the only honest way to get the number.
+        self._trainer = trainer
         self._batch_in_epoch += 1
         self._global_step += 1
 
@@ -1512,6 +1526,11 @@ class _RunState:
 
         def record(_whatever: Any) -> None:
             try:
+                # A validation pass times itself from here, so its rate covers
+                # the pass rather than the whole run.
+                if phase == "validating":
+                    self._val_started_at = time.monotonic()
+
                 self._ctx.report_metrics(
                     self._global_step,
                     _BATCH_PHASE,
@@ -1550,6 +1569,33 @@ class _RunState:
             loader = getattr(validator, "dataloader", None)
             if loader is not None:
                 sample["batches_total"] = len(loader)
+
+            # The validator's own rate, over this pass. Omitted rather than
+            # zeroed when there is no start or no completed batch, for the same
+            # reason it is on the training side: a rate over no work is
+            # undefined, not slow.
+            done = sample.get("batch", 0)
+            if self._val_started_at is not None and done > 0:
+                elapsed = time.monotonic() - self._val_started_at
+                if elapsed > 0:
+                    rate = done / elapsed
+                    sample["iterations_per_second"] = round(rate, 4)
+                    total = sample.get("batches_total")
+                    if isinstance(total, int) and total > done:
+                        sample["eta_seconds"] = round((total - done) / rate, 1)
+
+            # The same GPU number a training sample carries, from the trainer
+            # this validator belongs to -- the validator has no accessor of its
+            # own, and reaching for NVML here would be a second source for one
+            # fact.
+            memory = getattr(self._trainer, "_get_memory", None)
+            if callable(memory):
+                try:
+                    gigabytes = _json_number(memory())
+                    if gigabytes is not None:
+                        sample["gpu_memory_bytes"] = int(round(gigabytes * (2 ** 30)))
+                except Exception:
+                    pass
 
             if len(sample) > 1:
                 self._ctx.report_metrics(self._global_step, _VAL_BATCH_PHASE, sample)

@@ -2203,3 +2203,95 @@ def test_a_phase_marker_cannot_fail_the_run(tmp_path) -> None:
 
     # Must not raise.
     state.on_phase_change("validating")(object())
+
+
+# test_a_validation_sample_carries_its_own_pace_and_memory()
+# Verifies the validation pause charts like the training loop does.
+# Inputs: tmp_path and monkeypatch.
+# Output: pytest pass/fail result.
+#
+# The CLI shows validation progress, so a chart of "what the command line
+# shows" needs it. The validator has no memory accessor of its own, so the GPU
+# figure comes from the trainer it is validating for -- the same number from
+# the same source as a training sample, rather than a second reading.
+def test_a_validation_sample_carries_its_own_pace_and_memory(tmp_path, monkeypatch) -> None:
+
+    monkeypatch.setattr(training_module, "_SAMPLE_INTERVAL_S", 0.0)
+
+    clock = [500.0]
+    monkeypatch.setattr(training_module.time, "monotonic", lambda: clock[0])
+
+    ctx = RecordingContext()
+    state = training_module._RunState(ctx=ctx, total_epochs=1, run_root=tmp_path)
+
+    # A training batch first, so the state has seen the trainer.
+    state.on_batch_end(a_training_trainer())
+
+    # Validation begins, then four of twenty batches pass in two seconds.
+    state.on_phase_change("validating")(object())
+    clock[0] += 2.0
+    state.on_val_batch_end(types.SimpleNamespace(batch_i=3, dataloader=[None] * 20))
+
+    _step, phase, sample = ctx.metrics[-1]
+
+    assert phase == training_module._VAL_BATCH_PHASE
+    assert sample["batch"] == 4 and sample["batches_total"] == 20
+    # Four batches in two seconds, sixteen left at two a second.
+    assert sample["iterations_per_second"] == pytest.approx(2.0)
+    assert sample["eta_seconds"] == pytest.approx(8.0)
+    assert sample["gpu_memory_bytes"] == 7.25 * (2 ** 30)
+
+
+# test_a_validation_rate_needs_a_start_and_a_finished_batch()
+# Verifies an undefined rate is omitted rather than reported as zero.
+# Inputs: tmp_path and monkeypatch.
+# Output: pytest pass/fail result.
+#
+# Same rule as the training side. The first validation callback of a pass, and
+# any pass whose start was never seen, have nothing to divide by.
+def test_a_validation_rate_needs_a_start_and_a_finished_batch(tmp_path, monkeypatch) -> None:
+
+    monkeypatch.setattr(training_module, "_SAMPLE_INTERVAL_S", 0.0)
+
+    ctx = RecordingContext()
+    state = training_module._RunState(ctx=ctx, total_epochs=1, run_root=tmp_path)
+
+    # No `validating` marker seen, so no start to measure from.
+    state.on_val_batch_end(types.SimpleNamespace(batch_i=5, dataloader=[None] * 20))
+
+    _step, _phase, sample = ctx.metrics[-1]
+
+    assert sample["batch"] == 6
+    assert "iterations_per_second" not in sample
+    assert "eta_seconds" not in sample
+
+
+# test_each_validation_pass_is_timed_from_its_own_start()
+# Verifies the second epoch's validation is not measured from the first's.
+# Inputs: tmp_path and monkeypatch.
+# Output: pytest pass/fail result.
+#
+# Without resetting, a run's later validation passes would appear to slow down
+# steadily as the divisor grew to include every earlier pass.
+def test_each_validation_pass_is_timed_from_its_own_start(tmp_path, monkeypatch) -> None:
+
+    monkeypatch.setattr(training_module, "_SAMPLE_INTERVAL_S", 0.0)
+
+    clock = [100.0]
+    monkeypatch.setattr(training_module.time, "monotonic", lambda: clock[0])
+
+    ctx = RecordingContext()
+    state = training_module._RunState(ctx=ctx, total_epochs=2, run_root=tmp_path)
+
+    state.on_phase_change("validating")(object())
+    clock[0] += 60.0          # a long first pass
+    state.on_phase_change("validated")(object())
+
+    # Second pass, two batches in one second.
+    state.on_phase_change("validating")(object())
+    clock[0] += 1.0
+    state.on_val_batch_end(types.SimpleNamespace(batch_i=1, dataloader=[None] * 10))
+
+    _step, _phase, sample = ctx.metrics[-1]
+
+    assert sample["iterations_per_second"] == pytest.approx(2.0)

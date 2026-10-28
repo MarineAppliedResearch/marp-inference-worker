@@ -226,3 +226,123 @@ def test_an_archive_cannot_write_outside_its_cache_entry(tmp_path) -> None:
         ensure_dataset("http://marp.invalid/d/1/archive", sha, tmp_path / "cache", download=download)
 
     assert not outside.exists()
+
+
+# The archive's own name for its YAML, so the test does not hard-code a
+# second spelling of something the module already names.
+_DATA_YAML_NAME = dataset_module._DATA_YAML
+
+
+# a_classification_archive()
+# A tar in the shape MARP's builder actually produces for classification.
+# Inputs: tmp_path.
+# Output: (archive path, sha256).
+#
+# Modelled on dataset 390: `train`/`val`/`test`, a directory per class named
+# `<species_id>_<slug>`, and a `classes.json` beside the splits mapping those
+# handles back to species. **No data.yaml**, because Ultralytics reads a
+# classify dataset from the directory and takes its vocabulary from the folder
+# names -- there is no YAML to carry.
+def a_classification_archive(tmp_path):
+
+    staging = tmp_path / "cls-staging"
+    for split in ("train", "val", "test"):
+        for handle in ("145_blue-deacon-rockfish", "8_lingcod"):
+            folder = staging / split / handle
+            folder.mkdir(parents=True)
+            (folder / "crop0.jpg").write_bytes(b"x")
+    (staging / "classes.json").write_text(
+        '{"145_blue-deacon-rockfish": {"species_id": 145, "comname": "Blue/Deacon Rockfish"},'
+        ' "8_lingcod": {"species_id": 8, "comname": "Lingcod"}}',
+        encoding="utf-8",
+    )
+
+    archive = tmp_path / "cls.tar"
+    with tarfile.open(archive, "w") as tar:
+        for entry in sorted(staging.iterdir()):
+            tar.add(entry, arcname=entry.name)
+
+    return archive, hashlib.sha256(archive.read_bytes()).hexdigest()
+
+
+# test_a_classification_archive_unpacks_without_a_data_yaml()
+# Verifies the whole fetch-and-unpack path accepts a real classification shape.
+# Inputs: tmp_path.
+# Output: pytest pass/fail result.
+#
+# **This is the defect job 21798 died on.** `_rewrite_data_yaml` ran after every
+# extraction and raised when there was no data.yaml, so every classification
+# dataset was refused before any engine code was reached. The engine's own
+# classify tests passed throughout, because they hand it a directory that was
+# built by hand rather than one that came through this path.
+def test_a_classification_archive_unpacks_without_a_data_yaml(tmp_path) -> None:
+
+    archive, sha = a_classification_archive(tmp_path)
+    download, _ = fake_download(archive)
+
+    result = ensure_dataset(
+        "http://marp.invalid/d/390/archive", sha, tmp_path / "cache", download=download
+    )
+
+    # No data.yaml, and the caller is told so rather than handed a path to a
+    # file that is not there.
+    assert result["data_yaml"] is None
+
+    unpacked = Path(result["path"])
+    assert (unpacked / "train" / "145_blue-deacon-rockfish" / "crop0.jpg").is_file()
+    assert (unpacked / "val").is_dir() and (unpacked / "test").is_dir()
+
+    # The vocabulary file travels with it; the worker does not read it, but
+    # anything unpacking the archive outside MARP needs it.
+    assert (unpacked / "classes.json").is_file()
+
+
+# test_a_cached_classification_dataset_is_also_reported_without_a_yaml()
+# Verifies the second fetch answers the same way as the first.
+# Inputs: tmp_path.
+# Output: pytest pass/fail result.
+#
+# The cached branch returns early and built its own answer, so it could have
+# kept claiming a data.yaml that the fresh path had learned not to.
+def test_a_cached_classification_dataset_is_also_reported_without_a_yaml(tmp_path) -> None:
+
+    archive, sha = a_classification_archive(tmp_path)
+    download, _ = fake_download(archive)
+    cache = tmp_path / "cache"
+
+    first = ensure_dataset("http://marp.invalid/d/390/archive", sha, cache, download=download)
+    second = ensure_dataset("http://marp.invalid/d/390/archive", sha, cache, download=download)
+
+    assert first["fetched"] is True and second["fetched"] is False
+    assert second["data_yaml"] is None
+    assert second["path"] == first["path"]
+
+
+# test_a_detection_archive_still_gets_its_paths_rewritten()
+# The control: admitting classification must not stop detection working.
+# Inputs: tmp_path.
+# Output: pytest pass/fail result.
+def test_a_detection_archive_still_gets_its_paths_rewritten(tmp_path) -> None:
+
+    staging = tmp_path / "det-staging"
+    (staging / "train" / "images").mkdir(parents=True)
+    (staging / "train" / "images" / "a.jpg").write_bytes(b"x")
+    (staging / "val" / "images").mkdir(parents=True)
+    (staging / _DATA_YAML_NAME).write_text(
+        "names:\n- Lingcod\nnc: 1\ntrain: train/images\nval: val/images\n", encoding="utf-8"
+    )
+
+    archive = tmp_path / "det.tar"
+    with tarfile.open(archive, "w") as tar:
+        for entry in sorted(staging.iterdir()):
+            tar.add(entry, arcname=entry.name)
+    sha = hashlib.sha256(archive.read_bytes()).hexdigest()
+
+    download, _ = fake_download(archive)
+    result = ensure_dataset(
+        "http://marp.invalid/d/1/archive", sha, tmp_path / "cache", download=download
+    )
+
+    assert result["data_yaml"] is not None
+    text = Path(result["data_yaml"]).read_text(encoding="utf-8")
+    assert "train: " + Path(result["path"]).as_posix() + "/train/images" in text

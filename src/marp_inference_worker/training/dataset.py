@@ -137,11 +137,39 @@ def _download(
 # A dataset built by the legacy scripts carries absolute paths from the machine
 # that built it, which is the same bug seen from the other end; the packaging
 # step strips those, and this puts correct ones back.
-def _rewrite_data_yaml(unpacked: Path) -> Path:
+def _data_yaml_or_none(unpacked: Path) -> Path | None:
+
+    # Named rather than returned blindly: a classification dataset has no
+    # data.yaml, and handing back a path to a file that is not there makes
+    # every caller test for existence instead of being told.
+    yaml_path = unpacked / _DATA_YAML
+    return yaml_path if yaml_path.is_file() else None
+
+
+def _rewrite_data_yaml(unpacked: Path) -> Path | None:
 
     yaml_path = unpacked / _DATA_YAML
     if not yaml_path.is_file():
-        raise FileNotFoundError(f"dataset archive carried no {_DATA_YAML}")
+        # **A classification archive has no data.yaml and is not broken.**
+        # Ultralytics reads a classify dataset from a DIRECTORY, taking its
+        # class vocabulary from the subfolder names, so there is no YAML to
+        # rewrite and nothing missing. This refused every classification
+        # dataset outright -- job 21798 died here, before any engine code ran.
+        #
+        # Still a refusal for a DETECTION archive that lost its yaml, which is
+        # what the old message was right about. The two layouts are told apart
+        # by `train/images`: a detection dataset splits its train directory into
+        # `images/` and `labels/`, while a classification one holds a directory
+        # per class. Without this check a detection archive missing its yaml
+        # would be accepted as a classification dataset with one class called
+        # "images" -- a silently wrong run rather than a refusal.
+        if (unpacked / "train").is_dir() and not (unpacked / "train" / "images").is_dir():
+            return None
+
+        raise FileNotFoundError(
+            f"dataset archive carried no {_DATA_YAML}, and its train/ directory "
+            "is not a classification layout either"
+        )
 
     # Rewritten line by line rather than through a YAML library, for the same
     # reason the packaging side builds it that way: the file is a names list, an
@@ -195,7 +223,7 @@ def ensure_dataset(
 
     # Already here and finished. The marker is the test, not the directory.
     if marker.is_file():
-        return {"path": unpacked, "data_yaml": unpacked / _DATA_YAML, "fetched": False}
+        return {"path": unpacked, "data_yaml": _data_yaml_or_none(unpacked), "fetched": False}
 
     # A directory without the marker is the wreckage of an interrupted attempt,
     # and whatever is in it cannot be trusted. Start again rather than resume
@@ -240,4 +268,4 @@ def ensure_dataset(
     finally:
         archive.unlink(missing_ok=True)
 
-    return {"path": unpacked, "data_yaml": unpacked / _DATA_YAML, "fetched": True}
+    return {"path": unpacked, "data_yaml": _data_yaml_or_none(unpacked), "fetched": True}

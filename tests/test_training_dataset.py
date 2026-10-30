@@ -346,3 +346,73 @@ def test_a_detection_archive_still_gets_its_paths_rewritten(tmp_path) -> None:
     assert result["data_yaml"] is not None
     text = Path(result["data_yaml"]).read_text(encoding="utf-8")
     assert "train: " + Path(result["path"]).as_posix() + "/train/images" in text
+
+
+# test_two_attempts_fetching_one_dataset_download_it_once()
+# Verifies concurrent fetches of one archive are serialised (#73).
+# Inputs: tmp_path.
+# Output: pytest pass/fail result.
+#
+# Job 21953 on ABYSS: three attempts of one job each unlinked and reopened the
+# same `.partial`, and the later ones died with a Windows sharing violation.
+# The download is slowed so the two certainly overlap.
+def test_two_attempts_fetching_one_dataset_download_it_once(tmp_path: Path) -> None:
+
+    import threading
+    import time
+
+    archive, sha = build_archive(tmp_path)
+    copy, calls = fake_download(archive)
+
+    def slow(url, destination, headers=None, on_progress=None):
+        time.sleep(0.5)
+        copy(url, destination, headers, on_progress)
+
+    cache = tmp_path / "cache"
+    results: list[dict] = []
+    errors: list[BaseException] = []
+
+    def fetch():
+        try:
+            results.append(ensure_dataset("http://marp.invalid/d/1/archive", sha, cache, download=slow))
+        except BaseException as error:
+            errors.append(error)
+
+    threads = [threading.Thread(target=fetch) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+
+    assert errors == []
+    assert len(calls) == 1
+    assert sorted(result["fetched"] for result in results) == [False, True]
+    assert results[0]["path"] == results[1]["path"]
+
+    # And the lock is gone once both have finished.
+    assert list(cache.glob("*.lock")) == []
+
+
+# test_a_lock_left_by_a_dead_process_is_taken_over()
+# Verifies a crashed attempt's lock does not block the next one forever (#73).
+# Inputs: tmp_path.
+# Output: pytest pass/fail result.
+def test_a_lock_left_by_a_dead_process_is_taken_over(tmp_path: Path) -> None:
+
+    import psutil
+
+    archive, sha = build_archive(tmp_path)
+    download, calls = fake_download(archive)
+    cache = tmp_path / "cache"
+    cache.mkdir()
+
+    # A pid nothing is running as.
+    dead = 4_000_000
+    while psutil.pid_exists(dead):
+        dead += 1
+    (cache / f"{sha}.lock").write_text(str(dead), encoding="utf-8")
+
+    result = ensure_dataset("http://marp.invalid/d/1/archive", sha, cache, download=download)
+
+    assert result["fetched"] is True
+    assert len(calls) == 1

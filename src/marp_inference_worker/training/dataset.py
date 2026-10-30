@@ -16,6 +16,9 @@
 # hashlib verifies the archive against the hash the job spec carried.
 import hashlib
 
+# os creates the download lock atomically (#73).
+import os
+
 # shutil removes a half-unpacked directory when something goes wrong.
 import shutil
 
@@ -24,6 +27,9 @@ import shutil
 # CPU and saves nothing -- and tarfile is in the standard library, so a worker
 # needs no dependency to read one.
 import tarfile
+
+# time paces the wait for another attempt's download (#73).
+import time
 
 # Path types every directory this module hands back.
 from pathlib import Path
@@ -192,6 +198,61 @@ def _rewrite_data_yaml(unpacked: Path) -> Path | None:
     return yaml_path
 
 
+# How long a second caller waits for another attempt's download, in seconds.
+# A 20 GB archive took about three minutes on ABYSS; this is generous.
+_LOCK_WAIT_S = 2 * 60 * 60
+
+
+class DatasetBusy(RuntimeError):
+    pass
+
+
+# _dataset_lock()
+# Holds one archive's download for this caller, beside its cache entry (#73).
+# Inputs: the cache root and the archive's sha256.
+# Output: a context manager.
+# A lock left by a process that has died is taken over; one held by a live
+# process is waited for, and past _LOCK_WAIT_S the wait fails naming it.
+class _dataset_lock:
+
+    def __init__(self, cache_root, sha256):
+        self._path = Path(cache_root) / f"{sha256}.lock"
+
+    def __enter__(self):
+        import psutil
+
+        started = time.monotonic()
+        while True:
+            try:
+                fd = os.open(self._path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            except FileExistsError:
+                try:
+                    owner = int(self._path.read_text(encoding="utf-8").strip() or 0)
+                except (OSError, ValueError):
+                    owner = 0
+
+                # Its holder is gone: what it left is not a download in progress.
+                if owner and not psutil.pid_exists(owner):
+                    self._path.unlink(missing_ok=True)
+                    continue
+
+                if time.monotonic() - started > _LOCK_WAIT_S:
+                    raise DatasetBusy(
+                        f"another attempt (process {owner}) has been downloading this dataset "
+                        f"for over {_LOCK_WAIT_S // 60} minutes"
+                    )
+                time.sleep(1.0)
+                continue
+
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(str(os.getpid()))
+            return self
+
+    def __exit__(self, *exc):
+        self._path.unlink(missing_ok=True)
+        return False
+
+
 # ensure_dataset()
 # Returns a local directory holding this dataset, fetching it once if needed.
 # Inputs: the resolved locator, its expected sha256, the cache root, optional
@@ -225,14 +286,34 @@ def ensure_dataset(
     if marker.is_file():
         return {"path": unpacked, "data_yaml": _data_yaml_or_none(unpacked), "fetched": False}
 
-    # A directory without the marker is the wreckage of an interrupted attempt,
-    # and whatever is in it cannot be trusted. Start again rather than resume
-    # into it: the archive is content-addressed, so starting again is cheap to
-    # reason about and a half-unpacked tree is not.
-    if unpacked.exists():
-        shutil.rmtree(unpacked, ignore_errors=True)
-
     cache_root.mkdir(parents=True, exist_ok=True)
+
+    # **One download per archive** (#73). Two attempts of one job on one machine
+    # each unlinked and reopened the same `.partial`, and the second died with a
+    # Windows sharing violation that said nothing about the first. The lock waits
+    # for the other, then uses what it finished.
+    with _dataset_lock(cache_root, expected):
+        if marker.is_file():
+            return {"path": unpacked, "data_yaml": _data_yaml_or_none(unpacked), "fetched": False}
+
+        # A directory without the marker is the wreckage of an interrupted attempt,
+        # and whatever is in it cannot be trusted. Start again rather than resume
+        # into it: the archive is content-addressed, so starting again is cheap to
+        # reason about and a half-unpacked tree is not. Only under the lock, so it
+        # is never another attempt's unpacking in progress.
+        if unpacked.exists():
+            shutil.rmtree(unpacked, ignore_errors=True)
+
+        return _fetch_and_unpack(url, expected, cache_root, unpacked, marker, headers, on_progress, download)
+
+
+# _fetch_and_unpack()
+# Downloads, verifies and unpacks one archive into its cache entry.
+# Inputs: as ensure_dataset(), resolved.
+# Output: the same mapping ensure_dataset() returns.
+# Use this only while holding the archive's lock.
+def _fetch_and_unpack(url, expected, cache_root, unpacked, marker, headers, on_progress, download):
+
     archive = cache_root / f"{expected}.tar.partial"
     archive.unlink(missing_ok=True)
 

@@ -456,6 +456,7 @@ def test_the_service_pass_actually_applies_the_pause() -> None:
     stub = _Stub()
     stub._state = WorkerState()
     stub._jobs_by_slot = {}
+    stub._deferred = []
     stub._apply_pause_to_running_jobs = lambda: applied.append(True)
 
     # The tail of the pass refreshes what /status reports; stubbed out because

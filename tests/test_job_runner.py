@@ -328,6 +328,7 @@ def _job_for(
     frames: int = 5,
     frame_delay_s: float = 0.0,
     start_frame: int = 1000,
+    console_bar: bool = False,
 ) -> dict[str, Any]:
 
     # Contents keyed by attempt id, so each job gets its own cache entry and
@@ -337,9 +338,12 @@ def _job_for(
         contents=f"model for {attempt_id}".encode(),
         name=f"{attempt_id}.pt",
     )
-    return _mock_job(
+    job = _mock_job(
         attempt_id, model_path, model_sha256, frames, frame_delay_s, start_frame
     )
+    if console_bar:
+        job["spec"]["params"]["console_bar"] = True
+    return job
 
 
 # _runner()
@@ -998,6 +1002,34 @@ def test_engine_logs_reach_the_coordinator_as_events(tmp_path: Path) -> None:
     # `at` the coordinator can put in a timestamp column rather than a float.
     assert all("seq" in event for event in coordinator.events)
     assert all(isinstance(event["at"], str) for event in coordinator.events)
+
+
+# test_metrics_survive_a_progress_bar_on_stdout(tmp_path)
+# Verifies that console output from a library cannot swallow the job's events.
+# Inputs: pytest temporary directory.
+# Output: pytest pass/fail result.
+#
+# MARP_API#277 / #295. Ultralytics draws its training bar on stdout, redrawn
+# with a carriage return and no newline, and stdout was the event channel. Each
+# event written mid-epoch landed on the end of a bar line, failed to parse, and
+# was dropped as stray output: job 21956 wrote about 66,000 per-batch samples
+# and the coordinator received 101, the ones that happened to follow a newline.
+def test_metrics_survive_a_progress_bar_on_stdout(tmp_path: Path) -> None:
+
+    coordinator = FakeCoordinator(
+        offers=[_job_for(tmp_path, "attempt-bar", frames=90, console_bar=True)]
+    )
+    runner, _ = _runner(coordinator, tmp_path)
+    runner.ensure_enrolled()
+    runner._poll_once()
+    assert _wait_until(runner, lambda: len(coordinator.results) == 1)
+
+    # The same four as without the bar: the first frame, then one per 30.
+    metrics = [event for event in coordinator.events if event.get("kind") == "metric"]
+    assert len(metrics) == 4, [event["payload"] for event in metrics]
+
+    # And the bar itself is not passed off as job output.
+    assert not any("mock bar" in str(event.get("payload")) for event in coordinator.events)
 
 
 # test_slots_limit_how_many_jobs_run_at_once(tmp_path)

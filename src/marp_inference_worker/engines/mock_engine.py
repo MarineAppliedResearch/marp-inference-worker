@@ -18,6 +18,7 @@
 import json
 
 # time paces the mock work so a cancellation test has something to interrupt.
+import sys
 import time
 
 # Path types the artifact path.
@@ -117,6 +118,11 @@ class MockEngine(BaseEngine, FrameInferenceCapable):
         # Optional pacing, so a test can cancel a job that is still running.
         frame_delay_s = float(ctx.params.get("frame_delay_s", 0.0))
 
+        # Optional console noise the way Ultralytics makes it: a progress bar
+        # redrawn on stdout with a carriage return and never a newline. Its own
+        # switch, so a test can show the event channel survives it (#277).
+        console_bar = bool(ctx.params.get("console_bar", False))
+
         # Results go to a real file, so publish_artifact() has real bytes and a
         # real hash to work with.
         results_path: Path = ctx.checkpoint_dir / "observations.jsonl"
@@ -144,6 +150,10 @@ class MockEngine(BaseEngine, FrameInferenceCapable):
                 # Progress every frame: it is overwritten in place rather than
                 # accumulated, so it costs one mapping however long the job is.
                 ctx.report_progress(frames_processed, total, "frames")
+
+                if console_bar:
+                    sys.stdout.write(f"\r  {frames_processed}/{total} mock bar")
+                    sys.stdout.flush()
 
                 # Metrics on the real engine's cadence, because each one is a
                 # durable row. The first frame is included so a short job still

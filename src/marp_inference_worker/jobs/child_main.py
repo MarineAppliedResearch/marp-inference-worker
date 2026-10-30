@@ -64,6 +64,10 @@ def main(argv: list[str]) -> int:
     pause_file = Path(envelope.get("pause_file") or stop_file.with_name("PAUSE"))
     spec = envelope["spec"]
 
+    # The event channel is taken before anything can print, so nothing a
+    # library writes to stdout can land in the middle of it (#277).
+    events = _separate_events_from_console(workspace)
+
     # Set Ultralytics' runtime environment before anything imports it. This is
     # the worker's decision and not the engine's (R16), and it has to happen
     # before the first ultralytics import because the library reads these at
@@ -83,7 +87,7 @@ def main(argv: list[str]) -> int:
         stop_file=stop_file,
         pause_file=pause_file,
         resume_from=None,
-        stream=sys.stdout,
+        stream=events,
     )
 
     # A useful total and phase exist before preflight or the first decoded frame.
@@ -189,6 +193,39 @@ def _fetch_dataset_if_named(ctx: Any, spec: dict[str, Any]) -> None:
         f"dataset ready at {result['path']}"
         + ("" if result["fetched"] else " (already on this machine)")
     )
+
+
+# _separate_events_from_console()
+# Gives the job's events a channel of their own, and sends console output to a file.
+# Inputs: the job's workspace directory.
+# Output: a text stream on the parent's pipe, for the job context to write to.
+# Use this once, first thing in the child, before anything can print.
+#
+# **stdout was the event channel and Ultralytics' console as well.** Its training
+# bar is redrawn on stdout with a carriage return and never a newline, so every
+# event written mid-epoch landed on the end of a bar line, failed to parse in
+# the parent, and was dropped as stray output. Job 21956 wrote about 66,000
+# per-batch samples and the coordinator received 101 -- the ones that happened
+# to follow a newline (MARP_API#277, #295).
+#
+# The pipe is kept on a private duplicate of the descriptor, and descriptor 1
+# itself is pointed at `console.log`, so a C extension or a subprocess writing
+# to fd 1 cannot reach the channel either. The console is kept rather than
+# discarded: it is what a person debugging a run on the machine would read.
+def _separate_events_from_console(workspace: Path) -> Any:
+
+    sys.stdout.flush()
+
+    # Line buffered, so each event reaches the parent when it is written.
+    events = os.fdopen(os.dup(sys.stdout.fileno()), "w", encoding="utf-8", buffering=1)
+
+    workspace.mkdir(parents=True, exist_ok=True)
+    console = open(workspace / "console.log", "a", encoding="utf-8", errors="replace", buffering=1)
+
+    os.dup2(console.fileno(), sys.stdout.fileno())
+    sys.stdout = console
+
+    return events
 
 
 # _apply_ultralytics_environment()

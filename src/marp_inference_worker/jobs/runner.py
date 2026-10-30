@@ -94,6 +94,13 @@ _ERROR_BACKOFF_S = 30.0
 # a child still running after it is wedged, not slow.
 _STOP_GRACE_S = 60.0
 
+# How long a job may go without an accepted heartbeat before its lease is
+# treated as lost (#73). The coordinator's lease is 60 s; a little longer, so a
+# blip is not a loss. Past it the attempt is no longer this worker's to run:
+# job 21953's first attempt kept downloading for minutes after MARP had taken
+# the job back, and the next two attempts died fighting it for the file.
+_LEASE_LOST_S = 90.0
+
 _UPDATE_CHECK_INTERVAL_S = 60.0
 
 
@@ -340,6 +347,10 @@ class JobRunner:
         # Slot index -> the job running on it. A slot absent from this mapping
         # is free.
         self._jobs_by_slot: dict[int, JobProcess] = {}
+
+        # Leases for a job this machine is still running an earlier attempt of,
+        # held until that child has gone (#73).
+        self._deferred: list[AttemptEnvelope] = []
 
         # Set by stop() so the loop can be shut down from outside.
         self._should_exit = False
@@ -629,7 +640,10 @@ class JobRunner:
         # offer it back on the next poll.
         live = self._live_slot_count()
 
-        return [index for index in range(live) if index not in self._jobs_by_slot]
+        free = [index for index in range(live) if index not in self._jobs_by_slot]
+
+        # A lease held back for an earlier attempt still owes a slot (#73).
+        return free[:max(0, len(free) - len(self._deferred))]
 
     # stop()
     # Asks the loop to finish after the current iteration.
@@ -850,9 +864,57 @@ class JobRunner:
                 )
             return False
 
+        # **Not on top of an earlier attempt of the same job** (#73). Its child may
+        # still be stopping -- the lease it lost is why this one exists -- and the
+        # two would share the job's files. Held, and heartbeated, until it has gone.
+        if envelope.job_id is not None and envelope.job_id in self._running_job_ids():
+            self._state.note(f"holding {envelope.attempt_id}: an earlier attempt of job {envelope.job_id} is still stopping")
+            self._deferred.append(envelope)
+            return True
+
         # Start it.
         self._start_job(envelope)
         return True
+
+    # _running_job_ids()
+    # The coordinator job ids this machine has a child running for.
+    # Inputs: none.
+    # Output: a set of job ids.
+    def _running_job_ids(self) -> set[str]:
+
+        ids = set()
+        for job in self._jobs_by_slot.values():
+            params = job.spec.get("params") or {}
+            job_id = params.get("_job_id", job.spec.get("_job_id"))
+            if job_id is not None:
+                ids.add(str(job_id))
+        return ids
+
+    # _service_deferred()
+    # Starts a held lease once its job's earlier child has gone, and keeps it alive meanwhile.
+    # Inputs: none.
+    # Output: none.
+    def _service_deferred(self) -> None:
+
+        for envelope in list(self._deferred):
+            if envelope.job_id not in self._running_job_ids():
+                self._deferred.remove(envelope)
+                self._start_job(envelope)
+                continue
+
+            try:
+                response = self._client.heartbeat(
+                    attempt_id=envelope.attempt_id,
+                    worker_id=envelope.worker_id,
+                    lease_epoch=envelope.lease_epoch,
+                    progress={"done": 0, "total": None, "unit": "frames", "phase": "waiting"},
+                )
+            except CoordinatorError:
+                continue
+
+            # Taken back while it waited: nothing was started, so nothing to stop.
+            if is_stop_action(str(response.get("action", "continue"))):
+                self._deferred.remove(envelope)
 
     # _start_job()
     # Prepares and launches one job.
@@ -927,6 +989,10 @@ class JobRunner:
             ),
         )
         self._jobs_by_slot[slot_index] = job
+
+        # The last moment MARP accepted this attempt's heartbeat; the lease is
+        # judged lost from it (#73). The lease began just now.
+        job.heartbeat_accepted_at = time.monotonic()
 
         # Record it as in-flight before launching, so a crash between the two
         # still leaves evidence for report_lost_job() (R15).
@@ -1081,6 +1147,28 @@ class JobRunner:
                 # network may be back before the lease expires, and killing it
                 # throws away work that is still valid.
                 self._state.note_error(f"heartbeat failed for {job.attempt_id}: {error}")
+
+                # **But a lease that has run out is** (#73). Past it MARP has taken
+                # the job back and may lease it again, here or elsewhere, so this
+                # child is working for nobody and holding files a new attempt needs.
+                lost_for = time.monotonic() - getattr(job, "heartbeat_accepted_at", time.monotonic())
+                if lost_for > _LEASE_LOST_S and not job.stop_requested:
+                    self._state.note(
+                        f"lease lost for {job.attempt_id}: no heartbeat accepted for {int(lost_for)}s; stopping it"
+                    )
+                    job.request_stop()
+
+                # Fall through to the grace check, so a child that will not stop
+                # is still killed while the coordinator cannot be reached.
+                response = None
+
+            else:
+                job.heartbeat_accepted_at = time.monotonic()
+
+            if response is None:
+                if job.stop_requested and job.stop_elapsed_s() > _STOP_GRACE_S:
+                    if not job.wait(timeout_s=0.1):
+                        job.kill()
                 continue
 
             # Read the instruction. An action this worker does not recognize is
@@ -1109,6 +1197,10 @@ class JobRunner:
             if job.stop_requested and job.stop_elapsed_s() > _STOP_GRACE_S:
                 if not job.wait(timeout_s=0.1):
                     job.kill()
+
+        # A lease held for a job whose earlier child has now gone can start (#73).
+        if self._deferred:
+            self._service_deferred()
 
         # Refresh what /status reports.
         self._state.set_jobs(self._describe_jobs())

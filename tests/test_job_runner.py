@@ -2247,3 +2247,113 @@ def test_tidying_never_reaches_outside_the_workspace_root(tmp_path: Path) -> Non
 
     assert (elsewhere / "keep-me").is_file()
     assert "refusing to remove" in (state.describe()["last_error"] or "")
+
+
+# test_a_lost_lease_stops_the_child(tmp_path)
+# Verifies a job whose heartbeats stop being accepted is stopped (#73).
+# Inputs: pytest temporary directory.
+# Output: pytest pass/fail result.
+#
+# Job 21953's first attempt kept downloading after MARP had taken the job back,
+# because a failed heartbeat skipped every stop check. Past the lease the child
+# is working for nobody; it has to stop and free its slot.
+def test_a_lost_lease_stops_the_child(tmp_path: Path, monkeypatch) -> None:
+
+    from marp_inference_worker.jobs import runner as runner_module
+
+    # Lost after half a second rather than ninety.
+    monkeypatch.setattr(runner_module, "_LEASE_LOST_S", 0.5)
+
+    class Unreachable(FakeCoordinator):
+        def heartbeat(self, *args, **kwargs):
+            super().heartbeat(*args, **kwargs)
+            raise CoordinatorError("/heartbeat could not be reached: ConnectError")
+
+    coordinator = Unreachable(
+        offers=[_job_for(tmp_path, "attempt-lost", frames=2000, frame_delay_s=0.005)]
+    )
+    runner, state = _runner(coordinator, tmp_path)
+    runner.ensure_enrolled()
+    runner._poll_once()
+
+    job = runner._jobs_by_slot[0]
+    assert job.is_running()
+
+    # It stops, reports, and its slot is free again.
+    assert _wait_until(runner, lambda: 0 not in runner._jobs_by_slot), "child kept running with its lease gone"
+    assert job.stop_requested
+    assert not job.is_running()
+
+    summary = coordinator.terminal_detail("attempt-lost")["summary"]
+    assert 0 < summary["frames_processed"] < 2000
+
+
+# test_a_heartbeat_failure_inside_the_lease_does_not_stop_the_child(tmp_path)
+# Verifies a blip is not a lost lease (#73).
+# Inputs: pytest temporary directory.
+# Output: pytest pass/fail result.
+def test_a_heartbeat_failure_inside_the_lease_does_not_stop_the_child(tmp_path: Path) -> None:
+
+    class Flaky(FakeCoordinator):
+        def heartbeat(self, *args, **kwargs):
+            answer = super().heartbeat(*args, **kwargs)
+            if len(self.heartbeats) == 2:
+                raise CoordinatorError("/heartbeat returned 502: bad gateway")
+            return answer
+
+    coordinator = Flaky(offers=[_job_for(tmp_path, "attempt-blip", frames=20, frame_delay_s=0.01)])
+    runner, _ = _runner(coordinator, tmp_path)
+    runner.ensure_enrolled()
+    runner._poll_once()
+
+    assert _wait_until(runner, lambda: len(coordinator.results) == 1)
+    assert coordinator.results[0]["outcome"] == "succeeded"
+
+
+# test_a_second_lease_for_a_running_job_waits_for_the_first(tmp_path)
+# Verifies a new attempt is not started on top of an earlier one (#73).
+# Inputs: pytest temporary directory.
+# Output: pytest pass/fail result.
+#
+# MARP re-leases a job whose lease expired, possibly to the same machine, while
+# the old child is still unwinding. The two would share the job's files.
+def test_a_second_lease_for_a_running_job_waits_for_the_first(tmp_path: Path) -> None:
+
+    first = _job_for(tmp_path, "attempt-old", frames=2000, frame_delay_s=0.005)
+    second = _job_for(tmp_path, "attempt-new", frames=5)
+    first["job_id"] = second["job_id"] = "21953"
+
+    class Reclaiming(FakeCoordinator):
+        def heartbeat(self, attempt_id, *args, **kwargs):
+            super().heartbeat(attempt_id, *args, **kwargs)
+            # The old attempt is taken back once the new one has been leased.
+            if attempt_id == "attempt-old" and runner._deferred:
+                return {"action": "abandon"}
+            return {"action": "continue"}
+
+    coordinator = Reclaiming(offers=[first, second])
+    runner, state = _runner(coordinator, tmp_path, slots=2)
+    runner.ensure_enrolled()
+    runner._poll_once()
+    runner._poll_once()
+
+    # Held, not started beside the old child.
+    assert [job.attempt_id for job in runner._jobs_by_slot.values()] == ["attempt-old"]
+    assert [envelope.attempt_id for envelope in runner._deferred] == ["attempt-new"]
+
+    # Both finish, the old one first, and the new one only after it had gone.
+    order: list[str] = []
+
+    def watch():
+        for job in runner._jobs_by_slot.values():
+            if job.attempt_id not in order:
+                order.append(job.attempt_id)
+        return len(coordinator.results) == 2
+
+    assert _wait_until(runner, watch), "the held lease never started"
+    assert [result["attempt_id"] for result in coordinator.results] == ["attempt-old", "attempt-new"]
+    assert coordinator.results[1]["outcome"] == "succeeded"
+
+    # The held lease was kept alive while it waited.
+    assert any(beat["attempt_id"] == "attempt-new" and beat["progress"]["phase"] == "waiting"
+               for beat in coordinator.heartbeats)

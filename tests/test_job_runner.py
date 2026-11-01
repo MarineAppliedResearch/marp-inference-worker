@@ -2494,3 +2494,38 @@ def test_the_child_fetches_with_the_size_and_floor_marp_named(tmp_path: Path, mo
 
     assert seen["size_bytes"] == 123
     assert seen["keep_free_bytes"] == 456
+
+
+# test_the_model_cache_is_told_the_registry_architecture_and_task(tmp_path)
+# Verifies the worker records what MARP says a model is, not "unknown" (MARP_API#321).
+# Inputs: pytest temporary directory, monkeypatch.
+# Output: pytest pass/fail result.
+def test_the_model_cache_is_told_the_registry_architecture_and_task(tmp_path: Path, monkeypatch) -> None:
+
+    from marp_inference_worker.jobs import runner as runner_module
+    from marp_inference_worker.jobs.job_spec import AttemptEnvelope
+
+    seen = []
+
+    def fake_cache(spec, request_headers=None):
+        seen.append(spec)
+        return {"artifact_path": str(tmp_path / "m.pt"), "sha256": "a" * 64}
+
+    monkeypatch.setattr(runner_module.model_cache, "ensure_artifact_cached", fake_cache)
+    runner, _ = _runner(FakeCoordinator(), tmp_path)
+
+    for model, expected in (
+        ({"architecture": "yolo11m-cls", "task": "classification"}, ("yolo11m-cls", "classify")),
+        ({}, ("unknown", "detect")),
+    ):
+        envelope = AttemptEnvelope.model_validate({
+            "attempt_id": "9", "worker_id": "65", "lease_epoch": 1,
+            "spec": {
+                "engine": "mock",
+                "model": {"name": "m.pt", "sha256": "a" * 64, **model},
+                # A training spec, so it needs no video.
+                "dataset": {"url": "/d", "sha256": "b" * 64},
+            },
+        })
+        runner._prepare_job_params(envelope, 0)
+        assert (seen[-1].model_arch, seen[-1].task) == expected

@@ -46,6 +46,13 @@ class ModelRef(BaseModel):
     # and is never itself a refusal.
     class_names: list[str] | None = None
 
+    # What MARP's registry says the model is, e.g. "yolov8x" (MARP_API#321).
+    # Absent when the registry does not know.
+    architecture: str | None = None
+
+    # The task as MARP names it: "detection", "classification" and so on.
+    task: str | None = None
+
 
 # VideoRef
 # Names the video a job runs over: how to open it, and what MARP calls it.

@@ -104,6 +104,15 @@ _STOP_GRACE_S = 60.0
 # the job back, and the next two attempts died fighting it for the file.
 _LEASE_LOST_S = 90.0
 
+# MARP's task names, as Ultralytics spells them, for the model cache's record.
+_ULTRALYTICS_TASKS = {
+    "detection": "detect",
+    "classification": "classify",
+    "segmentation": "segment",
+    "pose": "pose",
+    "obb": "obb",
+}
+
 _UPDATE_CHECK_INTERVAL_S = 60.0
 
 
@@ -1128,8 +1137,9 @@ class JobRunner:
             ModelSpec(
                 model_id=model.name,
                 engine=envelope.spec.engine,
-                model_arch="unknown",
-                task="detect",
+                # What MARP's registry says, where it knows (MARP_API#321).
+                model_arch=model.architecture or "unknown",
+                task=_ULTRALYTICS_TASKS.get(model.task or "", "detect"),
                 artifact=ArtifactSpec(
                     url=artifact_url,
                     format="pt",

@@ -165,6 +165,14 @@ class DatasetRef(BaseModel):
     # MARP's `datasets.id`, when the job came from a registered dataset.
     dataset_id: int | None = None
 
+    # The archive's size, so room is made before the fetch rather than the disk
+    # filling during it (#320). Absent from coordinators before #320.
+    size_bytes: int | None = None
+
+    # The free disk this worker keeps, as MARP has it set for this machine (#320).
+    # Absent means the worker's own default.
+    keep_free_bytes: int | None = None
+
 
 # ReductionRef
 # Names the keyframe reduction rule this job must use, and its version.

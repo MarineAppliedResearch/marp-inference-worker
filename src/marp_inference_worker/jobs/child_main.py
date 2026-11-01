@@ -181,6 +181,8 @@ def _fetch_dataset_if_named(ctx: Any, spec: dict[str, Any]) -> None:
         cache_root=Path(str(params["dataset_cache"])),
         headers=headers,
         on_progress=on_progress,
+        size_bytes=params.get("dataset_size_bytes"),
+        keep_free_bytes=params.get("dataset_keep_free_bytes"),
     )
 
     # Only set when the dataset actually has one. A classification archive does

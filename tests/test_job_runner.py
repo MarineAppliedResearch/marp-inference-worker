@@ -2357,3 +2357,140 @@ def test_a_second_lease_for_a_running_job_waits_for_the_first(tmp_path: Path) ->
     # The held lease was kept alive while it waited.
     assert any(beat["attempt_id"] == "attempt-new" and beat["progress"]["phase"] == "waiting"
                for beat in coordinator.heartbeats)
+
+
+# _cache_one()
+# Puts one finished, idle dataset in a runner's cache (#320).
+# Inputs: the runner's state directory and a tmp directory for the archive.
+# Output: the dataset's sha256.
+def _cache_one(state_dir: Path, tmp_path: Path) -> str:
+
+    import hashlib
+    import tarfile
+
+    from marp_inference_worker.training.dataset import ensure_dataset
+
+    staging = tmp_path / "ds"
+    (staging / "train").mkdir(parents=True)
+    (staging / "train" / "cls").mkdir()
+    (staging / "train" / "cls" / "a.jpg").write_bytes(b"x" * 500)
+    archive = tmp_path / "ds.tar"
+    with tarfile.open(archive, "w") as tar:
+        tar.add(staging / "train", arcname="train")
+    sha = hashlib.sha256(archive.read_bytes()).hexdigest()
+
+    def copy(url, destination, headers=None, on_progress=None):
+        destination.write_bytes(archive.read_bytes())
+
+    result = ensure_dataset("http://marp.invalid/d", sha, state_dir / "datasets", download=copy)
+    for marker in Path(result["path"]).glob(".marp-in-use-*"):
+        marker.unlink()
+    return sha
+
+
+# test_the_poll_reports_the_dataset_cache(tmp_path)
+# Verifies an idle worker tells MARP what its dataset cache holds (#320).
+# Inputs: pytest temporary directory.
+# Output: pytest pass/fail result.
+def test_the_poll_reports_the_dataset_cache(tmp_path: Path) -> None:
+
+    coordinator = FakeCoordinator()
+    runner, _ = _runner(coordinator, tmp_path)
+    sha = _cache_one(tmp_path / "state", tmp_path)
+
+    runner.ensure_enrolled()
+    runner._poll_once()
+
+    report = coordinator.polls[-1]["capabilities"]["resources"]["dataset_cache"]
+    assert [entry["sha256"] for entry in report["entries"]] == [sha]
+    assert report["bytes"] > 0
+    assert report["disk"]["free_bytes"] > 0
+
+
+# test_the_heartbeat_carries_the_dataset_cache(tmp_path)
+# Verifies a busy single-slot worker still reports its cache, through the heartbeat (#320).
+# Inputs: pytest temporary directory.
+# Output: pytest pass/fail result.
+def test_the_heartbeat_carries_the_dataset_cache(tmp_path: Path) -> None:
+
+    coordinator = FakeCoordinator(offers=[_job_for(tmp_path, "attempt-cache", frames=200, frame_delay_s=0.01)])
+    runner, _ = _runner(coordinator, tmp_path)
+    _cache_one(tmp_path / "state", tmp_path)
+
+    runner.ensure_enrolled()
+    runner._poll_once()
+
+    assert _wait_until(runner, lambda: len(coordinator.heartbeats) >= 1)
+    telemetry = coordinator.heartbeats[0]["telemetry"]
+    assert len(telemetry["dataset_cache"]["entries"]) == 1
+
+
+# test_marp_asking_clears_the_dataset_cache(tmp_path)
+# Verifies the poll instruction empties the cache of datasets not in use (#320).
+# Inputs: pytest temporary directory.
+# Output: pytest pass/fail result.
+def test_marp_asking_clears_the_dataset_cache(tmp_path: Path) -> None:
+
+    from marp_inference_worker.training.dataset import cache_entry
+
+    coordinator = FakeCoordinator()
+    runner, state = _runner(coordinator, tmp_path)
+    sha = _cache_one(tmp_path / "state", tmp_path)
+
+    runner.ensure_enrolled()
+
+    # Not asked: kept.
+    runner._poll_once()
+    assert cache_entry(tmp_path / "state" / "datasets", sha).is_dir()
+
+    # Asked, on an empty poll.
+    coordinator.last_instructions = {"clear-dataset-cache"}
+    runner._poll_once()
+
+    assert not cache_entry(tmp_path / "state" / "datasets", sha).exists()
+
+
+# test_the_child_fetches_with_the_size_and_floor_marp_named(tmp_path)
+# Verifies the archive size and the worker's floor reach ensure_dataset (#320).
+# Inputs: pytest temporary directory, monkeypatch.
+# Output: pytest pass/fail result.
+def test_the_child_fetches_with_the_size_and_floor_marp_named(tmp_path: Path, monkeypatch) -> None:
+
+    from marp_inference_worker import training
+    from marp_inference_worker.jobs import child_main
+    from marp_inference_worker.jobs.job_spec import AttemptEnvelope
+
+    # The coordinator's spec carries both, and the envelope accepts them.
+    envelope = AttemptEnvelope.model_validate({
+        "attempt_id": "9", "worker_id": "65", "lease_epoch": 1,
+        "spec": {
+            "engine": "mock",
+            "model": {"name": "m.pt", "sha256": "a" * 64},
+            "dataset": {"url": "/d", "sha256": "b" * 64, "size_bytes": 123, "keep_free_bytes": 456},
+        },
+    })
+    assert envelope.spec.dataset.size_bytes == 123
+    assert envelope.spec.dataset.keep_free_bytes == 456
+
+    seen = {}
+
+    def fake_ensure(**kwargs):
+        seen.update(kwargs)
+        return {"path": tmp_path, "data_yaml": None, "fetched": True}
+
+    monkeypatch.setattr(training, "ensure_dataset", fake_ensure)
+
+    class _Ctx:
+        def report_progress(self, *args, **kwargs):
+            pass
+
+        def log(self, *args, **kwargs):
+            pass
+
+    child_main._fetch_dataset_if_named(_Ctx(), {"params": {
+        "dataset_url": "http://marp.invalid/d", "dataset_sha256": "b" * 64,
+        "dataset_cache": str(tmp_path), "dataset_size_bytes": 123, "dataset_keep_free_bytes": 456,
+    }})
+
+    assert seen["size_bytes"] == 123
+    assert seen["keep_free_bytes"] == 456

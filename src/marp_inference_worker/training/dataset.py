@@ -16,6 +16,9 @@
 # hashlib verifies the archive against the hash the job spec carried.
 import hashlib
 
+# json records each cache entry's size beside it, so reporting it is not a walk (#320).
+import json
+
 # os creates the download lock atomically (#73).
 import os
 
@@ -50,6 +53,21 @@ _CHUNK_BYTES = 1024 * 1024
 _COMPLETE_MARKER = ".marp-complete"
 
 
+# Beside the marker: what a finished entry holds, written once when it is unpacked.
+# Reporting the cache reads this rather than walking 310,520 files per poll (#320).
+_ENTRY_INFO = ".marp-entry.json"
+
+
+# Prefix of the file a process leaves in an entry while it trains on it (#320).
+# Eviction skips an entry carrying one whose process is still alive.
+_IN_USE_PREFIX = ".marp-in-use-"
+
+
+# The disk a worker keeps free when MARP names no floor of its own (#320).
+# Settled with Isaac on 2026-10-31: 50 GB, adjustable per worker from MARP.
+DEFAULT_KEEP_FREE_BYTES = 50 * 1000 ** 3
+
+
 # The YAML the packaging script writes into every archive.
 # A fixed name on purpose: the builders produce `classnames.yaml`,
 # `frames-classnames.yaml` and `mixed-classnames.yaml`, and choosing between
@@ -63,6 +81,13 @@ _DATA_YAML = "data.yaml"
 # A distinct type so a caller can tell "the bytes are wrong" from "the fetch
 # failed", and refuse the job rather than retry forever.
 class DatasetHashMismatch(RuntimeError):
+    pass
+
+
+# DatasetNoRoom
+# Raised when a dataset cannot be fetched without going under the free-disk floor,
+# even after evicting every cached dataset not in use (#320).
+class DatasetNoRoom(RuntimeError):
     pass
 
 
@@ -117,11 +142,31 @@ def _download(
     # would be killed every time on exactly the machines we most want.
     timeout = httpx.Timeout(connect=30.0, read=300.0, write=300.0, pool=30.0)
 
-    with httpx.stream("GET", url, headers=headers, timeout=timeout, follow_redirects=True) as response:
+    # **Resumed from what is already on disk** (#320). At 16.6 MB/s through the
+    # public address, a 20 GB fetch that restarts from zero loses twenty minutes.
+    start = destination.stat().st_size if destination.exists() else 0
+    request_headers = dict(headers or {})
+    if start:
+        request_headers["Range"] = f"bytes={start}-"
+
+    with httpx.stream("GET", url, headers=request_headers, timeout=timeout, follow_redirects=True) as response:
+
+        # Nothing past what we hold: the partial is already whole, or is not this
+        # archive at all. The hash check after this decides which.
+        if start and response.status_code == 416:
+            return
+
         response.raise_for_status()
-        total = int(response.headers.get("content-length") or 0) or None
-        received = 0
-        with destination.open("wb") as handle:
+
+        # 206 continues the partial; a 200 is the whole archive, so start over.
+        resuming = start and response.status_code == 206
+        received = start if resuming else 0
+        if resuming:
+            total = int(str(response.headers.get("content-range", "")).rsplit("/", 1)[-1] or 0) or None
+        else:
+            total = int(response.headers.get("content-length") or 0) or None
+
+        with destination.open("ab" if resuming else "wb") as handle:
             for chunk in response.iter_bytes(_CHUNK_BYTES):
                 handle.write(chunk)
                 received += len(chunk)
@@ -185,7 +230,8 @@ def _rewrite_data_yaml(unpacked: Path) -> Path | None:
     rewritten: list[str] = []
     for line in lines:
         key = line.split(":", 1)[0].strip() if ":" in line else ""
-        if key in {"train", "val"}:
+        # `test` too: left relative, Ultralytics resolves it against its own settings.
+        if key in {"train", "val", "test"}:
             relative = line.split(":", 1)[1].strip()
             # Already absolute means somebody else has been here; leave it.
             candidate = Path(relative)
@@ -199,7 +245,8 @@ def _rewrite_data_yaml(unpacked: Path) -> Path | None:
 
 
 # How long a second caller waits for another attempt's download, in seconds.
-# A 20 GB archive took about three minutes on ABYSS; this is generous.
+# A 20 GB archive took 28 minutes to reach training on ABYSS through the public
+# address (job 21954); this is generous.
 _LOCK_WAIT_S = 2 * 60 * 60
 
 
@@ -272,6 +319,8 @@ def ensure_dataset(
     headers: dict[str, str] | None = None,
     on_progress: Callable[[int, int | None], None] | None = None,
     download: Callable[..., None] | None = None,
+    size_bytes: int | None = None,
+    keep_free_bytes: int | None = None,
 ) -> dict[str, Any]:
 
     expected = str(sha256).lower()
@@ -284,7 +333,7 @@ def ensure_dataset(
 
     # Already here and finished. The marker is the test, not the directory.
     if marker.is_file():
-        return {"path": unpacked, "data_yaml": _data_yaml_or_none(unpacked), "fetched": False}
+        return _use(unpacked, fetched=False)
 
     cache_root.mkdir(parents=True, exist_ok=True)
 
@@ -294,7 +343,7 @@ def ensure_dataset(
     # for the other, then uses what it finished.
     with _dataset_lock(cache_root, expected):
         if marker.is_file():
-            return {"path": unpacked, "data_yaml": _data_yaml_or_none(unpacked), "fetched": False}
+            return _use(unpacked, fetched=False)
 
         # A directory without the marker is the wreckage of an interrupted attempt,
         # and whatever is in it cannot be trusted. Start again rather than resume
@@ -304,7 +353,19 @@ def ensure_dataset(
         if unpacked.exists():
             shutil.rmtree(unpacked, ignore_errors=True)
 
-        return _fetch_and_unpack(url, expected, cache_root, unpacked, marker, headers, on_progress, download)
+        # **Room first** (#320): the rest of the archive plus its unpacked copy,
+        # above the floor. Evicting after the fact would mean a full disk mid-fetch.
+        if size_bytes:
+            partial = cache_root / f"{expected}.tar.partial"
+            held = partial.stat().st_size if partial.exists() else 0
+            needed = max(0, int(size_bytes) - held) + int(size_bytes)
+        else:
+            needed = 0
+        floor = DEFAULT_KEEP_FREE_BYTES if keep_free_bytes is None else int(keep_free_bytes)
+        make_room(cache_root, needed, floor, keep={expected})
+
+        _fetch_and_unpack(url, expected, cache_root, unpacked, marker, headers, on_progress, download)
+        return _use(unpacked, fetched=True)
 
 
 # _fetch_and_unpack()
@@ -314,8 +375,9 @@ def ensure_dataset(
 # Use this only while holding the archive's lock.
 def _fetch_and_unpack(url, expected, cache_root, unpacked, marker, headers, on_progress, download):
 
+    # Kept between attempts so the next one resumes it (#320). Only a hash
+    # mismatch or a finished unpack removes it.
     archive = cache_root / f"{expected}.tar.partial"
-    archive.unlink(missing_ok=True)
 
     fetch = download or _download
     try:
@@ -326,18 +388,25 @@ def _fetch_and_unpack(url, expected, cache_root, unpacked, marker, headers, on_p
         # nothing anywhere would say so.
         actual = compute_sha256(archive)
         if actual != expected:
+            # Not these bytes: resuming into it would only repeat the mismatch.
+            archive.unlink(missing_ok=True)
             raise DatasetHashMismatch(
                 f"dataset archive has sha256 {actual}, expected {expected}"
             )
 
         unpacked.mkdir(parents=True, exist_ok=True)
         with tarfile.open(archive, "r:") as tar:
+            members = tar.getmembers()
             # `filter="data"` refuses absolute paths, parent traversal, links and
             # device nodes. The archive is ours, but it arrives over the network
             # and unpacking is the moment where that stops mattering.
             tar.extractall(unpacked, filter="data")
 
         _rewrite_data_yaml(unpacked)
+
+        # What the entry holds, so the cache can be reported without a walk.
+        _write_entry_info(unpacked, sum(m.size for m in members if m.isfile()),
+                          sum(1 for m in members if m.isfile()))
 
         # Last, so a crash anywhere above leaves an entry that is visibly unfinished.
         marker.write_text(expected + "\n", encoding="utf-8")
@@ -346,7 +415,212 @@ def _fetch_and_unpack(url, expected, cache_root, unpacked, marker, headers, on_p
         # Leave nothing a later run could mistake for a usable dataset.
         shutil.rmtree(unpacked, ignore_errors=True)
         raise
-    finally:
-        archive.unlink(missing_ok=True)
 
-    return {"path": unpacked, "data_yaml": _data_yaml_or_none(unpacked), "fetched": True}
+    # Unpacked and marked: the archive has done its job.
+    archive.unlink(missing_ok=True)
+
+
+# _use()
+# Records that this process is training on a cache entry, and returns it.
+# Inputs: the entry directory, and whether this call fetched it.
+# Output: the mapping ensure_dataset() returns.
+# The marker's time is the entry's last use, which is what eviction orders by;
+# the in-use file keeps it from being evicted while this process lives (#320).
+def _use(unpacked: Path, fetched: bool) -> dict[str, Any]:
+
+    marker = unpacked / _COMPLETE_MARKER
+    os.utime(marker)
+    (unpacked / f"{_IN_USE_PREFIX}{os.getpid()}").write_text("", encoding="utf-8")
+    return {"path": unpacked, "data_yaml": _data_yaml_or_none(unpacked), "fetched": fetched}
+
+
+# _write_entry_info()
+# Records a finished entry's size beside it (#320).
+# Inputs: the entry directory, its bytes and its file count.
+# Output: none.
+def _write_entry_info(unpacked: Path, size: int, files: int) -> None:
+
+    (unpacked / _ENTRY_INFO).write_text(
+        json.dumps({"bytes": int(size), "files": int(files)}), encoding="utf-8"
+    )
+
+
+# entry_bytes()
+# How many bytes a finished cache entry holds.
+# Inputs: the entry directory; whether to walk it when nothing is recorded.
+# Output: bytes, or None when unrecorded and walk is False.
+# Entries unpacked before #320 carry no record; one walk writes it, and the
+# runner does that in the background rather than in a poll.
+def entry_bytes(unpacked: Path, walk: bool = False) -> int | None:
+
+    try:
+        return int(json.loads((unpacked / _ENTRY_INFO).read_text(encoding="utf-8"))["bytes"])
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+
+    if not walk:
+        return None
+
+    size = 0
+    files = 0
+    for path in unpacked.rglob("*"):
+        if path.is_file() and not path.name.startswith(".marp-"):
+            size += path.stat().st_size
+            files += 1
+    _write_entry_info(unpacked, size, files)
+    return size
+
+
+# _in_use()
+# Whether a live process is training on this entry (#320).
+# Inputs: the entry directory.
+# Output: True when any in-use file names a process that is still running.
+# Files left by processes that have exited are removed on the way.
+def _in_use(unpacked: Path) -> bool:
+
+    import psutil
+
+    busy = False
+    for path in unpacked.glob(f"{_IN_USE_PREFIX}*"):
+        try:
+            pid = int(path.name[len(_IN_USE_PREFIX):])
+        except ValueError:
+            pid = 0
+        if pid and psutil.pid_exists(pid):
+            busy = True
+        else:
+            path.unlink(missing_ok=True)
+    return busy
+
+
+# _disk()
+# Free and total bytes on the disk the cache is on.
+# Inputs: the cache root, which may not exist yet.
+# Output: {"total_bytes", "free_bytes"}.
+def _disk(cache_root: Path) -> dict[str, int]:
+
+    probe = Path(cache_root)
+    while not probe.exists() and probe.parent != probe:
+        probe = probe.parent
+    usage = shutil.disk_usage(probe)
+    return {"total_bytes": int(usage.total), "free_bytes": int(usage.free)}
+
+
+# _entries()
+# The cache's finished entries, least recently used first.
+# Inputs: the cache root.
+# Output: list of entry directories.
+def _entries(cache_root: Path) -> list[Path]:
+
+    root = Path(cache_root)
+    if not root.is_dir():
+        return []
+    found = [p for p in root.iterdir() if p.is_dir() and (p / _COMPLETE_MARKER).is_file()]
+    return sorted(found, key=lambda p: (p / _COMPLETE_MARKER).stat().st_mtime)
+
+
+# _evict()
+# Removes one cache entry, returning the bytes it held.
+def _evict(unpacked: Path) -> int:
+
+    size = entry_bytes(unpacked) or 0
+    # The marker first, so a removal that fails part way leaves an unfinished
+    # entry the next fetch clears, never a finished one with files missing.
+    (unpacked / _COMPLETE_MARKER).unlink(missing_ok=True)
+    shutil.rmtree(unpacked, ignore_errors=True)
+    return size
+
+
+# make_room()
+# Evicts least-recently-used datasets until `needed` bytes fit above the floor (#320).
+# Inputs: the cache root, the bytes about to be written, the free-disk floor, and
+#   hashes never to evict.
+# Output: the hashes evicted.
+# Raises DatasetNoRoom when even an empty cache would not make it fit; an entry
+# a live process is training on is never evicted.
+def make_room(cache_root: Path, needed: int, keep_free_bytes: int, keep: set[str] | None = None) -> list[str]:
+
+    keep = keep or set()
+    evicted: list[str] = []
+    for unpacked in _entries(cache_root):
+        if _disk(cache_root)["free_bytes"] - needed >= keep_free_bytes:
+            break
+        if unpacked.name in keep or _in_use(unpacked):
+            continue
+        _evict(unpacked)
+        evicted.append(unpacked.name)
+
+    # With no size to go on (a spec from before #320), evicting is all it can do.
+    free = _disk(cache_root)["free_bytes"]
+    if needed and free - needed < keep_free_bytes:
+        raise DatasetNoRoom(
+            f"this dataset needs {needed / 1e9:.1f} GB, and fetching it would leave "
+            f"{max(0, free - needed) / 1e9:.1f} GB free on the worker's disk, under its "
+            f"{keep_free_bytes / 1e9:.0f} GB floor, with every unused dataset already evicted"
+        )
+    return evicted
+
+
+# clear_cache()
+# Evicts every cached dataset not in use, when MARP asks (#320).
+# Inputs: the cache root.
+# Output: {"evicted": [...], "freed_bytes": n, "kept_in_use": [...]}.
+# Leftover partial downloads are removed too, unless their download is running.
+def clear_cache(cache_root: Path) -> dict[str, Any]:
+
+    import psutil
+
+    root = Path(cache_root)
+    evicted: list[str] = []
+    kept: list[str] = []
+    freed = 0
+    for unpacked in _entries(root):
+        if _in_use(unpacked):
+            kept.append(unpacked.name)
+            continue
+        freed += _evict(unpacked)
+        evicted.append(unpacked.name)
+
+    if root.is_dir():
+        for partial in root.glob("*.tar.partial"):
+            lock = root / partial.name.replace(".tar.partial", ".lock")
+            try:
+                owner = int(lock.read_text(encoding="utf-8").strip() or 0) if lock.exists() else 0
+            except (OSError, ValueError):
+                owner = 0
+            if owner and psutil.pid_exists(owner):
+                continue
+            freed += partial.stat().st_size
+            partial.unlink(missing_ok=True)
+
+    return {"evicted": evicted, "freed_bytes": freed, "kept_in_use": kept}
+
+
+# cache_report()
+# What the dataset cache holds and the disk it is on, for MARP (#320).
+# Inputs: the cache root, and the floor this worker keeps.
+# Output: JSON-safe mapping.
+# Cheap enough for every poll: it reads each entry's record and never walks one.
+def cache_report(cache_root: Path, keep_free_bytes: int | None = None) -> dict[str, Any]:
+
+    from datetime import datetime, timezone
+
+    entries = []
+    for unpacked in reversed(_entries(cache_root)):
+        used = (unpacked / _COMPLETE_MARKER).stat().st_mtime
+        entries.append({
+            "sha256": unpacked.name,
+            "bytes": entry_bytes(unpacked),
+            "last_used_at": datetime.fromtimestamp(used, timezone.utc).isoformat(),
+            "in_use": _in_use(unpacked),
+        })
+
+    root = Path(cache_root)
+    partial = sum(p.stat().st_size for p in root.glob("*.tar.partial")) if root.is_dir() else 0
+    return {
+        "bytes": sum(e["bytes"] or 0 for e in entries) + partial,
+        "partial_bytes": partial,
+        "entries": entries,
+        "disk": _disk(root),
+        "keep_free_bytes": DEFAULT_KEEP_FREE_BYTES if keep_free_bytes is None else int(keep_free_bytes),
+    }

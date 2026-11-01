@@ -200,6 +200,9 @@ class CoordinatorClient:
 
         # Ordinary calls get a short timeout; long-poll needs a longer one.
         self._request_timeout_s = request_timeout_s
+
+        # Instructions the last response carried outside any job (#320).
+        self.last_instructions: set[str] = set()
         self._long_poll_timeout_s = long_poll_timeout_s
 
         # One connection pool for the process, so keep-alive actually helps.
@@ -288,6 +291,12 @@ class CoordinatorClient:
             )
         except httpx.HTTPError as error:
             raise CoordinatorError(f"{path} could not be reached: {type(error).__name__}: {error}")
+
+        # What MARP asks of this machine outside any job, carried as a header so
+        # an empty poll (204) can carry it too, and an older worker ignores it (#320).
+        self.last_instructions = {
+            word.strip() for word in response.headers.get("x-marp-worker-instructions", "").split(",") if word.strip()
+        }
 
         # 204 is the coordinator saying "nothing for you", not an error.
         if response.status_code == 204:

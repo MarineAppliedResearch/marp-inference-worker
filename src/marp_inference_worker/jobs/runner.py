@@ -22,6 +22,9 @@ import socket
 # time paces the loop and the heartbeat interval.
 import time
 
+# threading runs the one-off size record of old cache entries off the loop (#320).
+import threading
+
 # shutil removes a finished attempt's workspace.
 import shutil
 
@@ -283,6 +286,14 @@ class JobRunner:
 
         # Where identity, workspaces and the in-flight record live.
         self._state_dir = state_dir
+
+        # The free-disk floor MARP last named for this machine (#320); None until
+        # a job carries one, and then the dataset module's default applies.
+        self._keep_free_bytes: int | None = None
+
+        # Size records for cache entries unpacked before #320, written once in the
+        # background so the first poll is not a walk of 310,520 files.
+        threading.Thread(target=self._record_dataset_sizes, name="dataset-sizes", daemon=True).start()
         self._workspace_root = state_dir / "jobs"
         # The watch window's browser profiles, one per slot, kept for the life
         # of the worker rather than built and thrown away per attempt (#65 R1).
@@ -379,8 +390,70 @@ class JobRunner:
             "engines": engine_registry.describe_engines(),
             "reductions": keyframe_reduction.available_reductions(),
             # The full hardware snapshot, so MARP sees the real machine.
-            "resources": resources,
+            "resources": {**resources, "dataset_cache": self._dataset_cache_report()},
         }
+
+    # _dataset_cache_report()
+    # What this machine's dataset cache holds, for MARP (#320).
+    # Inputs: none.
+    # Output: the report, or None when it cannot be read.
+    # A report that fails must not cost the poll or the heartbeat it rides on.
+    def _dataset_cache_report(self) -> dict[str, Any] | None:
+
+        from marp_inference_worker.training.dataset import cache_report
+
+        try:
+            return cache_report(self._state_dir / "datasets", self._keep_free_bytes)
+        except Exception:
+            return None
+
+    # _telemetry()
+    # The heartbeat's reading, with the dataset cache beside cpu, memory and disk (#320).
+    # Inputs: none.
+    # Output: the telemetry mapping, or None.
+    # A single-slot worker does not poll while it works, so the heartbeat is the
+    # only way MARP sees the cache fill during a fetch.
+    def _telemetry(self) -> dict[str, Any] | None:
+
+        telemetry = get_gpu_telemetry()
+        report = self._dataset_cache_report()
+        if report is not None:
+            # A machine with no GPU reading still has a disk worth reporting.
+            telemetry = {**(telemetry or {}), "dataset_cache": report}
+        return telemetry
+
+    # _clear_dataset_cache()
+    # Evicts every cached dataset not in use, when MARP asks (#320).
+    # Inputs: none.
+    # Output: none.
+    def _clear_dataset_cache(self) -> None:
+
+        from marp_inference_worker.training.dataset import clear_cache
+
+        try:
+            result = clear_cache(self._state_dir / "datasets")
+        except Exception as error:
+            self._state.note_error(f"clearing the dataset cache failed: {error}")
+            return
+        self._state.note(
+            f"dataset cache cleared: {len(result['evicted'])} removed, "
+            f"{result['freed_bytes'] / 1e9:.1f} GB freed, {len(result['kept_in_use'])} kept in use"
+        )
+
+    # _record_dataset_sizes()
+    # Writes the size record of cache entries unpacked before #320, once.
+    # Inputs: none.
+    # Output: none.
+    # Run on a background thread at start: a 20 GB entry is 310,520 files to walk.
+    def _record_dataset_sizes(self) -> None:
+
+        from marp_inference_worker.training.dataset import _entries, entry_bytes
+
+        try:
+            for unpacked in _entries(self._state_dir / "datasets"):
+                entry_bytes(unpacked, walk=True)
+        except Exception:
+            return
 
     # ensure_enrolled()
     # Makes sure this worker has a coordinator-assigned id.
@@ -836,6 +909,10 @@ class JobRunner:
             wait_seconds=wait_seconds,
         )
 
+        # Cleared when MARP asks, whether or not a job came with the answer (#320).
+        if "clear-dataset-cache" in getattr(self._client, "last_instructions", set()):
+            self._clear_dataset_cache()
+
         # Nothing queued.
         if not offered:
             return False
@@ -1078,6 +1155,12 @@ class JobRunner:
             params["dataset_url"] = dataset_url
             params["dataset_sha256"] = dataset.sha256
 
+            # Room is made against these before the fetch (#320).
+            params["dataset_size_bytes"] = dataset.size_bytes
+            params["dataset_keep_free_bytes"] = dataset.keep_free_bytes
+            if dataset.keep_free_bytes is not None:
+                self._keep_free_bytes = dataset.keep_free_bytes
+
             # One cache for the machine, beside the rest of the worker's state.
             # Per attempt it would be tens of gigabytes of identical bytes, which
             # is the mistake #65 already records against the job workspace.
@@ -1140,7 +1223,7 @@ class JobRunner:
                     worker_id=job.worker_id,
                     lease_epoch=job.lease_epoch,
                     progress=job.current_progress(),
-                    telemetry=get_gpu_telemetry(),
+                    telemetry=self._telemetry(),
                 )
             except CoordinatorError as error:
                 # A failed heartbeat is not a reason to kill a running job: the

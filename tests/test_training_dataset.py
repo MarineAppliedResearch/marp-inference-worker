@@ -416,3 +416,264 @@ def test_a_lock_left_by_a_dead_process_is_taken_over(tmp_path: Path) -> None:
 
     assert result["fetched"] is True
     assert len(calls) == 1
+
+
+# _FakeStream
+# Stands in for `httpx.stream`, serving an archive and honouring `Range` (#320).
+# Records each request's headers so a test can see what was asked for.
+class _FakeStream:
+
+    def __init__(self, payload: bytes, fail_after: int | None = None):
+        self.payload = payload
+        self.fail_after = fail_after
+        self.requests: list[dict] = []
+
+    def __call__(self, method, url, headers=None, **kwargs):
+        self.requests.append(dict(headers or {}))
+        outer = self
+
+        class _Response:
+            def __init__(self):
+                rng = (headers or {}).get("Range")
+                first = int(rng.split("=")[1].split("-")[0]) if rng else 0
+                if rng and first >= len(outer.payload):
+                    self.status_code, self.body, self.headers = 416, b"", {}
+                elif rng:
+                    self.status_code = 206
+                    self.body = outer.payload[first:]
+                    self.headers = {"content-range": f"bytes {first}-{len(outer.payload) - 1}/{len(outer.payload)}"}
+                else:
+                    self.status_code, self.body = 200, outer.payload
+                    self.headers = {"content-length": str(len(outer.payload))}
+
+            def raise_for_status(self):
+                if self.status_code >= 400:
+                    raise RuntimeError(self.status_code)
+
+            def iter_bytes(self, size):
+                sent = 0
+                for i in range(0, len(self.body), 64):
+                    if outer.fail_after is not None and sent >= outer.fail_after:
+                        outer.fail_after = None
+                        raise ConnectionError("connection dropped")
+                    chunk = self.body[i:i + 64]
+                    sent += len(chunk)
+                    yield chunk
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        return _Response()
+
+
+# test_an_interrupted_fetch_resumes_from_what_it_had()
+# Verifies the second attempt asks for the rest, not the whole archive (#320).
+# Inputs: tmp_path, monkeypatch.
+# Output: pytest pass/fail result.
+#
+# Through the public address ABYSS fetches at 16.6 MB/s; a 20 GB dataset that
+# restarted from zero after a dropped connection lost twenty minutes.
+def test_an_interrupted_fetch_resumes_from_what_it_had(tmp_path: Path, monkeypatch) -> None:
+
+    import httpx
+
+    archive, sha = build_archive(tmp_path)
+    payload = archive.read_bytes()
+    stream = _FakeStream(payload, fail_after=1024)
+    monkeypatch.setattr(httpx, "stream", stream)
+    cache = tmp_path / "cache"
+
+    with pytest.raises(ConnectionError):
+        ensure_dataset("http://marp.invalid/d/1/archive", sha, cache)
+
+    # The partial survived the failure, holding what arrived.
+    partial = cache / f"{sha}.tar.partial"
+    assert 0 < partial.stat().st_size < len(payload)
+    held = partial.stat().st_size
+
+    result = ensure_dataset("http://marp.invalid/d/1/archive", sha, cache)
+
+    assert result["fetched"] is True
+    assert stream.requests[-1]["Range"] == f"bytes={held}-"
+    assert not partial.exists()
+    assert (Path(result["path"]) / "train" / "images" / "a.jpg").is_file()
+
+
+# test_a_whole_partial_is_used_rather_than_fetched_again()
+# Verifies a partial the server has nothing beyond is checked and unpacked (#320).
+# Inputs: tmp_path, monkeypatch.
+# Output: pytest pass/fail result.
+def test_a_whole_partial_is_used_rather_than_fetched_again(tmp_path: Path, monkeypatch) -> None:
+
+    import httpx
+
+    archive, sha = build_archive(tmp_path)
+    stream = _FakeStream(archive.read_bytes())
+    monkeypatch.setattr(httpx, "stream", stream)
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    (cache / f"{sha}.tar.partial").write_bytes(archive.read_bytes())
+
+    result = ensure_dataset("http://marp.invalid/d/1/archive", sha, cache)
+
+    assert result["fetched"] is True
+    assert stream.requests == [{"Range": f"bytes={len(archive.read_bytes())}-"}]
+
+
+# _cached()
+# Puts a finished dataset in the cache, last used `age` seconds ago.
+# Inputs: the cache, tmp_path, an archive name and an age in seconds.
+# Output: the dataset's sha256.
+def _cached(cache: Path, tmp_path: Path, name: str, age: float) -> str:
+
+    import os
+    import time
+
+    archive, sha = build_archive(tmp_path, name=name, data_yaml=f"names:\n- {name}\nnc: 1\ntrain: train/images\nval: eval/images\n")
+    download, _ = fake_download(archive)
+    result = ensure_dataset("http://marp.invalid/d/archive", sha, cache, download=download)
+
+    # Not in use any more: the test process is the one that marked it.
+    for marker in Path(result["path"]).glob(".marp-in-use-*"):
+        marker.unlink()
+    when = time.time() - age
+    os.utime(Path(result["path"]) / ".marp-complete", (when, when))
+    return sha
+
+
+# _disk_of()
+# A disk whose free space is a fixed amount less whatever the cache holds.
+def _disk_of(cache: Path, free_without_cache: int):
+
+    def disk(_root):
+        held = sum(p.stat().st_size for p in cache.rglob("*") if p.is_file())
+        return {"total_bytes": 10 ** 12, "free_bytes": free_without_cache - held}
+
+    return disk
+
+
+# test_room_is_made_by_evicting_the_least_recently_used()
+# Verifies eviction order, and that it stops once the new dataset fits (#320).
+# Inputs: tmp_path, monkeypatch.
+# Output: pytest pass/fail result.
+def test_room_is_made_by_evicting_the_least_recently_used(tmp_path: Path, monkeypatch) -> None:
+
+    cache = tmp_path / "cache"
+    oldest = _cached(cache, tmp_path, "oldest.tar", age=300)
+    middle = _cached(cache, tmp_path, "middle.tar", age=200)
+    newest = _cached(cache, tmp_path, "newest.tar", age=100)
+
+    held = sum(p.stat().st_size for p in cache.rglob("*") if p.is_file())
+    one = held // 3
+
+    # Room for the new dataset only once one old one has gone.
+    floor = 1_000_000
+    monkeypatch.setattr(dataset_module, "_disk", _disk_of(cache, floor + held + one // 2))
+
+    evicted = dataset_module.make_room(cache, needed=one, keep_free_bytes=floor)
+
+    assert evicted == [oldest]
+    assert dataset_module.cache_entry(cache, middle).is_dir()
+    assert dataset_module.cache_entry(cache, newest).is_dir()
+
+
+# test_a_dataset_in_use_is_never_evicted()
+# Verifies an entry a live process trains on is skipped, and the next one goes (#320).
+# Inputs: tmp_path, monkeypatch.
+# Output: pytest pass/fail result.
+def test_a_dataset_in_use_is_never_evicted(tmp_path: Path, monkeypatch) -> None:
+
+    import os
+
+    cache = tmp_path / "cache"
+    oldest = _cached(cache, tmp_path, "oldest.tar", age=300)
+    middle = _cached(cache, tmp_path, "middle.tar", age=200)
+    entry = dataset_module.cache_entry(cache, oldest)
+    (entry / f".marp-in-use-{os.getpid()}").write_text("", encoding="utf-8")
+
+    held = sum(p.stat().st_size for p in cache.rglob("*") if p.is_file())
+    one = held // 2
+    floor = 1_000_000
+    monkeypatch.setattr(dataset_module, "_disk", _disk_of(cache, floor + held + one // 2))
+
+    assert dataset_module.make_room(cache, needed=one, keep_free_bytes=floor) == [middle]
+    assert entry.is_dir()
+
+
+# test_no_room_is_refused_with_the_numbers()
+# Verifies a fetch that cannot fit above the floor is refused before downloading (#320).
+# Inputs: tmp_path, monkeypatch.
+# Output: pytest pass/fail result.
+def test_no_room_is_refused_with_the_numbers(tmp_path: Path, monkeypatch) -> None:
+
+    archive, sha = build_archive(tmp_path)
+    download, calls = fake_download(archive)
+    cache = tmp_path / "cache"
+    monkeypatch.setattr(dataset_module, "_disk", lambda _root: {"total_bytes": 10 ** 12, "free_bytes": 60 * 10 ** 9})
+
+    with pytest.raises(dataset_module.DatasetNoRoom, match="50 GB floor"):
+        ensure_dataset("http://marp.invalid/d/1/archive", sha, cache, download=download,
+                       size_bytes=20 * 10 ** 9)
+
+    assert calls == []
+
+
+# test_clearing_keeps_what_is_in_use()
+# Verifies clear_cache removes idle datasets and leftover partials only (#320).
+# Inputs: tmp_path.
+# Output: pytest pass/fail result.
+def test_clearing_keeps_what_is_in_use(tmp_path: Path) -> None:
+
+    import os
+
+    cache = tmp_path / "cache"
+    idle = _cached(cache, tmp_path, "idle.tar", age=300)
+    busy = _cached(cache, tmp_path, "busy.tar", age=200)
+    (dataset_module.cache_entry(cache, busy) / f".marp-in-use-{os.getpid()}").write_text("", encoding="utf-8")
+    (cache / f"{'0' * 64}.tar.partial").write_bytes(b"x" * 100)
+
+    result = dataset_module.clear_cache(cache)
+
+    assert result["evicted"] == [idle]
+    assert result["kept_in_use"] == [busy]
+    assert not dataset_module.cache_entry(cache, idle).exists()
+    assert list(cache.glob("*.partial")) == []
+
+
+# test_the_report_lists_entries_newest_first_with_sizes()
+# Verifies what MARP is told about the cache (#320).
+# Inputs: tmp_path.
+# Output: pytest pass/fail result.
+def test_the_report_lists_entries_newest_first_with_sizes(tmp_path: Path) -> None:
+
+    cache = tmp_path / "cache"
+    older = _cached(cache, tmp_path, "older.tar", age=300)
+    newer = _cached(cache, tmp_path, "newer.tar", age=100)
+
+    report = dataset_module.cache_report(cache, keep_free_bytes=7)
+
+    assert [e["sha256"] for e in report["entries"]] == [newer, older]
+    assert all(e["bytes"] and e["bytes"] > 0 for e in report["entries"])
+    assert report["bytes"] == sum(e["bytes"] for e in report["entries"])
+    assert report["keep_free_bytes"] == 7
+    assert report["disk"]["total_bytes"] > 0
+
+
+# test_the_test_split_path_is_made_absolute_too()
+# Verifies `test:` is rewritten with `train:` and `val:` (#320).
+# Inputs: tmp_path.
+# Output: pytest pass/fail result.
+def test_the_test_split_path_is_made_absolute_too(tmp_path: Path) -> None:
+
+    archive, sha = build_archive(
+        tmp_path, data_yaml="names:\n- A\nnc: 1\ntrain: train/images\nval: eval/images\ntest: test/images\n"
+    )
+    download, _ = fake_download(archive)
+
+    result = ensure_dataset("http://marp.invalid/d/1/archive", sha, tmp_path / "cache", download=download)
+    text = Path(result["data_yaml"]).read_text(encoding="utf-8")
+
+    assert "test: " + Path(result["path"]).as_posix() + "/test/images" in text

@@ -2529,3 +2529,25 @@ def test_the_model_cache_is_told_the_registry_architecture_and_task(tmp_path: Pa
         })
         runner._prepare_job_params(envelope, 0)
         assert (seen[-1].model_arch, seen[-1].task) == expected
+
+
+# test_a_yield_answer_hands_the_job_back_with_its_frame(tmp_path)
+# Verifies MARP's Pause now reaches a running job as a neutral hand-back (MARP_API#319).
+# Inputs: pytest temporary directory.
+# Output: pytest pass/fail result.
+def test_a_yield_answer_hands_the_job_back_with_its_frame(tmp_path: Path) -> None:
+
+    offer = _job_for(tmp_path, "attempt-yield-answer", frames=400, frame_delay_s=0.05, start_frame=1000)
+    coordinator = FakeCoordinator(offers=[offer])
+
+    # Work for a few beats, then MARP says to yield, as it does for a paused or retired worker.
+    coordinator.heartbeat_action = lambda count: "continue" if count < 3 else "yield"
+    runner, _ = _runner(coordinator, tmp_path)
+    runner.ensure_enrolled()
+
+    assert runner._poll_once() is True
+    assert _wait_until(runner, lambda: bool(coordinator.results))
+
+    result = coordinator.results[0]
+    assert result["outcome"] == "yielded", "handed back, not cancelled: no attempt is used"
+    assert 1000 < result["completed_through_frame"] < 1400

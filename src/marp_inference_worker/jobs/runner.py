@@ -1275,6 +1275,14 @@ class JobRunner:
                 self._state.set_paused(True, reason="paused by coordinator")
                 continue
 
+            # **Yield hands this job back now** (MARP_API#319): Pause now or Retire on
+            # the dashboard. The same hand-back the volunteer's own button makes -- the
+            # resume point goes with it and no attempt is used -- so another machine, or
+            # this one when resumed, carries on from there.
+            if action == "yield" and not job.stop_requested:
+                self._state.note(f"yield received for {job.attempt_id}")
+                job.request_yield()
+
             # Cancel and abandon both stop this job.
             if is_stop_action(action) and not job.stop_requested:
                 # A notice, not an error. The coordinator telling a worker to

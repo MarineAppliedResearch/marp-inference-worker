@@ -26,6 +26,9 @@ from urllib.parse import urlparse
 # Path handles filesystem-safe cache path creation and file checks.
 from pathlib import Path
 
+# Callable types the progress hook a fetch reports through (#84).
+from typing import Callable
+
 # ModelSpec provides validated artifact metadata and model identity.
 from marp_inference_worker.models.model_spec import ModelSpec
 
@@ -155,6 +158,7 @@ def download_artifact(
     url: str,
     destination: Path,
     request_headers: dict[str, str] | None = None,
+    on_progress: Callable[[int, int | None], None] | None = None,
 ) -> None:
 
     # Imported here because the API process may never fetch anything.
@@ -173,9 +177,19 @@ def download_artifact(
             follow_redirects=True,
         ) as response:
             response.raise_for_status()
+
+            # Bytes so far and the whole, for whoever is reporting the fetch
+            # (marp-inference-worker#84). Raising from it abandons the download.
+            length = response.headers.get("content-length")
+            total = int(length) if length and length.isdigit() else None
+            done = 0
+
             with partial_path.open("wb") as file_handle:
                 for chunk in response.iter_bytes(_CHUNK_BYTES):
                     file_handle.write(chunk)
+                    done += len(chunk)
+                    if on_progress is not None:
+                        on_progress(done, total)
     except Exception:
         # Leave nothing behind that a later run could mistake for a complete
         # download; the hash check would catch it, but only after wasting a load.
@@ -195,6 +209,7 @@ def download_artifact(
 def ensure_artifact_cached(
     model_spec: ModelSpec,
     request_headers: dict[str, str] | None = None,
+    on_progress: Callable[[int, int | None], None] | None = None,
 ) -> dict[str, object]:
 
     # Compute deterministic cache key and artifact target path.
@@ -221,7 +236,12 @@ def ensure_artifact_cached(
 
     # Fetch or copy the artifact into the cache path.
     if is_remote_url(model_spec.artifact.url):
-        download_artifact(model_spec.artifact.url, artifact_path, request_headers=request_headers)
+        download_artifact(
+            model_spec.artifact.url,
+            artifact_path,
+            request_headers=request_headers,
+            on_progress=on_progress,
+        )
         cache_action = "downloaded"
     else:
         # Copy local artifacts into cache for local development workflows.

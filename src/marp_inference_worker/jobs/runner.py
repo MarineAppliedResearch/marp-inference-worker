@@ -25,6 +25,9 @@ import time
 # threading runs the one-off size record of old cache entries off the loop (#320).
 import threading
 
+# contextlib shapes the upload keep-alive as a `with` block (MARP_API#319).
+import contextlib
+
 # shutil removes a finished attempt's workspace.
 import shutil
 
@@ -1487,22 +1490,29 @@ class JobRunner:
         # never points at bytes MARP does not hold.
         delivered: list[dict[str, Any]] = []
 
-        for role, artifact in job.artifacts.items():
-            try:
-                handover = self._hand_over_artifact(job, artifact)
-                payload.setdefault("artifacts", {})[role] = handover
+        # **Heartbeats go on while the results upload** (MARP_API#319 run, 2026-11-05).
+        # The upload runs here, on the loop that heartbeats every job, so nothing
+        # heartbeated while it ran: a finished training's 520 MB checkpoint took
+        # longer than the 60 s lease through the public address, MARP abandoned the
+        # attempt, and the job trained again from the start with its result thrown
+        # away. Every job on the machine waits on this loop, so all of them are kept.
+        with self._keepalive(job):
+            for role, artifact in job.artifacts.items():
+                try:
+                    handover = self._hand_over_artifact(job, artifact)
+                    payload.setdefault("artifacts", {})[role] = handover
 
-                if handover.get("delivered"):
-                    delivered.append({"sha256": str(artifact["sha256"]), "role": role})
+                    if handover.get("delivered"):
+                        delivered.append({"sha256": str(artifact["sha256"]), "role": role})
 
-            except CoordinatorError as error:
-                # Say the artifact exists and could not be delivered, rather
-                # than reporting a success with no result behind it.
-                payload.setdefault("artifacts", {})[role] = {
-                    "sha256": artifact.get("sha256"),
-                    "delivered": False,
-                    "error": str(error),
-                }
+                except CoordinatorError as error:
+                    # Say the artifact exists and could not be delivered, rather
+                    # than reporting a success with no result behind it.
+                    payload.setdefault("artifacts", {})[role] = {
+                        "sha256": artifact.get("sha256"),
+                        "delivered": False,
+                        "error": str(error),
+                    }
 
         # Send the terminal payload as one last log event.
         #
@@ -1633,6 +1643,42 @@ class JobRunner:
 
         if failed:
             self._state.note_error(f"could not remove {failed} leftover job workspace(s)")
+
+    # _keepalive()
+    # Heartbeats the finishing job, and every other job here, while the loop is busy.
+    # Inputs: the job whose results are being handed over.
+    # Output: a context manager.
+    # The answers are not acted on: the loop does that on its next pass, which comes
+    # as soon as this block ends. Only the lease is kept.
+    @contextlib.contextmanager
+    def _keepalive(self, finishing: JobProcess):
+
+        stop = threading.Event()
+
+        def beat() -> None:
+            while not stop.wait(_HEARTBEAT_INTERVAL_S):
+                for job in [finishing, *[j for j in self._jobs_by_slot.values() if j is not finishing]]:
+                    progress = dict(job.current_progress() or {})
+                    if job is finishing:
+                        progress["phase"] = "uploading"
+                    try:
+                        self._client.heartbeat(
+                            attempt_id=job.attempt_id,
+                            worker_id=job.worker_id,
+                            lease_epoch=job.lease_epoch,
+                            progress=progress,
+                        )
+                        job.heartbeat_accepted_at = time.monotonic()
+                    except CoordinatorError:
+                        continue
+
+        thread = threading.Thread(target=beat, name="upload-keepalive", daemon=True)
+        thread.start()
+        try:
+            yield
+        finally:
+            stop.set()
+            thread.join(timeout=_HEARTBEAT_INTERVAL_S + 5.0)
 
     # _hand_over_artifact()
     # Offers one artifact by hash and uploads it only if asked.

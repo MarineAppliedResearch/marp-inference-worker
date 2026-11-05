@@ -181,6 +181,19 @@ class DatasetRef(BaseModel):
     keep_free_bytes: int | None = None
 
 
+# ResumeRef
+# The checkpoint a paused training run left, to carry on from (MARP_API#319).
+# Present only on a training job that was handed back part way; the coordinator
+# kept what the run uploaded when it yielded and names it here.
+class ResumeRef(BaseModel):
+
+    # Where to fetch it, coordinator-relative like a model artifact.
+    url: str = Field(min_length=1)
+
+    # Its sha256, verified before training resumes from it.
+    sha256: str
+
+
 # ReductionRef
 # Names the keyframe reduction rule this job must use, and its version.
 # Recorded with every observation the job produces, because the reduction is
@@ -268,6 +281,9 @@ class JobSpec(BaseModel):
 
     # The dataset a training job learns from. Absent on an inference job.
     dataset: DatasetRef | None = None
+
+    # The checkpoint a paused training run carries on from (MARP_API#319).
+    resume: ResumeRef | None = None
 
     # Free-form engine parameters. Deliberately unschema'd: confidence
     # thresholds, tracker settings and Ultralytics arguments differ per engine.

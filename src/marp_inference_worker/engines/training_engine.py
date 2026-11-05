@@ -1128,7 +1128,13 @@ class TrainingEngine(BaseEngine):
         # torch, and a worker that never trains must not pay for it.
         from ultralytics import YOLO
 
-        model = YOLO(str(weights_in))
+        # **A run handed back part way carries on from its checkpoint** (MARP_API#319),
+        # rather than training from the start again, which threw away every epoch
+        # done before a pause. Ultralytics resumes from the checkpoint's own settings
+        # and epoch; the data path is swapped for this machine's when the old one is
+        # not here, and `save_dir` puts the run in this attempt's folder.
+        resume_from = params.get("resume_checkpoint")
+        model = YOLO(str(resume_from or weights_in))
 
         # What this run writes, inside the attempt's own directory so two jobs
         # on one machine cannot collide over a run folder (R16).
@@ -1146,19 +1152,36 @@ class TrainingEngine(BaseEngine):
         ctx.report_progress(0, total_epochs, "epochs", phase="training")
 
         try:
-            model.train(
-                data=str(data_path),
-                device=device,
-                project=str(run_root),
-                name="run",
-                exist_ok=True,
-                **settings,
-            )
+            if resume_from:
+                ctx.log("resuming from the checkpoint the run left when it was handed back")
+                model.train(
+                    resume=True,
+                    data=str(data_path),
+                    device=device,
+                    save_dir=str(run_root / "run"),
+                )
+            else:
+                model.train(
+                    data=str(data_path),
+                    device=device,
+                    project=str(run_root),
+                    name="run",
+                    exist_ok=True,
+                    **settings,
+                )
         except _StopTraining:
             # Raised out of a callback when the operator stopped the job. The
             # weights published so far are the run's honest partial result.
             state.stopped_early = True
             ctx.log("stop requested; keeping the best weights published so far", level="warning")
+
+            # Handed back rather than cancelled: the latest epoch's checkpoint goes
+            # up too, so the next attempt carries on from it (MARP_API#319).
+            if ctx.yield_requested():
+                last = run_root / "run" / "weights" / "last.pt"
+                if last.is_file():
+                    sha256 = ctx.publish_artifact(last, "resume")
+                    ctx.log(f"published a checkpoint to resume from, after epoch {state.epochs_done}: sha256={sha256}")
 
         # The final best, published unconditionally -- it must never be the one
         # the rate limiter happened to skip (R11).
@@ -1218,7 +1241,7 @@ class TrainingEngine(BaseEngine):
             # reported as ignored ones.
             if name.startswith("_") or name in {
                 "data_yaml", "model_path", "model_sha256", "model_class_names",
-                "device", "slot_index", "slot_count", "dataset_path",
+                "device", "slot_index", "slot_count", "dataset_path", "resume_checkpoint",
             }:
                 continue
 
@@ -1365,6 +1388,13 @@ class _RunState:
     # there. This one says what the run settled on and is only reachable once
     # setup succeeded.
     def on_train_start(self, trainer: Any) -> None:
+
+        # A resumed run starts part way: say so, and count from where it is.
+        start = int(getattr(trainer, "start_epoch", 0) or 0)
+        if start:
+            self.epochs_done = start
+            self._ctx.report_progress(start, self._total, "epochs", phase="training")
+            self._ctx.log(f"resumed after epoch {start} of {self._total}")
 
         # Bookkeeping must never cost a volunteer's GPU run. Same rule as the
         # first report: a fault building the record is a warning, not a failure.

@@ -87,6 +87,9 @@ def test_context_offers_exactly_the_documented_calls() -> None:
         # answers "should I keep going", which tells the engine nothing about
         # MARP. The list grew from six to seven; it is still a closed list.
         "wait_while_paused",
+        # MARP_API#319. Inbound too: whether a stop is a hand-back, so a paused
+        # training run uploads the checkpoint it will carry on from. Eight now.
+        "yield_requested",
     }
 
 

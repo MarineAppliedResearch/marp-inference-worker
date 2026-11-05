@@ -121,3 +121,19 @@ def test_a_dataset_must_say_where_it_is() -> None:
 
     with pytest.raises(ValidationError):
         JobSpec.model_validate(payload)
+
+
+# test_a_handed_back_training_job_names_its_checkpoint()
+# Verifies the checkpoint a paused run carries on from is part of the spec.
+# Inputs: none.
+# Output: pytest pass/fail result.
+#
+# MARP_API#319. Absent on a fresh job, present once the run has been handed back.
+def test_a_handed_back_training_job_names_its_checkpoint() -> None:
+
+    assert JobSpec.model_validate(TRAINING).resume is None
+
+    spec = JobSpec.model_validate({**TRAINING, "resume": {"url": "/api/v2/gpu/artifacts/" + "d" * 64, "sha256": "d" * 64}})
+
+    assert spec.resume.sha256 == "d" * 64
+    assert spec.resume.url.endswith("d" * 64)

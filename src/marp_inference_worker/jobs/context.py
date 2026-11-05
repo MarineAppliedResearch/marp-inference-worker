@@ -307,6 +307,17 @@ class ChildJobContext:
         return self._stop_cached
 
 
+    # yield_requested()
+    # True when the stop is a hand-back, to be carried on later (MARP_API#319).
+    # Inputs: none.
+    # Output: True for a yield, False for a cancel or no stop at all.
+    def yield_requested(self) -> bool:
+
+        try:
+            return self._stop_file.read_text(encoding="utf-8").strip() == "yield"
+        except OSError:
+            return False
+
     # wait_while_paused()
     # Blocks here for as long as the volunteer has the worker paused.
     # Inputs: none.

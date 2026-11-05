@@ -1158,6 +1158,24 @@ class JobRunner:
         # against the weights it actually loads and refuses a mismatch.
         params["model_class_names"] = model.class_names
 
+        # **A paused training run carries on from its checkpoint** (MARP_API#319):
+        # fetched and verified like the model, so the engine resumes from a local
+        # file whose bytes are the ones the run uploaded when it yielded.
+        resume = envelope.spec.resume
+        if resume is not None:
+            resume_url, resume_headers = self._client.resolve_artifact_url(resume.url)
+            resumed = model_cache.ensure_artifact_cached(
+                ModelSpec(
+                    model_id=f"resume-{resume.sha256[:16]}",
+                    engine=envelope.spec.engine,
+                    model_arch=model.architecture or "unknown",
+                    task=_ULTRALYTICS_TASKS.get(model.task or "", "detect"),
+                    artifact=ArtifactSpec(url=resume_url, format="pt", sha256=resume.sha256),
+                ),
+                request_headers=resume_headers,
+            )
+            params["resume_checkpoint"] = resumed["artifact_path"]
+
         # A training job names a dataset instead of a video. Only the locator is
         # resolved here; the bytes are fetched by the child, because a dataset is
         # gigabytes and this method runs on the loop that heartbeats every job on

@@ -376,6 +376,9 @@ class JobProcess:
 
     def request_yield(self) -> None:
         self.yield_requested = True
+        # Said in the stop file, so the child can tell a hand-back from a cancel:
+        # only a hand-back is worth uploading a checkpoint to resume from (#319).
+        self.stop_file.write_text("yield", encoding="utf-8")
         self.request_stop()
 
     # is_running()

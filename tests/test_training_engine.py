@@ -2476,3 +2476,100 @@ def test_a_training_sample_never_names_an_epoch_past_the_end(tmp_path, monkeypat
 
     assert "epoch" not in sample
     assert sample["epochs_total"] == 2
+
+
+# test_a_handed_back_run_carries_on_from_its_checkpoint()
+# Verifies a resumed run trains on from the checkpoint, not from the base weights.
+# Inputs: tmp_path and monkeypatch.
+# Output: pytest pass/fail result.
+#
+# MARP_API#319: Pause now handed a training run back and the next attempt began
+# at epoch 0 again, throwing away every epoch done before the pause.
+def test_a_handed_back_run_carries_on_from_its_checkpoint(tmp_path, monkeypatch) -> None:
+
+    model = a_stubbed_ultralytics(monkeypatch)
+    checkpoint = tmp_path / "resume.pt"
+    checkpoint.write_bytes(b"a-checkpoint")
+    spec = a_runnable_spec(tmp_path, epochs=3, resume_checkpoint=str(checkpoint))
+
+    ctx = RunContext(tmp_path / "attempt")
+    ctx.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    TrainingEngine().run(ctx, spec)
+
+    assert model.weights_path == str(checkpoint)
+    assert model.train_kwargs["resume"] is True
+    assert model.train_kwargs["save_dir"] == str(ctx.checkpoint_dir / "train" / "run")
+
+    # The checkpoint carries the run's own settings; nothing else is passed in.
+    assert "epochs" not in model.train_kwargs
+
+    # And it is the worker's key, not a setting the submitter sent.
+    _engine, _reported, ignored = ctx.settings_reports[0]
+    assert "resume_checkpoint" not in ignored
+
+
+# test_a_resumed_run_counts_from_where_it_left_off()
+# Verifies the first progress report of a resumed run is the epoch it resumed at.
+# Inputs: tmp_path.
+# Output: pytest pass/fail result.
+def test_a_resumed_run_counts_from_where_it_left_off(tmp_path) -> None:
+
+    ctx = RecordingContext()
+    callbacks = training_module._RunState(ctx=ctx, total_epochs=3, run_root=tmp_path)
+
+    trainer = FakeTrainer(epoch=1, metrics={})
+    trainer.start_epoch = 1
+    callbacks.on_train_start(trainer)
+
+    assert callbacks.epochs_done == 1
+    assert ctx.progress[0] == (1, 3, "epochs", "training")
+
+
+# StoppingModel
+# A stub whose training is stopped part way, after writing last.pt.
+class StoppingModel(StubTrainedModel):
+
+    def train(self, **kwargs) -> None:
+        self.train_kwargs = kwargs
+        weights = Path(kwargs["project"]) / kwargs["name"] / "weights"
+        weights.mkdir(parents=True, exist_ok=True)
+        (weights / "last.pt").write_bytes(b"epoch-1")
+        raise training_module._StopTraining()
+
+
+# HandBackContext
+# A run context whose stop is a yield or a cancel, keeping what it published.
+class HandBackContext(RunContext):
+
+    def __init__(self, checkpoint_dir, yielding) -> None:
+
+        super().__init__(checkpoint_dir)
+        self.yielding = yielding
+        self.published: list[tuple] = []
+
+    def yield_requested(self) -> bool:
+        return self.yielding
+
+    def publish_artifact(self, path, kind) -> str:
+        self.published.append((Path(path).name, kind))
+        return "0" * 64
+
+
+# test_only_a_hand_back_uploads_a_checkpoint_to_resume_from()
+# Verifies a yield publishes last.pt as "resume", and a cancel does not.
+# Inputs: tmp_path and monkeypatch.
+# Output: pytest pass/fail result.
+@pytest.mark.parametrize("yielding", [True, False])
+def test_only_a_hand_back_uploads_a_checkpoint_to_resume_from(tmp_path, monkeypatch, yielding) -> None:
+
+    model = StoppingModel(None)
+    module = types.ModuleType("ultralytics")
+    module.YOLO = lambda weights: model
+    monkeypatch.setitem(sys.modules, "ultralytics", module)
+
+    ctx = HandBackContext(tmp_path / "attempt", yielding)
+    ctx.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    summary = TrainingEngine().run(ctx, a_runnable_spec(tmp_path, epochs=3))
+
+    assert summary["stopped_early"] is True
+    assert (("last.pt", "resume") in ctx.published) is yielding

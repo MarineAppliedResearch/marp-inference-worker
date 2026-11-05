@@ -2573,3 +2573,38 @@ def test_only_a_hand_back_uploads_a_checkpoint_to_resume_from(tmp_path, monkeypa
 
     assert summary["stopped_early"] is True
     assert (("last.pt", "resume") in ctx.published) is yielding
+
+
+# FailingModel
+# A stub whose training fails part way, after writing last.pt.
+class FailingModel(StubTrainedModel):
+
+    def train(self, **kwargs) -> None:
+        self.train_kwargs = kwargs
+        weights = Path(kwargs["project"]) / kwargs["name"] / "weights"
+        weights.mkdir(parents=True, exist_ok=True)
+        (weights / "last.pt").write_bytes(b"epoch-1")
+        raise RuntimeError("CUDA error: resource already mapped")
+
+
+# test_a_failed_run_leaves_its_checkpoint_and_still_fails()
+# Verifies a failure uploads last.pt as "resume" and is still reported as a failure.
+# Inputs: tmp_path and monkeypatch.
+# Output: pytest pass/fail result.
+#
+# MARP_API#319: the first run to fail this way, on a CUDA fault at the end of epoch
+# 1, began its retry at epoch 0.
+def test_a_failed_run_leaves_its_checkpoint_and_still_fails(tmp_path, monkeypatch) -> None:
+
+    model = FailingModel(None)
+    module = types.ModuleType("ultralytics")
+    module.YOLO = lambda weights: model
+    monkeypatch.setitem(sys.modules, "ultralytics", module)
+
+    ctx = HandBackContext(tmp_path / "attempt", yielding=False)
+    ctx.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+    with pytest.raises(RuntimeError, match="resource already mapped"):
+        TrainingEngine().run(ctx, a_runnable_spec(tmp_path, epochs=3))
+
+    assert ("last.pt", "resume") in ctx.published

@@ -1153,7 +1153,7 @@ class TrainingEngine(BaseEngine):
 
         try:
             if resume_from:
-                ctx.log("resuming from the checkpoint the run left when it was handed back")
+                ctx.log("resuming from the checkpoint an earlier attempt left")
                 model.train(
                     resume=True,
                     data=str(data_path),
@@ -1178,10 +1178,14 @@ class TrainingEngine(BaseEngine):
             # Handed back rather than cancelled: the latest epoch's checkpoint goes
             # up too, so the next attempt carries on from it (MARP_API#319).
             if ctx.yield_requested():
-                last = run_root / "run" / "weights" / "last.pt"
-                if last.is_file():
-                    sha256 = ctx.publish_artifact(last, "resume")
-                    ctx.log(f"published a checkpoint to resume from, after epoch {state.epochs_done}: sha256={sha256}")
+                _publish_resume_checkpoint(ctx, run_root, state)
+        except Exception:
+            # **A failed run leaves its checkpoint too** (MARP_API#319), so the retry
+            # carries on from the last epoch it finished rather than from the start:
+            # the first run to fail this way lost a whole epoch to one CUDA fault.
+            # Published before the failure goes out, which takes it up with the result.
+            _publish_resume_checkpoint(ctx, run_root, state)
+            raise
 
         # The final best, published unconditionally -- it must never be the one
         # the rate limiter happened to skip (R11).
@@ -1308,6 +1312,24 @@ class TrainingEngine(BaseEngine):
 # Raised inside a callback to unwind a run the operator stopped.
 # A private exception rather than JobStopped, because it never leaves this
 # module: run() catches it and turns it into a partial result.
+# _publish_resume_checkpoint()
+# Uploads the run's latest epoch, for the next attempt to carry on from (MARP_API#319).
+# Inputs: the job context, the run root and the run's state.
+# Output: none. Nothing to upload before the first epoch ends, and an upload that
+#   fails is a warning: it must not replace the reason the run stopped.
+def _publish_resume_checkpoint(ctx: JobContext, run_root: Path, state: "_RunState") -> None:
+
+    last = run_root / "run" / "weights" / "last.pt"
+    if not last.is_file():
+        return
+
+    try:
+        sha256 = ctx.publish_artifact(last, "resume")
+        ctx.log(f"published a checkpoint to resume from, after epoch {state.epochs_done}: sha256={sha256}")
+    except Exception as error:
+        ctx.log(f"could not publish a checkpoint to resume from: {error}", level="warning")
+
+
 class _StopTraining(RuntimeError):
     pass
 

@@ -677,3 +677,52 @@ def test_the_test_split_path_is_made_absolute_too(tmp_path: Path) -> None:
     text = Path(result["data_yaml"]).read_text(encoding="utf-8")
 
     assert "test: " + Path(result["path"]).as_posix() + "/test/images" in text
+
+
+# test_a_stop_during_the_fetch_stops_it_and_keeps_what_arrived()
+# Verifies Pause now no longer waits for a dataset to finish downloading (MARP_API#319).
+# Inputs: tmp_path, monkeypatch.
+# Output: pytest pass/fail result.
+#
+# Found live on 2026-11-05: Pause now at 1,125 of 1,964 MB took 73 s, the fetch
+# running on until the 60 s kill, because nothing checked the stop file before
+# training began. The partial it left is what the next attempt resumes from.
+def test_a_stop_during_the_fetch_stops_it_and_keeps_what_arrived(tmp_path: Path, monkeypatch) -> None:
+
+    from marp_inference_worker.jobs import child_main
+
+    archive, sha = build_archive(tmp_path)
+    payload = archive.read_bytes()
+
+    def slow(url, destination, headers=None, on_progress=None):
+        with destination.open("wb") as handle:
+            for i in range(0, len(payload), 64):
+                handle.write(payload[i:i + 64])
+                handle.flush()
+                on_progress(i + 64, len(payload))
+
+    monkeypatch.setattr(dataset_module, "_download", slow)
+
+    class _Ctx:
+        def __init__(self):
+            self.calls = 0
+
+        def report_progress(self, *args, **kwargs):
+            self.calls += 1
+
+        def should_stop(self):
+            return self.calls > 3
+
+        def log(self, *args, **kwargs):
+            pass
+
+    cache = tmp_path / "cache"
+    with pytest.raises(child_main._FetchStopped):
+        child_main._fetch_dataset_if_named(_Ctx(), {"params": {
+            "dataset_url": "http://marp.invalid/d", "dataset_sha256": sha, "dataset_cache": str(cache),
+        }})
+
+    partial = cache / f"{sha}.tar.partial"
+    assert 0 < partial.stat().st_size < len(payload), "what arrived is kept for the next attempt"
+    assert not dataset_module.cache_entry(cache, sha).exists()
+    assert not (cache / f"{sha}.lock").exists(), "and the lock is let go"

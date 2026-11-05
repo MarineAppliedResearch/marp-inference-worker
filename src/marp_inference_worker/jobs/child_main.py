@@ -119,6 +119,13 @@ def main(argv: list[str]) -> int:
         _emit_terminal(ctx, outcome, {"summary": summary})
         return 0
 
+    except _FetchStopped:
+        # Stopped while the dataset was still arriving (MARP_API#319): reported as a
+        # stop, which the parent turns into `yielded` when a yield was asked for. What
+        # arrived stays on disk, and the next attempt resumes the download from it.
+        _emit_terminal(ctx, "cancelled", {"summary": {"stopped_early": True, "stopped_during": "fetching_dataset"}})
+        return 0
+
     except JobUnrunnable as error:
         # A refusal is a clean, informative failure and is reported as one.
         _emit_terminal(
@@ -141,6 +148,14 @@ def main(argv: list[str]) -> int:
             },
         )
         return 1
+
+
+# _FetchStopped
+# Raised out of the download when the parent asks the job to stop (MARP_API#319).
+# A dataset can take twenty minutes to arrive, and nothing checked the stop file
+# until training began, so Pause now during a fetch waited for the 60 s kill.
+class _FetchStopped(Exception):
+    pass
 
 
 # _fetch_dataset_if_named()
@@ -173,6 +188,10 @@ def _fetch_dataset_if_named(ctx: Any, spec: dict[str, Any]) -> None:
     # minutes has no way to tell it apart from one that has hung.
     def on_progress(received: int, total: int | None) -> None:
         ctx.report_progress(received, total, "bytes", phase="fetching_dataset")
+
+        # Checked on every chunk; `should_stop` rate-limits its own file check.
+        if ctx.should_stop():
+            raise _FetchStopped()
 
     ctx.report_progress(0, None, "bytes", phase="fetching_dataset")
     result = ensure_dataset(

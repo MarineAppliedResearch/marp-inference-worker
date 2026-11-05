@@ -107,6 +107,12 @@ _STOP_GRACE_S = 60.0
 # the job back, and the next two attempts died fighting it for the file.
 _LEASE_LOST_S = 90.0
 
+# How long a job's preparation may take before it is moved off the loop (#84).
+# A cached model is verified and ready well inside this, and those jobs start
+# exactly as they always have. A download that takes longer goes on in the
+# background while the loop goes on heartbeating and polling.
+_PREPARE_INLINE_S = 2.0
+
 # MARP's task names, as Ultralytics spells them, for the model cache's record.
 _ULTRALYTICS_TASKS = {
     "detection": "detect",
@@ -275,6 +281,83 @@ def derive_slot_count() -> int:
 # The worker's outbound loop.
 # One instance per worker process. It is single-threaded on purpose: the only
 # concurrency is one reader thread per running job, inside JobProcess.
+# _PreparationStopped
+# Raised out of a download to abandon it, when MARP took the attempt back (#84).
+class _PreparationStopped(Exception):
+    pass
+
+
+# _Preparation
+# One leased attempt whose model or checkpoint is being fetched (#84).
+#
+# The fetch used to run on the loop that sends every heartbeat and every poll, so
+# a 546 MB checkpoint at 3 MB/s left the whole worker silent for three minutes:
+# MARP abandoned the attempt it had just leased, then marked the machine offline.
+# The fetch now runs on a thread of its own, and the loop heartbeats the attempt
+# while it does.
+class _Preparation:
+
+    # __init__()
+    # Inputs: the attempt envelope, its slot, and the function that prepares it.
+    # Output: an unstarted preparation.
+    def __init__(self, envelope: AttemptEnvelope, slot_index: int, prepare) -> None:
+
+        self.envelope = envelope
+        self.slot_index = slot_index
+
+        # Set when MARP takes the attempt back; the download stops at its next chunk.
+        self.stop = threading.Event()
+        self.stop_action: str | None = None
+
+        # What the heartbeat reports while the fetch runs.
+        self.phase = "preparing"
+        self.bytes_done = 0
+        self.bytes_total: int | None = None
+
+        # The outcome: params on success, the exception otherwise.
+        self.params: dict[str, Any] | None = None
+        self.error: BaseException | None = None
+
+        # The lease began when the attempt was offered; judged lost from here (#73).
+        self.heartbeat_accepted_at = time.monotonic()
+        self.last_beat_at = time.monotonic()
+
+        self._prepare = prepare
+        self._thread = threading.Thread(target=self._run, name=f"prepare-{envelope.attempt_id}", daemon=True)
+
+    def start(self) -> None:
+        self._thread.start()
+
+    # wait()
+    # Inputs: seconds to wait.
+    # Output: True once the preparation has finished, either way.
+    def wait(self, timeout_s: float) -> bool:
+        self._thread.join(timeout_s)
+        return not self._thread.is_alive()
+
+    def is_running(self) -> bool:
+        return self._thread.is_alive()
+
+    # progress()
+    # Called with each chunk of a fetch. Raises to abandon it once stopped.
+    # Inputs: the phase, bytes so far and the whole.
+    # Output: none.
+    def progress(self, phase: str, done: int, total: int | None) -> None:
+
+        self.phase = phase
+        self.bytes_done = done
+        self.bytes_total = total
+        if self.stop.is_set():
+            raise _PreparationStopped()
+
+    def _run(self) -> None:
+
+        try:
+            self.params = self._prepare(self.envelope, self.slot_index, on_progress=self.progress)
+        except BaseException as error:
+            self.error = error
+
+
 class JobRunner:
 
     # __init__()
@@ -374,6 +457,10 @@ class JobRunner:
         # Leases for a job this machine is still running an earlier attempt of,
         # held until that child has gone (#73).
         self._deferred: list[AttemptEnvelope] = []
+
+        # Slot index -> an attempt whose model or checkpoint is still being
+        # fetched (#84). It owns its slot from the moment it is leased.
+        self._preparing: dict[int, _Preparation] = {}
 
         # Set by stop() so the loop can be shut down from outside.
         self._should_exit = False
@@ -636,7 +723,7 @@ class JobRunner:
         # being offered work without needing a separate coordinator concept.
         if self._state.is_paused():
             return 0
-        return self._live_slot_count() - len(self._jobs_by_slot)
+        return self._live_slot_count() - len(self._jobs_by_slot) - len(self._preparing)
 
     # _live_slot_count()
     # How many jobs to run at once, given how fast they are actually going.
@@ -703,7 +790,7 @@ class JobRunner:
     def _next_free_slot(self) -> int | None:
 
         for slot_index in range(self._slot_count):
-            if slot_index not in self._jobs_by_slot:
+            if slot_index not in self._jobs_by_slot and slot_index not in self._preparing:
                 return slot_index
         return None
 
@@ -725,7 +812,7 @@ class JobRunner:
         # offer it back on the next poll.
         live = self._live_slot_count()
 
-        free = [index for index in range(live) if index not in self._jobs_by_slot]
+        free = [index for index in range(live) if index not in self._jobs_by_slot and index not in self._preparing]
 
         # A lease held back for an earlier attempt still owes a slot (#73).
         return free[:max(0, len(free) - len(self._deferred))]
@@ -798,7 +885,7 @@ class JobRunner:
                 self._service_running_jobs()
 
                 self._check_for_update()
-                if self._draining_for_update and not self._jobs_by_slot:
+                if self._draining_for_update and not self._jobs_by_slot and not self._preparing:
                     self._stage_requested_update()
                     return
 
@@ -911,7 +998,7 @@ class JobRunner:
         # which both breaks R5's "within one heartbeat" and can outlast the
         # lease itself -- the coordinator would take the job away from a worker
         # that was busy doing it.
-        wait_seconds = 0 if self._jobs_by_slot else int(_LONG_POLL_WAIT_S)
+        wait_seconds = 0 if self._jobs_by_slot or self._preparing else int(_LONG_POLL_WAIT_S)
 
         # Say what this worker can take right now.
         offered = self._client.poll(
@@ -977,6 +1064,11 @@ class JobRunner:
             job_id = params.get("_job_id", job.spec.get("_job_id"))
             if job_id is not None:
                 ids.add(str(job_id))
+
+        # One still fetching its model is running too, as far as a re-lease goes.
+        for preparation in self._preparing.values():
+            if preparation.envelope.job_id is not None:
+                ids.add(str(preparation.envelope.job_id))
         return ids
 
     # _service_deferred()
@@ -1019,14 +1111,121 @@ class JobRunner:
         if slot_index is None:
             return
 
-        try:
-            # Fetch and hash-verify the model in the parent. It can fail for
-            # reasons the coordinator should hear about as a refusal rather than
-            # as a crashed child.
-            prepared_params = self._prepare_job_params(envelope, slot_index)
+        # Fetch and hash-verify the model in the parent, on a thread of its own
+        # (#84). A cached model is ready at once and the job starts here, as it
+        # always has; a download carries on in the background, heartbeated by
+        # _service_preparing() until it is done.
+        preparation = _Preparation(envelope, slot_index, self._prepare_job_params)
+        preparation.start()
 
-        except Exception as error:
-            # Refused before any work started, with the reason attached.
+        if not preparation.wait(_PREPARE_INLINE_S):
+            self._state.note(f"fetching what {envelope.attempt_id} needs before it starts")
+            self._preparing[slot_index] = preparation
+            return
+
+        self._launch_prepared(preparation)
+
+    # _service_preparing()
+    # Heartbeats the attempts still fetching, and starts the ones that are ready (#84).
+    # Inputs: none.
+    # Output: none.
+    def _service_preparing(self) -> None:
+
+        for slot_index, preparation in list(self._preparing.items()):
+
+            # Done, one way or another: start it, refuse it, or let it go.
+            if not preparation.is_running():
+                del self._preparing[slot_index]
+                self._launch_prepared(preparation)
+                continue
+
+            # Taken back already: the download stops at its next chunk.
+            if preparation.stop.is_set():
+                continue
+
+            # The same cadence as a running job's beat.
+            now = time.monotonic()
+            if now - preparation.last_beat_at < _HEARTBEAT_INTERVAL_S:
+                continue
+            preparation.last_beat_at = now
+
+            envelope = preparation.envelope
+            try:
+                response = self._client.heartbeat(
+                    attempt_id=envelope.attempt_id,
+                    worker_id=envelope.worker_id,
+                    lease_epoch=envelope.lease_epoch,
+                    progress={
+                        "done": preparation.bytes_done,
+                        "total": preparation.bytes_total,
+                        "unit": "bytes",
+                        "phase": preparation.phase,
+                    },
+                )
+            except CoordinatorError as error:
+                self._state.note_error(f"heartbeat failed for {envelope.attempt_id}: {error}")
+
+                # A lease that has run out is not this worker's to go on fetching for (#73).
+                if now - preparation.heartbeat_accepted_at > _LEASE_LOST_S:
+                    self._state.note(f"lease lost for {envelope.attempt_id} while it was fetching; stopping it")
+                    preparation.stop_action = "abandon"
+                    preparation.stop.set()
+                continue
+
+            preparation.heartbeat_accepted_at = now
+            action = str(response.get("action", "continue"))
+
+            # Pause now, Retire, a cancel or an abandon: nothing has started, so
+            # stopping the download is all there is to stop.
+            if action == "yield" or is_stop_action(action):
+                self._state.note(f"{action} received for {envelope.attempt_id} while it was fetching")
+                self._stop_preparation(preparation, action)
+
+    # _stop_preparation()
+    # Abandons an attempt's fetch and tells MARP how it ended (#84).
+    # Inputs: the preparation and the action that stopped it.
+    # Output: none.
+    #
+    # A hand-back is reported as one, so MARP requeues it without spending an
+    # attempt. A cancel is reported as cancelled. An abandoned lease is not
+    # reported: MARP has already taken it back and would refuse the result.
+    def _stop_preparation(self, preparation: _Preparation, action: str) -> None:
+
+        preparation.stop_action = action
+        preparation.stop.set()
+
+        if action == "abandon":
+            return
+
+        envelope = preparation.envelope
+        try:
+            self._client.report_result(
+                attempt_id=envelope.attempt_id,
+                worker_id=envelope.worker_id,
+                lease_epoch=envelope.lease_epoch,
+                outcome="yielded" if action == "yield" else "cancelled",
+            )
+        except CoordinatorError as error:
+            self._state.note_error(f"could not report {envelope.attempt_id} stopped while fetching: {error}")
+
+    # _launch_prepared()
+    # Starts a job whose preparation has finished, or reports why it cannot.
+    # Inputs: the finished preparation.
+    # Output: none.
+    def _launch_prepared(self, preparation: _Preparation) -> None:
+
+        envelope = preparation.envelope
+        slot_index = preparation.slot_index
+
+        # Stopped while it fetched; already reported, and nothing to start.
+        if preparation.stop.is_set():
+            return
+
+        if preparation.error is not None:
+            error = preparation.error
+            # Refused before any work started, with the reason attached. It can
+            # fail for reasons the coordinator should hear about as a refusal
+            # rather than as a crashed child.
             self._client.report_result(
                 attempt_id=envelope.attempt_id,
                 worker_id=envelope.worker_id,
@@ -1035,6 +1234,8 @@ class JobRunner:
                 failure_reason=f"preparation_failed: {type(error).__name__}: {error}",
             )
             return
+
+        prepared_params = preparation.params
 
         # Build the spec the child receives: the coordinator's spec with the
         # local model details merged into params. The engine reads these and
@@ -1099,7 +1300,18 @@ class JobRunner:
     # is fetched and its sha256 verified, so no engine can be handed unverified
     # weights (R13). The video is not resolved anywhere in the worker -- the
     # coordinator does that and the spec arrives carrying an openable url (A8).
-    def _prepare_job_params(self, envelope: AttemptEnvelope, slot_index: int) -> dict[str, Any]:
+    def _prepare_job_params(
+        self,
+        envelope: AttemptEnvelope,
+        slot_index: int,
+        on_progress=None,
+    ) -> dict[str, Any]:
+
+        # Each fetch says which it is, so a heartbeat can tell the two apart (#84).
+        def reporting(phase: str):
+            if on_progress is None:
+                return None
+            return lambda done, total: on_progress(phase, done, total)
 
         # Start from what the coordinator sent.
         params = dict(envelope.spec.params)
@@ -1150,6 +1362,7 @@ class JobRunner:
                 ),
             ),
             request_headers=artifact_headers,
+            on_progress=reporting("fetching_model"),
         )
         params["model_path"] = cache_state["artifact_path"]
         params["model_sha256"] = cache_state["sha256"]
@@ -1173,6 +1386,7 @@ class JobRunner:
                     artifact=ArtifactSpec(url=resume_url, format="pt", sha256=resume.sha256),
                 ),
                 request_headers=resume_headers,
+                on_progress=reporting("fetching_checkpoint"),
             )
             params["resume_checkpoint"] = resumed["artifact_path"]
 
@@ -1211,6 +1425,13 @@ class JobRunner:
             for job in self._jobs_by_slot.values():
                 if not job.stop_requested:
                     job.request_yield()
+            for preparation in list(self._preparing.values()):
+                if not preparation.stop.is_set():
+                    self._stop_preparation(preparation, "yield")
+
+        # Attempts still fetching their model are heartbeated like running ones (#84).
+        if self._preparing:
+            self._service_preparing()
 
         # Carry the worker's paused flag down to the jobs themselves. Pause used
         # to stop new work arriving and leave a running job on the GPU, which is

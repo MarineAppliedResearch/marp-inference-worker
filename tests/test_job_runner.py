@@ -21,6 +21,8 @@
 # json reads back the in-flight record the runner writes.
 import json
 
+import pytest
+
 # time waits for the child, with a deadline rather than a fixed sleep.
 import time
 
@@ -2507,7 +2509,7 @@ def test_the_model_cache_is_told_the_registry_architecture_and_task(tmp_path: Pa
 
     seen = []
 
-    def fake_cache(spec, request_headers=None):
+    def fake_cache(spec, request_headers=None, on_progress=None):
         seen.append(spec)
         return {"artifact_path": str(tmp_path / "m.pt"), "sha256": "a" * 64}
 
@@ -2587,3 +2589,92 @@ def test_a_slow_result_upload_keeps_the_lease(tmp_path: Path, monkeypatch) -> No
     assert len(during) >= 5, "heartbeats went on through a one-second upload at 0.1 s"
     assert all(beat["progress"].get("phase") == "uploading" for beat in during)
     assert coordinator.results[0]["outcome"] == "succeeded"
+
+
+# a_slow_model_fetch()
+# Swaps the model cache for one whose download takes a while (#84).
+# Inputs: monkeypatch and the number of chunks it reports before finishing.
+# Output: a record of the chunks it reported and whether it was abandoned.
+def a_slow_model_fetch(monkeypatch, chunks: int = 30) -> dict[str, Any]:
+
+    from marp_inference_worker.jobs import runner as runner_module
+
+    real = runner_module.model_cache.ensure_artifact_cached
+    seen = {"chunks": 0, "stopped": False}
+
+    def slow(spec, request_headers=None, on_progress=None):
+        for chunk in range(chunks):
+            try:
+                on_progress((chunk + 1) * 1000, chunks * 1000)
+            except Exception:
+                seen["stopped"] = True
+                raise
+            seen["chunks"] += 1
+            time.sleep(0.05)
+        return real(spec, request_headers=request_headers)
+
+    monkeypatch.setattr(runner_module.model_cache, "ensure_artifact_cached", slow)
+
+    # Moved off the loop at once, and beaten every pass, so the test is quick.
+    monkeypatch.setattr(runner_module, "_PREPARE_INLINE_S", 0.05)
+    monkeypatch.setattr(runner_module, "_HEARTBEAT_INTERVAL_S", 0.0)
+    return seen
+
+
+# test_a_slow_model_download_is_heartbeated_and_then_runs(tmp_path)
+# Verifies the worker goes on heartbeating while a job's model downloads (#84).
+# Inputs: pytest temporary directory and monkeypatch.
+# Output: pytest pass/fail result.
+#
+# Found live on 2026-11-05: a 546 MB checkpoint at 3 MB/s was fetched on the loop
+# that heartbeats, so MARP heard nothing for three minutes, abandoned the attempt
+# it had just leased and marked the machine offline.
+def test_a_slow_model_download_is_heartbeated_and_then_runs(tmp_path: Path, monkeypatch) -> None:
+
+    seen = a_slow_model_fetch(monkeypatch)
+    coordinator = FakeCoordinator(offers=[_job_for(tmp_path, "attempt-slow-fetch", frames=3)])
+    runner, _ = _runner(coordinator, tmp_path)
+    runner.ensure_enrolled()
+
+    # Taken, and the poll returns while the model is still arriving.
+    assert runner._poll_once() is True
+    assert seen["chunks"] < 30
+    assert runner.free_slots() == 0
+
+    assert _wait_until(runner, lambda: len(coordinator.results) == 1), "job never reported"
+
+    # MARP heard about the fetch while it ran, in bytes, under its own phase.
+    fetching = [beat for beat in coordinator.heartbeats if beat["progress"].get("phase") == "fetching_model"]
+    assert fetching, "no heartbeat while the model downloaded"
+    assert fetching[-1]["progress"]["unit"] == "bytes"
+    assert fetching[-1]["progress"]["total"] == 30_000
+
+    # And the job ran once it had arrived.
+    assert coordinator.results[0]["outcome"] == "succeeded"
+    assert seen["chunks"] == 30
+    assert runner.free_slots() == 1
+
+
+# test_a_job_taken_back_while_its_model_downloads_never_starts(tmp_path, action, outcome)
+# Verifies a cancel or a hand-back stops the download and starts nothing (#84).
+# Inputs: pytest temporary directory, monkeypatch, the heartbeat action and what is reported.
+# Output: pytest pass/fail result.
+@pytest.mark.parametrize("action, outcome", [("cancel", "cancelled"), ("yield", "yielded"), ("abandon", None)])
+def test_a_job_taken_back_while_its_model_downloads_never_starts(tmp_path: Path, monkeypatch, action, outcome) -> None:
+
+    seen = a_slow_model_fetch(monkeypatch, chunks=200)
+    coordinator = FakeCoordinator(offers=[_job_for(tmp_path, f"attempt-{action}-fetch", frames=3)])
+    coordinator.heartbeat_action = action
+    runner, _ = _runner(coordinator, tmp_path)
+    runner.ensure_enrolled()
+
+    assert runner._poll_once() is True
+    assert _wait_until(runner, lambda: runner.free_slots() == 1, deadline_s=10), "slot never freed"
+
+    # The download stopped at its next chunk rather than running to the end.
+    assert seen["stopped"] is True
+    assert seen["chunks"] < 200
+
+    # A hand-back is reported as one, a cancel as cancelled; an abandoned lease is
+    # MARP's already and is not reported at all.
+    assert [result["outcome"] for result in coordinator.results] == ([outcome] if outcome else [])

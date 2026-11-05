@@ -2551,3 +2551,39 @@ def test_a_yield_answer_hands_the_job_back_with_its_frame(tmp_path: Path) -> Non
     result = coordinator.results[0]
     assert result["outcome"] == "yielded", "handed back, not cancelled: no attempt is used"
     assert 1000 < result["completed_through_frame"] < 1400
+
+
+# test_a_slow_result_upload_keeps_the_lease(tmp_path)
+# Verifies a finished job heartbeats while its results upload (MARP_API#319 run).
+# Inputs: pytest temporary directory, monkeypatch.
+# Output: pytest pass/fail result.
+#
+# Found live on 2026-11-05: a finished training's 520 MB checkpoint took longer
+# than the 60 s lease to upload, nothing heartbeated meanwhile, and MARP threw the
+# result away and trained the job again from the start.
+def test_a_slow_result_upload_keeps_the_lease(tmp_path: Path, monkeypatch) -> None:
+
+    from marp_inference_worker.jobs import runner as runner_module
+
+    monkeypatch.setattr(runner_module, "_HEARTBEAT_INTERVAL_S", 0.1)
+
+    class SlowUpload(FakeCoordinator):
+        def upload_artifact(self, upload_url, path, attempt_id=None):
+            self.upload_started = len(self.heartbeats)
+            time.sleep(1.0)
+            super().upload_artifact(upload_url, path, attempt_id)
+            self.upload_ended = len(self.heartbeats)
+
+    coordinator = SlowUpload(offers=[_job_for(tmp_path, "attempt-slow-upload", frames=5)])
+    coordinator.already_have_artifact = False
+    runner, _ = _runner(coordinator, tmp_path)
+    runner.ensure_enrolled()
+    runner._poll_once()
+
+    assert _wait_until(runner, lambda: bool(coordinator.results))
+    assert coordinator.uploads, "the result was uploaded"
+
+    during = coordinator.heartbeats[coordinator.upload_started:coordinator.upload_ended]
+    assert len(during) >= 5, "heartbeats went on through a one-second upload at 0.1 s"
+    assert all(beat["progress"].get("phase") == "uploading" for beat in during)
+    assert coordinator.results[0]["outcome"] == "succeeded"

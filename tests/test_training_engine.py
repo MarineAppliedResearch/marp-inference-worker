@@ -2608,3 +2608,23 @@ def test_a_failed_run_leaves_its_checkpoint_and_still_fails(tmp_path, monkeypatc
         TrainingEngine().run(ctx, a_runnable_spec(tmp_path, epochs=3))
 
     assert ("last.pt", "resume") in ctx.published
+
+
+# test_a_stop_is_honoured_between_batches()
+# Verifies a stop raised mid-epoch unwinds training at the next batch.
+# Inputs: tmp_path.
+# Output: pytest pass/fail result.
+#
+# MARP_API#319 live run: a stop was only checked at the end of a ten-minute epoch,
+# so the runner's 60 s grace killed the child first and Pause now left nothing to
+# resume from.
+def test_a_stop_is_honoured_between_batches(tmp_path) -> None:
+
+    class Stopping(RecordingContext):
+        def should_stop(self) -> bool:
+            return True
+
+    state = training_module._RunState(ctx=Stopping(), total_epochs=3, run_root=tmp_path)
+
+    with pytest.raises(training_module._StopTraining):
+        state.on_batch_end(a_training_trainer())

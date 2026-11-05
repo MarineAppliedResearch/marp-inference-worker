@@ -1616,6 +1616,15 @@ class _RunState:
 
         self._emit_sample(trainer)
 
+        # **A stop is honoured between batches, not only between epochs**
+        # (MARP_API#319). An epoch can run ten minutes and the runner kills a child
+        # 60 s after asking it to stop, so a stop that waited for the epoch to end
+        # was a kill: nothing after it ran, and Pause now uploaded no checkpoint to
+        # resume from. The epoch in progress is lost either way; last.pt holds the
+        # one before it.
+        if self._ctx.should_stop():
+            raise _StopTraining()
+
 
     # on_phase_change()
     # Builds a callback that records entering a named phase.
@@ -1910,8 +1919,8 @@ class _RunState:
         # resuming costs nothing and no epoch is repeated (#57 R5).
         self._ctx.wait_while_paused()
 
-        # Cancellation arrives at the epoch boundary and nowhere else. Raising
-        # rather than returning is what unwinds Ultralytics' own loop.
+        # A stop that arrived during validation is honoured here. Raising rather
+        # than returning is what unwinds Ultralytics' own loop.
         if self._ctx.should_stop():
             raise _StopTraining()
 

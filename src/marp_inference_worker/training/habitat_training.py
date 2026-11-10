@@ -359,6 +359,44 @@ def train_habitat(
             "kept": best["stage"], "history": history}
 
 
+# HabitatFrames
+# One split's frames for torch: each read, cut to the crop, prepared, with its labels.
+# At module level, not inside make_loader: a loader's worker processes are started fresh on
+# Windows and are sent the dataset by pickling, which cannot carry a class defined inside a
+# function. The GPU run found that; test_habitat_training's worker-process test holds it.
+class HabitatFrames:
+
+    # The rows, the crop, the input size and the preparation, fixed for the split.
+    def __init__(self, rows: Sequence[tuple[Path, list[float]]], crop: Sequence[float], input_size: int, prepare: Any) -> None:
+
+        self.rows = list(rows)
+        self.crop = tuple(crop)
+        self.input_size = input_size
+        self.prepare = prepare
+
+    def __len__(self) -> int:
+
+        return len(self.rows)
+
+    # One frame: the crop, prepared, and its labels.
+    def __getitem__(self, index: int):
+
+        import torch
+        from PIL import Image
+
+        path, labels = self.rows[index]
+        image = Image.open(path)
+        # A full-HD frame is decoded at half size when the crop is still larger than the
+        # model's input after it, which keeps the loaders ahead of the GPU.
+        if image.width > 1000 and image.height // 2 * (self.crop[3] - self.crop[1]) >= self.input_size:
+            image.draft("RGB", (image.width // 2, image.height // 2))
+        image = image.convert("RGB")
+        width, height = image.size
+        x0, y0, x1, y1 = self.crop
+        box = (int(width * x0), int(height * y0), int(width * x1), int(height * y1))
+        return self.prepare(image.crop(box)), torch.tensor(labels, dtype=torch.float32)
+
+
 # make_loader()
 # A torch loader over one split: each frame cropped, resized and normalised.
 # Inputs: the split's rows from read_split, the crop as fractions (x0, y0, x1, y1), the
@@ -369,10 +407,9 @@ def train_habitat(
 def make_loader(rows: Sequence[tuple[Path, list[float]]], crop: Sequence[float], recipe: HabitatRecipe,
                 train: bool, workers: int = 4) -> Any:
 
-    # torch, torchvision and Pillow are needed from here on.
+    # torch and torchvision are needed from here on.
     import torch
-    from PIL import Image
-    from torch.utils.data import DataLoader, Dataset
+    from torch.utils.data import DataLoader
     from torchvision import transforms
 
     # The same preparation as the feasibility training: ImageNet normalisation, which is
@@ -381,34 +418,7 @@ def make_loader(rows: Sequence[tuple[Path, list[float]]], crop: Sequence[float],
     if train:
         steps += [transforms.RandomHorizontalFlip(), transforms.ColorJitter(0.2, 0.2, 0.1)]
     steps += [transforms.ToTensor(), transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])]
-    prepare = transforms.Compose(steps)
 
-    # Frames
-    # The split's frames, read one at a time.
-    class Frames(Dataset):
-
-        # The rows and the crop, fixed for the split.
-        def __init__(self) -> None:
-
-            self.rows = list(rows)
-
-        def __len__(self) -> int:
-
-            return len(self.rows)
-
-        # One frame: the habitat crop, prepared, and its labels.
-        def __getitem__(self, index: int):
-
-            path, labels = self.rows[index]
-            image = Image.open(path)
-            # A full-HD frame is decoded at half size when the crop is still larger than the
-            # model's input after it, which keeps the loaders ahead of the GPU.
-            if image.width > 1000 and image.height // 2 * (crop[3] - crop[1]) >= recipe.input_size:
-                image.draft("RGB", (image.width // 2, image.height // 2))
-            image = image.convert("RGB")
-            width, height = image.size
-            box = (int(width * crop[0]), int(height * crop[1]), int(width * crop[2]), int(height * crop[3]))
-            return prepare(image.crop(box)), torch.tensor(labels, dtype=torch.float32)
-
-    return DataLoader(Frames(), batch_size=recipe.batch, shuffle=train, num_workers=workers,
+    frames = HabitatFrames(rows, crop, recipe.input_size, transforms.Compose(steps))
+    return DataLoader(frames, batch_size=recipe.batch, shuffle=train, num_workers=workers,
                       persistent_workers=workers > 0, pin_memory=torch.cuda.is_available())

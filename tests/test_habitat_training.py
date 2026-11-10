@@ -235,3 +235,18 @@ def test_a_stop_unwinds_the_recipe(tmp_path):
         train_habitat(model, model.head, made["train"], made["val"], labels, RECIPE,
                       torch.device("cpu"), classes, hook)
     assert record["epochs"] == []
+
+
+# test_a_loader_with_worker_processes_reads_frames()
+# The loaders run with worker processes in a real job, and on Windows each is started fresh
+# and sent the dataset by pickling. The first GPU run failed there, at its first batch, with
+# "Can't get local object 'make_loader.<locals>.Frames'"; the other tests here use no worker
+# processes and could not see it.
+def test_a_loader_with_worker_processes_reads_frames(tmp_path):
+
+    root = write_archive(tmp_path, per_split=4)
+    classes = read_classes(root)
+    loader = make_loader(read_split(root, "val", classes), CROP, RECIPE, train=False, workers=1)
+    images, labels = next(iter(loader))
+    assert tuple(images.shape) == (4, 3, 16, 16)
+    assert tuple(labels.shape) == (4, 5)

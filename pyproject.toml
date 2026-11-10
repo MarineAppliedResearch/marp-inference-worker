@@ -39,6 +39,12 @@ dependencies = [
     "cython-bbox",
     "cython",
     "filterpy",
+    # The habitat substrate model (MarineAppliedResearch/MARP_API#287): DINOv2 ViT-B/14 is
+    # timm's, and its weights are safetensors. Pinned exactly, as Ultralytics is: the model is
+    # built by name, and a different timm can build a different network from the same weights.
+    # The versions the feasibility runs were scored with.
+    "timm==1.0.30",
+    "safetensors==0.8.0",
 ]
 [project.optional-dependencies]
 dev = [

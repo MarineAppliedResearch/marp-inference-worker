@@ -271,6 +271,10 @@ def _apply_ultralytics_environment(workspace: Path) -> None:
     os.environ["YOLO_AUTOINSTALL"] = "false"
     os.environ["YOLO_CONFIG_DIR"] = str(config_dir)
 
+    # The habitat engines build DINOv2 through timm, which reaches Hugging Face unless told
+    # not to. Their weights always come from MARP, so the network is never needed.
+    os.environ["HF_HUB_OFFLINE"] = "1"
+
 
 # _emit_terminal()
 # Writes the job's final event.

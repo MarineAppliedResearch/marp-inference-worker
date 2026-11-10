@@ -26,6 +26,9 @@ from marp_inference_worker.engines.training_engine import TrainingEngine
 
 from marp_inference_worker.engines.ultralytics_engine import UltralyticsEngine
 
+# HabitatTrainingEngine trains habitat substrate models (MARP_API#287).
+from marp_inference_worker.engines.habitat_training_engine import HabitatTrainingEngine
+
 
 # Registered engine instances keyed by public engine name.
 # Engines are constructed here at import, which is cheap: every ML import inside
@@ -35,6 +38,7 @@ _ENGINES_BY_NAME: dict[str, object] = {
     "ultralytics": UltralyticsEngine(),
     "marp_tracking": TrackingEngine(),
     "marp_training": TrainingEngine(),
+    "marp_habitat_training": HabitatTrainingEngine(),
 }
 
 

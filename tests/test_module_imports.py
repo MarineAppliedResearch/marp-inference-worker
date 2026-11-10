@@ -52,6 +52,7 @@ _MODULES = [
     "marp_inference_worker.jobs.runner",
     "marp_inference_worker.jobs.worker_state",
     "marp_inference_worker.media.frame_range_reader",
+    "marp_inference_worker.media.habitat_frames",
     "marp_inference_worker.models.model_cache",
     "marp_inference_worker.models.model_manager",
     "marp_inference_worker.models.model_spec",

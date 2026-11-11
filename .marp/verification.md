@@ -271,6 +271,8 @@ What it showed:
 
 - **The trainer reproduces the feasibility result.** Same frames, same crop, same seed: test
   0.734 against 0.728, every frozen pass within 0.003, the best tuning pass within 0.002.
+  The feasibility session's five seeds on this crop afterwards scored 0.721 to 0.738 as single
+  models (0.737 averaged), so 0.734 is inside the spread rather than a lucky draw.
 - **The kept model is the best tuning pass, not the last.** Tuning F1 peaked at pass 4 and
   fell to 0.786 by pass 10 as the loss went to 0.017; the published weights are pass 4's.
 - **All three files were published and say what they should**: `weights` (346 MB),

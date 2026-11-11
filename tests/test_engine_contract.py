@@ -44,7 +44,7 @@ def test_every_job_engine_implements_the_contract() -> None:
 
     # Every job engine is registered. Pinned as a set rather than a count, so
     # adding one is a deliberate edit here and removing one cannot pass quietly.
-    assert set(names) == {"mock", "marp_tracking", "marp_training", "marp_habitat_training"}
+    assert set(names) == {"mock", "marp_tracking", "marp_training", "marp_habitat_training", "marp_habitat"}
 
     for name in names:
         engine = engine_registry.get_job_engine(name)
@@ -152,6 +152,7 @@ def test_context_protocol_is_the_only_thing_engines_are_given() -> None:
 def _engine_module_paths() -> list[Path]:
 
     from marp_inference_worker.engines import (
+        habitat_engine,
         habitat_training_engine,
         mock_engine,
         tracking_engine,
@@ -160,7 +161,7 @@ def _engine_module_paths() -> list[Path]:
 
     return [
         Path(inspect.getfile(module))
-        for module in (mock_engine, tracking_engine, ultralytics_engine, habitat_training_engine)
+        for module in (mock_engine, tracking_engine, ultralytics_engine, habitat_training_engine, habitat_engine)
     ]
 
 

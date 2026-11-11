@@ -231,3 +231,57 @@ So a profile is **17 MB against 102 MB**, and it is built once per slot rather t
 per attempt. Against the issue's measured rate -- 86 to 101 attempts in twelve hours, 70 to
 120 MB each -- that is roughly 14-24 GB a day becoming tens of megabytes for the life of
 the worker.
+
+## MARP_API#287: the habitat trainer on a GPU, 2026-11-10
+
+`scripts/verify_habitat_training.py`, run by hand on the RTX 4080 SUPER in this machine,
+the `marp_habitat_training` engine from this branch with the recipe's defaults (3 frozen
+passes, 10 fine-tune passes, seed 1, input 518).
+
+**The data is the feasibility session's own frames**, packed read-only into a habitat archive
+(Isaac's choice, 2026-11-10), so the result can be set beside the feasibility run on the same
+crop: 21,457 training, 5,163 tuning and 6,016 test frames, whole dives per split, the habitat
+crop x 0.25-0.75, y 0.5-1.0. DINOv2 ViT-B/14 was built from the `model.safetensors` that
+`seed-base-models.js --only dinov2-vitb14` registers, offline.
+
+The GPU was shared for the whole run with the feasibility session's own seed-2 training and
+another script, so the time below is not the trainer's own.
+
+| | this run | feasibility run, same crop, seed 1 |
+| --- | --- | --- |
+| frozen passes, tuning macro F1 | 0.735 / 0.741 / 0.743 | 0.738 / 0.742 / 0.746 |
+| best fine-tune pass, tuning macro F1 | 0.796 (pass 4) | 0.798 |
+| **test macro F1** | **0.734** | **0.728** |
+| Boulder, test F1 | 0.556 | 0.55 |
+
+Per substrate on the test dives, at the cut-offs chosen on the tuning dives:
+
+| | F1 | precision | recall | frames with it | cut-off |
+| --- | --- | --- | --- | --- | --- |
+| Rock | 0.935 | 0.898 | 0.976 | 3,999 | 0.30 |
+| Mud | 0.656 | 0.548 | 0.816 | 925 | 0.15 |
+| Sand | 0.841 | 0.881 | 0.805 | 2,598 | 0.90 |
+| Cobble | 0.684 | 0.606 | 0.785 | 958 | 0.75 |
+| Boulder | 0.556 | 0.548 | 0.565 | 407 | 0.80 |
+
+Mud's 0.15 is the tuned cut-off; a run applies 0.35, the settled 0.2 raise, which
+`db/habitat-rules.js` adds when the model is leased.
+
+What it showed:
+
+- **The trainer reproduces the feasibility result.** Same frames, same crop, same seed: test
+  0.734 against 0.728, every frozen pass within 0.003, the best tuning pass within 0.002.
+- **The kept model is the best tuning pass, not the last.** Tuning F1 peaked at pass 4 and
+  fell to 0.786 by pass 10 as the loss went to 0.017; the published weights are pass 4's.
+- **All three files were published and say what they should**: `weights` (346 MB),
+  `decision_rules` with the substrates, cut-offs, crop and input size, and `final_metrics` in
+  the `multilabel` family on the test split.
+- Took 5,253 s (88 min) with the GPU shared.
+
+Run once the first time and failed at the first pass on Windows: the frame loader class was
+local to a function and could not be handed to a worker process. Fixed by making it a module
+class, with `tests/test_habitat_training.py` now loading through a worker process (shown
+failing before the fix). This run is the second.
+
+Not covered here: a habitat run of the trained model over real video (`marp_habitat`), which
+needs the model registered in MARP and a video to run on.

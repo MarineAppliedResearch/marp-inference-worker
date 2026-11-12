@@ -15,6 +15,9 @@ lap
 cython-bbox
 cython
 filterpy
+# The habitat substrate model (MARP_API#287), pinned as in pyproject.toml.
+timm==1.0.30
+safetensors==0.8.0
 # The system-tray icon the volunteer controls the worker from (#57), and the
 # library that draws its bitmap. Pillow already arrives through ultralytics;
 # it is named here because tray.py imports it directly, and a dependency you
